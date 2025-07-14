@@ -1,13 +1,10 @@
 # main.py
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-import models
-from database import engine
 from routers.auth_routes import router as auth_router
 from routers.holdings_routes import router as holdings_router
 from routers.finnhub_routes import router as finnhub_router  # keep this as-is
-
-models.Base.metadata.create_all(bind=engine)
+from routers.plaid_routes import router as plaid_routers
 
 app = FastAPI()
 
@@ -23,3 +20,4 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(holdings_router)
 app.include_router(finnhub_router, prefix="/api/finnhub")
+app.include_router(plaid_routers, prefix="/api/plaid")

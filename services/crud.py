@@ -1,6 +1,7 @@
-from models import User, Holding
+from models.user import User
+from models.holding import Holding
 from sqlalchemy.orm import Session
-from auth import get_password_hash
+from services.auth import get_password_hash
 
 def get_user_by_email(db: Session, email: str):
     return db.query(User).filter(User.email == email).first()
