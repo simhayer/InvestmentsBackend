@@ -5,16 +5,39 @@ from database import get_db
 from services.auth import get_current_user
 import schemas, services.crud as crud
 from models.holding import Holding
+from services.plaid_service import fetch_plaid_holdings_for_user
 
 router = APIRouter()
 
+
 @router.post("/holdings")
 def save_holding(holding: schemas.HoldingCreate, db: Session = Depends(get_db), user=Depends(get_current_user)):
-    return crud.create_holding(db, user.id, holding.symbol, holding.quantity, holding.avg_price, holding.type)
+    return crud.create_holding(db, user.id, holding.symbol, holding.quantity, holding.purchase_price, holding.type)
 
 @router.get("/holdings")
 def get_holdings(db: Session = Depends(get_db), user=Depends(get_current_user)):
-    return db.query(Holding).filter(Holding.user_id == user.id).all()
+    print('Fetching holdings for user:', user.id)
+    holdings = db.query(Holding).filter_by(user_id=user.id).all()
+
+    print('Fetched holdings:', holdings)
+
+    return [
+        {
+            "id": h.id,
+            "symbol": h.symbol,
+            "name": h.name,
+            "type": h.type,
+            "quantity": h.quantity,
+            "purchase_price": h.purchase_price,
+            "current_price": h.current_price,
+            "value": h.value,
+            "currency": h.currency,
+            "institution": h.institution,
+            "account_name": h.account_name,
+            "source": h.source,
+        }
+        for h in holdings
+    ]
 
 @router.delete("/holdings/{holding_id}")
 def delete_holding(holding_id: int, db: Session = Depends(get_db), user=Depends(get_current_user)):

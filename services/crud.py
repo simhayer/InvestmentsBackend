@@ -19,13 +19,13 @@ def create_holding(
     user_id: int,
     symbol: str,
     quantity: float,
-    avg_price: float,
+    purchase_price: float,
     type_: str
 ) -> Holding:
     holding = Holding(
         symbol=symbol,
         quantity=quantity,
-        avg_price=avg_price,
+        purchase_price=purchase_price,
         type=type_, 
         user_id=user_id,
     )

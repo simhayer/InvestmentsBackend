@@ -21,3 +21,10 @@ app.include_router(auth_router)
 app.include_router(holdings_router)
 app.include_router(finnhub_router, prefix="/api/finnhub")
 app.include_router(plaid_routers, prefix="/api/plaid")
+
+
+# db startup
+from database import Base, engine
+import models  # this triggers models/__init__.py which imports all tables
+
+Base.metadata.create_all(bind=engine)
