@@ -4,7 +4,7 @@ from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel
 from services.auth_service import get_current_user
 from services.ai_service import analyze_investment_holding
-from types.holding import HoldingInputPydantic
+from schemas.holding import HoldingInputPydantic
 from utils.converters import to_holding_dict
 
 router = APIRouter()

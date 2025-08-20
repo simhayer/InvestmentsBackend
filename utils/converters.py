@@ -1,7 +1,7 @@
 # utils/converters.py
 from typing import cast
 from pydantic import BaseModel
-from types.holding import HoldingInput
+from schemas.holding import HoldingInput
 
 def to_holding_dict(m: BaseModel) -> HoldingInput:
     """

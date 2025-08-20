@@ -2,15 +2,15 @@
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 from database import get_db
-from backend.services.auth_service import get_current_user
-import schemas, services.crud as crud
+from services.auth_service import get_current_user
+import schemas.general as general, services.crud as crud
 from models.holding import Holding
 
 router = APIRouter()
 
 
 @router.post("/holdings")
-def save_holding(holding: schemas.HoldingCreate, db: Session = Depends(get_db), user=Depends(get_current_user)):
+def save_holding(holding: general.HoldingCreate, db: Session = Depends(get_db), user=Depends(get_current_user)):
     return crud.create_holding(db, user.id, holding.symbol, holding.quantity, holding.purchase_price, holding.type)
 
 @router.get("/holdings")

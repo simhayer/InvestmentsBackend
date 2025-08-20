@@ -1,7 +1,7 @@
 from models.user import User
 from models.holding import Holding
 from sqlalchemy.orm import Session
-from services.auth import get_password_hash
+from services.auth_service import get_password_hash
 
 def get_user_by_email(db: Session, email: str):
     return db.query(User).filter(User.email == email).first()
@@ -33,4 +33,7 @@ def create_holding(
     db.commit()
     db.refresh(holding)
     return holding
+
+def get_user_by_id(db: Session, user_id: int) -> User | None:
+    return db.query(User).filter(User.id == user_id).first()
 

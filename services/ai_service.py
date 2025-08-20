@@ -5,7 +5,7 @@ from typing import Any, Dict, List, TypedDict, Optional
 
 from langchain_openai import ChatOpenAI  # pip install langchain-openai
 from services.yahoo_service import get_full_stock_data
-from types.holding import HoldingInput
+from schemas.holding import HoldingInput
 
 # Deterministic + bounded
 llm = ChatOpenAI(

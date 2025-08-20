@@ -1,12 +1,12 @@
 # finnhub_routes.py
 from fastapi import APIRouter, Depends, HTTPException
 import httpx, os
-from services.auth import get_current_user
+from services.auth_service import get_current_user
 from dotenv import load_dotenv
 import asyncio
 from fastapi import APIRouter, Depends, HTTPException
 import httpx, os
-from services.auth import get_current_user
+from services.auth_service import get_current_user
 from typing import List
 from dotenv import load_dotenv
 from pydantic import BaseModel

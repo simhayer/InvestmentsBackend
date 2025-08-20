@@ -15,7 +15,7 @@ from plaid.model.investments_holdings_get_request import InvestmentsHoldingsGetR
 from pydantic import BaseModel
 from models.holding import Holding
 from typing import List, Dict
-from services.auth import get_current_user
+from services.auth_service import get_current_user
 
 # Plaid setup
 configuration = Configuration(
