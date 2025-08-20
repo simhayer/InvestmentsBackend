@@ -5,6 +5,7 @@ from typing import Any, Dict, List, TypedDict, Optional
 
 from langchain_openai import ChatOpenAI  # pip install langchain-openai
 from services.yahoo_service import get_full_stock_data
+from types.holding import HoldingInput
 
 # Deterministic + bounded
 llm = ChatOpenAI(
@@ -15,15 +16,6 @@ llm = ChatOpenAI(
 )
 
 # ---------- Types ----------
-class HoldingInput(TypedDict):
-    symbol: str
-    name: str
-    type: str
-    quantity: float
-    purchase_price: float
-    current_price: float
-    institution: str
-    currency: str
 
 class AnalysisOutput(TypedDict, total=False):
     symbol: str
