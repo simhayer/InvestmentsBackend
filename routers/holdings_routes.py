@@ -5,7 +5,6 @@ from database import get_db
 from services.auth import get_current_user
 import schemas, services.crud as crud
 from models.holding import Holding
-from services.plaid_service import fetch_plaid_holdings_for_user
 
 router = APIRouter()
 

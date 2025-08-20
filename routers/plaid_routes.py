@@ -67,10 +67,6 @@ async def exchange_token(
         access_token = response.access_token
         item_id = response.item_id
 
-        # token_entry = db.query(UserAccess).filter_by(
-        #     user_id=user.id, institution_id=institution_id
-        # ).first()
-
         token_entry = db.query(UserAccess).filter_by(
             user_id=str(user.id), institution_id=institution_id
         ).first()
@@ -200,3 +196,28 @@ def sync_plaid_holdings(user_id: int, plaid_holdings: List[Dict], db: Session):
             db.delete(h)
 
     db.commit()
+
+class InstitutionOut(BaseModel):
+    institution_name: str
+    institution_id: str
+    created_at: str
+
+@router.get("/institutions", response_model=List[InstitutionOut])
+async def get_connected_institutions(
+    db: Session = Depends(get_db),
+    user=Depends(get_current_user),
+):
+    try:
+        institutions = db.query(UserAccess).filter(UserAccess.user_id == str(user.id)).all()
+
+        return [
+            {
+                "institution_name": ua.institution_name,
+                "institution_id": ua.institution_id,
+                "created_at": ua.created_at.isoformat(),
+            }
+            for ua in institutions
+            if ua.institution_id and ua.institution_name
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail="Failed to fetch institutions")
