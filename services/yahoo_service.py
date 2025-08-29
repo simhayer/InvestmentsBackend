@@ -45,12 +45,12 @@ def retry(
 # ---------------------------
 # Tiny TTL cache (optional but helpful)
 # ---------------------------
-_CACHE: Dict[Tuple[str, bool], Tuple[float, Json]] = {}
+_CACHE: Dict[str, Tuple[float, Json]] = {}
 _CACHE_TTL_SEC = 60  # adjust 30–120s as you like
 
 
-def _cache_get(symbol: str, include_news: bool) -> Optional[Json]:
-    key = (symbol.upper(), include_news)
+def _cache_get(symbol: str) -> Optional[Json]:
+    key = symbol.upper()
     hit = _CACHE.get(key)
     if not hit:
         return None
@@ -61,8 +61,8 @@ def _cache_get(symbol: str, include_news: bool) -> Optional[Json]:
     return None
 
 
-def _cache_set(symbol: str, include_news: bool, payload: Json) -> None:
-    _CACHE[(symbol.upper(), include_news)] = (time.time(), payload)
+def _cache_set(symbol: str, payload: Json) -> None:
+    _CACHE[(symbol.upper())] = (time.time(), payload)
 
 
 # ---------------------------
@@ -122,7 +122,7 @@ def _iso_utc_from_ts(ts: Any) -> Optional[str]:
 # ---------------------------
 # Main API
 # ---------------------------
-def get_full_stock_data(symbol: str, include_news: bool = True) -> Json:
+def get_full_stock_data(symbol: str) -> Json:
     """
     Fetch quotes + fundamentals (and optionally top news) for `symbol`.
     Returns a stable JSON shape with computed metrics and data quality info.
@@ -136,7 +136,7 @@ def get_full_stock_data(symbol: str, include_news: bool = True) -> Json:
         }
 
     # Serve from short TTL cache if available
-    cached = _cache_get(sym, include_news)
+    cached = _cache_get(sym)
     if cached:
         return cached
 
@@ -204,34 +204,6 @@ def get_full_stock_data(symbol: str, include_news: bool = True) -> Json:
         distance_from_52w_high_pct = _dist_pct(current, high_52)
         distance_from_52w_low_pct = _dist_pct(current, low_52)
 
-        # Optional news (defensive parsing)
-        news_items: List[Dict[str, Any]] = []
-        if include_news:
-            try:
-                raw_news = retry(lambda: tq.news(5) or [])
-                for item in raw_news:
-                    if not isinstance(item, dict) or "title" not in item:
-                        continue
-                    ts = item.get("provider_publish_time")
-                    thumb = item.get("thumbnail")
-                    # Sometimes thumbnail is a dict of resolutions
-                    if isinstance(thumb, dict):
-                        thumb = (thumb.get("resolutions") or [{}])[0].get("url")
-                    news_items.append(
-                        {
-                            "title": item.get("title"),
-                            "summary": item.get("summary"),
-                            "url": item.get("url"),
-                            "author": item.get("author_name"),
-                            "source": item.get("provider_name"),
-                            "published_at": _iso_utc_from_ts(ts),
-                            "thumbnail": thumb,
-                        }
-                    )
-            except Exception:
-                # Non-fatal: keep going without news
-                news_items = []
-
         # Data quality
         missing_fields = [
             k
@@ -281,8 +253,6 @@ def get_full_stock_data(symbol: str, include_news: bool = True) -> Json:
             "recommendation": recommendation,
             "recommendation_key": recommendation_key,
             "target_price": target_price,
-            # News
-            "news": news_items,
             # Quality & provenance
             "data_quality": {
                 "source": "Yahoo Finance via yahooquery",
@@ -292,7 +262,7 @@ def get_full_stock_data(symbol: str, include_news: bool = True) -> Json:
             },
         }
 
-        _cache_set(sym, include_news, payload)
+        _cache_set(sym, payload)
         return payload
 
     except Exception as e:
