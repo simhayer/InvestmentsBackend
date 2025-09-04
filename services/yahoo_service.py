@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import math
 import time
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
+
 from typing import Any, Dict, Callable, List, Optional, Tuple, Type
 
 from yahooquery import Ticker
+import pandas as pd
 
 Number = Optional[float]
 Json = Dict[str, Any]
@@ -272,3 +274,632 @@ def get_full_stock_data(symbol: str) -> Json:
             "error_code": "YAHOOQUERY_FAILURE",
             "message": f"Failed to fetch data for {sym}: {str(e)}",
         }
+
+INTRADAY_INTERVALS = {"1m","2m","5m","15m","30m","60m","90m","1h"}
+
+def _f(x: Any):
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def get_price_history(symbol: str, period: str = "1y", interval: str = "1d") -> Json:
+    """
+    Normalize yahooquery history to:
+      {
+        status: "ok",
+        symbol, period, interval,
+        points: [{t, o, h, l, c, v, adjclose}]
+      }
+    - t is epoch seconds UTC
+    - o/h/l/c/v/adjclose are floats or None
+    """
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return {"status": "error", "error_code": "EMPTY_SYMBOL", "message": "Symbol is required"}
+
+    try:
+        tq = Ticker(sym, asynchronous=False, formatted=False, validate=False)
+        df = tq.history(period=period, interval=interval)
+
+        # Make sure we have a DataFrame
+        if df is None or (hasattr(df, "empty") and df.empty):
+            return {"status": "ok", "symbol": sym, "period": period, "interval": interval, "points": []}
+
+        if isinstance(df, pd.Series):
+            df = df.to_frame().T
+
+        # MultiIndex (symbol, date) is common; flatten
+        if isinstance(df.index, pd.MultiIndex):
+            df = df.reset_index()  # gives 'symbol' and 'date' cols
+            # If multiple symbols were requested (not here), filter to ours:
+            if "symbol" in df.columns:
+                df = df[df["symbol"].str.upper() == sym]
+        else:
+            df = df.reset_index()
+            # Some shapes call the index column something else; align to 'date'
+            if "index" in df.columns and "date" not in df.columns:
+                df = df.rename(columns={"index": "date"})
+            if "date" not in df.columns:
+                # last resort, bail with empty
+                return {"status": "ok", "symbol": sym, "period": period, "interval": interval, "points": []}
+
+        # Coerce 'date' → tz-aware UTC and keep order
+        # This handles datetime.date, naive datetimes, and strings.
+        df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+        df = df.dropna(subset=["date"]).sort_values("date")
+
+        # Some intervals don't include 'adjclose' – guard it
+        has_adj = "adjclose" in df.columns
+
+        points: List[Dict[str, Any]] = []
+        for row in df.itertuples(index=False):
+            # Access by attribute names (created from columns)
+            d = getattr(row, "date", None)
+            t = int(d.timestamp()) if isinstance(d, pd.Timestamp) else _to_epoch_utc(d)
+            if t is None:
+                continue
+
+            points.append({
+                "t": t,
+                "o": _f(getattr(row, "open", None)),
+                "h": _f(getattr(row, "high", None)),
+                "l": _f(getattr(row, "low", None)),
+                "c": _f(getattr(row, "close", None)),
+                "v": _f(getattr(row, "volume", None)),
+                "adjclose": _f(getattr(row, "adjclose", None)) if has_adj else None,
+            })
+
+        return {"status": "ok", "symbol": sym, "period": period, "interval": interval, "points": points}
+
+    except Exception as e:
+        return {"status": "error", "error_code": "YQ_HISTORY_FAILED", "message": str(e)}    
+def _to_epoch_utc(x: Any) -> int | None:
+    """Coerce pandas Timestamp / datetime / date / epoch / ISO string to epoch seconds (UTC)."""
+    if x is None:
+        return None
+    try:
+        if isinstance(x, pd.Timestamp):
+            x = x.tz_localize("UTC") if x.tzinfo is None else x.tz_convert("UTC")
+            return int(x.timestamp())
+    except Exception:
+        pass
+    if isinstance(x, datetime):
+        x = x.astimezone(timezone.utc) if x.tzinfo else x.replace(tzinfo=timezone.utc)
+        return int(x.timestamp())
+    if isinstance(x, date):
+        return int(datetime(x.year, x.month, x.day, tzinfo=timezone.utc).timestamp())
+    if isinstance(x, (int, float)):
+        try:
+            return int(float(x))
+        except Exception:
+            return None
+    if isinstance(x, str):
+        # try pandas parser; utc=True gives tz-aware UTC
+        try:
+            ts = pd.to_datetime(x, utc=True, errors="coerce")
+            if pd.isna(ts):
+                return None
+            return int(ts.timestamp())
+        except Exception:
+            return None
+    return None
+
+def get_financials(symbol: str, period: str = "annual") -> Json:
+    """
+    Prefer yahooquery.Ticker(...).all_financial_data() to build statements.
+
+    Output (latest -> oldest):
+    {
+      status, symbol, period: 'annual'|'quarterly',
+      income_statement: [{date, revenue, gross_profit, operating_income, net_income, eps}],
+      balance_sheet:    [{date, total_assets, total_liabilities, total_equity, cash, inventory, long_term_debt}],
+      cash_flow:        [{date, operating_cash_flow, investing_cash_flow, financing_cash_flow, free_cash_flow}],
+    }
+    """
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return {"status": "error", "error_code": "EMPTY_SYMBOL", "message": "Symbol is required"}
+
+    # Which periodType(s) correspond to the UI toggle
+    want_quarterly = (period == "quarterly")
+    acceptable_period_types = {"3M"} if want_quarterly else {"12M", "FY"}  # Apple tends to use 3M / 12M
+
+    try:
+        tq = Ticker(sym, asynchronous=False, formatted=False, validate=False)
+
+        # ---- 1) Try all_financial_data (rich, wide DataFrame)
+        afd = tq.all_financial_data()
+        if afd is not None and not getattr(afd, "empty", True):
+            # normalize shape
+            df = afd.copy()
+
+            # bring symbol out of index if needed
+            if not isinstance(df, pd.DataFrame):
+                df = pd.DataFrame(df)
+            if isinstance(df.index, pd.MultiIndex):
+                df = df.reset_index()
+            else:
+                df = df.reset_index(drop=False)
+
+            # ensure symbol filter if present
+            if "symbol" in df.columns:
+                df["symbol"] = df["symbol"].astype(str).str.upper()
+                df = df[df["symbol"] == sym]
+
+            # unify date & periodType
+            if "asOfDate" not in df.columns and "endDate" in df.columns:
+                df = df.rename(columns={"endDate": "asOfDate"})
+            # if "asOfDate" not in df.columns:
+                # nothing to align -> fallback
+                # return _financials_df_fallback(sym, period)
+
+            # coerce date
+            df["asOfDate"] = pd.to_datetime(df["asOfDate"], utc=True, errors="coerce")
+            df = df.dropna(subset=["asOfDate"])
+
+            # periodType filter (some tickers label annual as FY or 12M)
+            if "periodType" in df.columns:
+                df = df[df["periodType"].isin(acceptable_period_types)]
+            # If no periodType column, keep all and let dates/fields speak
+
+            # sort latest first
+            df = df.sort_values("asOfDate", ascending=False)
+
+            # Small helper to fetch from multiple candidate columns
+            def col(row: pd.Series, *names: str) -> Optional[float]:
+                for name in names:
+                    if name in row and pd.notna(row[name]):
+                        return _f(row[name])
+                return None
+
+            income: List[Dict[str, Any]] = []
+            balance: List[Dict[str, Any]] = []
+            cash_flow: List[Dict[str, Any]] = []
+
+            for _, r in df.iterrows():
+                iso = r["asOfDate"].date().isoformat()
+
+                # Income
+                income.append({
+                    "date": iso,
+                    # many names in AFD; prefer TotalRevenue/GrossProfit/OperatingIncome/NetIncome
+                    "revenue":          col(r, "TotalRevenue", "OperatingRevenue", "Revenue"),
+                    "gross_profit":     col(r, "GrossProfit"),
+                    "operating_income": col(r, "OperatingIncome", "TotalOperatingIncomeAsReported"),
+                    "net_income":       col(r, "NetIncome", "NetIncomeCommonStockholders", "NetIncomeIncludingNoncontrollingInterests"),
+                    "eps":              col(r, "DilutedEPS", "BasicEPS", "EPS"),
+                })
+
+                # Balance
+                balance.append({
+                    "date": iso,
+                    "total_assets":      col(r, "TotalAssets"),
+                    "total_liabilities": col(r, "TotalLiabilitiesNetMinorityInterest", "TotalLiabilities"),
+                    "total_equity":      col(r, "StockholdersEquity", "TotalEquityGrossMinorityInterest", "CommonStockEquity"),
+                    "cash":              col(r, "CashAndCashEquivalents", "Cash", "CashFinancial"),
+                    "inventory":         col(r, "Inventory"),
+                    "long_term_debt":    col(r, "LongTermDebt", "LongTermDebtAndCapitalLeaseObligation"),
+                })
+
+                # Cash Flow
+                ocf = col(r, "OperatingCashFlow")
+                icf = col(r, "InvestingCashFlow")
+                fcf = col(r, "FreeCashFlow")
+                if fcf is None:
+                    capex = col(r, "CapitalExpenditure")
+                    if ocf is not None and capex is not None:
+                        fcf = ocf - capex
+                cash_flow.append({
+                    "date": iso,
+                    "operating_cash_flow":  ocf,
+                    "investing_cash_flow":  icf,
+                    "financing_cash_flow":  col(r, "CashFlowFromContinuingFinancingActivities", "FinancingCashFlow"),
+                    "free_cash_flow":       fcf,
+                })
+
+            return {
+                "status": "ok",
+                "symbol": sym,
+                "period": "quarterly" if want_quarterly else "annual",
+                "income_statement": income,
+                "balance_sheet": balance,
+                "cash_flow": cash_flow,
+            }
+
+        # ---- 2) Fallback to statement DFs if AFD is empty
+        return _financials_df_fallback(sym, period)
+        # return {"status": "error", "error_code": "YQ_FINANCIALS_FAILED", "message": 'Fallback to statement DFs if AFD is empty'}
+
+    except Exception as e:
+        return {"status": "error", "error_code": "YQ_FINANCIALS_FAILED", "message": str(e)}
+
+def _financials_df_fallback(sym: str, period: str) -> Json:
+    """
+    Your previous DF-based implementation; called if all_financial_data()
+    is unavailable or too sparse. Uses .income_statement/.balance_sheet/.cash_flow
+    and returns the same normalized shape.
+    """
+    # reuse the DF logic we discussed earlier; if you already have it defined as
+    # a separate function, just call it here:
+    try:
+        freq = "q" if period == "quarterly" else "a"
+        tq = Ticker(sym, asynchronous=False, formatted=False, validate=False)
+
+        def _prep_df(df: Any) -> pd.DataFrame:
+            if df is None:
+                return pd.DataFrame()
+            if isinstance(df, pd.Series):
+                df = df.to_frame().T
+            df = df.reset_index()
+            for cand in ("asOfDate", "endDate", "date"):
+                if cand in df.columns:
+                    if cand != "date":
+                        df = df.rename(columns={cand: "date"})
+                    break
+            if "date" not in df.columns:
+                if "index" in df.columns:
+                    df = df.rename(columns={"index": "date"})
+                else:
+                    return pd.DataFrame()
+            df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
+            df = df.dropna(subset=["date"]).sort_values("date", ascending=False)
+            return df
+
+        def _val(row: pd.Series, *keys: str) -> Optional[float]:
+            for k in keys:
+                if k in row:
+                    return _f(row[k])
+            return None
+
+        inc_df = _prep_df(tq.income_statement(frequency=freq))
+        bal_df = _prep_df(tq.balance_sheet(frequency=freq))
+        cfs_df = _prep_df(tq.cash_flow(frequency=freq))
+
+        income = []
+        for _, r in inc_df.iterrows():
+            income.append({
+                "date": r["date"].date().isoformat(),
+                "revenue":           _val(r, "totalRevenue", "revenue"),
+                "gross_profit":      _val(r, "grossProfit"),
+                "operating_income":  _val(r, "operatingIncome"),
+                "net_income":        _val(r, "netIncome"),
+                "eps":               _val(r, "dilutedEps", "dilutedEPS", "eps"),
+            })
+
+        balance = []
+        for _, r in bal_df.iterrows():
+            balance.append({
+                "date": r["date"].date().isoformat(),
+                "total_assets":      _val(r, "totalAssets"),
+                "total_liabilities": _val(r, "totalLiab", "totalLiabilities"),
+                "total_equity":      _val(r, "totalStockholderEquity", "totalShareholderEquity"),
+                "cash":              _val(r, "cash", "cashAndCashEquivalentsAtCarryingValue", "cashAndCashEquivalents"),
+                "inventory":         _val(r, "inventory"),
+                "long_term_debt":    _val(r, "longTermDebt"),
+            })
+
+        cash_flow = []
+        for _, r in cfs_df.iterrows():
+            ocf = _val(r, "totalCashFromOperatingActivities", "operatingCashFlow")
+            icf = _val(r, "totalCashflowsFromInvestingActivities", "investingCashFlow")
+            fcf = _val(r, "freeCashflow", "freeCashFlow")
+            if fcf is None:
+                capex = _val(r, "capitalExpenditures")
+                if ocf is not None and capex is not None:
+                    fcf = ocf - capex
+            cash_flow.append({
+                "date": r["date"].date().isoformat(),
+                "operating_cash_flow":  ocf,
+                "investing_cash_flow":  icf,
+                "financing_cash_flow":  _val(r, "totalCashFromFinancingActivities", "financingCashFlow"),
+                "free_cash_flow":       fcf,
+            })
+
+        return {
+            "status": "ok",
+            "symbol": sym,
+            "period": "quarterly" if period == "quarterly" else "annual",
+            "income_statement": income,
+            "balance_sheet": balance,
+            "cash_flow": cash_flow,
+        }
+
+    except Exception as e:
+        return {"status": "error", "error_code": "YQ_FINANCIALS_FALLBACK_FAILED", "message": str(e)}
+
+# --- new little helpers for calendarEvents quirks ---
+
+import re
+_dt_suffix_pat = re.compile(r"(:S|[ T]S)$", re.IGNORECASE)
+
+def _parse_weird_cal_dt(val: Any) -> Optional[str]:
+    """
+    '2025-10-30 16:00:S' -> '2025-10-30' (ISO date)
+    also accepts list[...] / epoch / dict{'raw':...}
+    """
+    # unwrap list
+    if isinstance(val, list) and val:
+        val = val[0]
+    # epoch
+    if isinstance(val, (int, float)):
+        return _date_iso(val)
+    # dict{'raw':...}
+    if isinstance(val, dict) and "raw" in val:
+        return _date_iso(val["raw"])
+    # string with trailing ':S'
+    if isinstance(val, str):
+        s = _dt_suffix_pat.sub("", val.strip())  # drop weird suffix
+        ts = pd.to_datetime(s, utc=True, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts.date().isoformat()
+    return None
+
+def _parse_epoch_list_to_iso(val: Any) -> Optional[str]:
+    """
+    [1753995600] -> '2025-08-31T12:00:00Z' (example)
+    """
+    if isinstance(val, list) and val:
+        val = val[0]
+    if isinstance(val, (int, float)):
+        sec = int(val / 1000) if val > 1e12 else int(val)
+        return datetime.fromtimestamp(sec, tz=timezone.utc).isoformat()
+    return None
+
+def _quarter_label(iso_date: str) -> str:
+    """
+    '2025-06-30' -> 'Q2 2025' (calendar quarter).
+    (If you want fiscal quarters, you can add an offset param later.)
+    """
+    try:
+        dt = datetime.fromisoformat(iso_date)
+    except Exception:
+        return iso_date
+    q = (dt.month - 1) // 3 + 1
+    return f"Q{q} {dt.year}"
+
+# ---------- NEW: earnings ----------
+def get_earnings(symbol: str) -> Json:
+    """
+    {
+      status, symbol,
+      next_earnings_date: 'YYYY-MM-DD' | null,
+      next: {
+        date: 'YYYY-MM-DD' | null,
+        call_time_utc: 'YYYY-MM-DDTHH:MM:SSZ' | null,
+        is_estimate: bool | null,
+        eps_avg: float|null, eps_low: float|null, eps_high: float|null,
+        revenue_avg: float|null, revenue_low: float|null, revenue_high: float|null
+      },
+      events: {
+        ex_dividend_date: 'YYYY-MM-DD' | null,
+        dividend_date: 'YYYY-MM-DD' | null
+      },
+      history: [{ date, period, actual, estimate, surprisePct }]
+    }
+    """
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return {"status": "error", "error_code": "EMPTY_SYMBOL", "message": "Symbol is required"}
+
+    try:
+        tq = Ticker(sym, asynchronous=False, formatted=False, validate=False)
+        res = tq.get_modules(["calendarEvents", "earningsHistory"])
+        node = _get_symbol_node(res, sym)
+
+        # ---- calendar / next earnings ----
+        cal = node.get("calendarEvents") or {}
+        nxt_date = None
+        nxt_obj = None
+        ex_div = None
+        div_date = None
+
+        # calendarEvents.earnings {...}
+        earnings_block = cal.get("earnings") if isinstance(cal, dict) else None
+        if isinstance(earnings_block, dict):
+            nxt_date = _parse_weird_cal_dt(earnings_block.get("earningsDate"))
+            call_iso = _parse_epoch_list_to_iso(earnings_block.get("earningsCallDate"))
+            nxt_obj = {
+                "date": nxt_date,
+                "call_time_utc": call_iso,
+                "is_estimate": bool(earnings_block.get("isEarningsDateEstimate")) if "isEarningsDateEstimate" in earnings_block else None,
+                "eps_avg": _f(earnings_block.get("earningsAverage")),
+                "eps_low": _f(earnings_block.get("earningsLow")),
+                "eps_high": _f(earnings_block.get("earningsHigh")),
+                "revenue_avg": _f(earnings_block.get("revenueAverage")),
+                "revenue_low": _f(earnings_block.get("revenueLow")),
+                "revenue_high": _f(earnings_block.get("revenueHigh")),
+            }
+
+        # ex-dividend & dividend dates (strings like '2025-08-10 20:00:00')
+        ex_div = _date_iso(cal.get("exDividendDate"))
+        div_date = _date_iso(cal.get("dividendDate"))
+
+        # ---- earnings history ----
+        history: List[Dict[str, Any]] = []
+        eh = node.get("earningsHistory")
+        hist_list = []
+        if isinstance(eh, dict):
+            hist_list = eh.get("history") or []
+        elif isinstance(eh, list):
+            hist_list = eh
+
+        for r in hist_list or []:
+            d = _date_iso(r.get("reportDate") or r.get("quarter") or r.get("date"))
+            if not d:
+                continue
+            history.append({
+                "date": d,
+                "period": _quarter_label(d),
+                "actual": _f(r.get("epsActual") or r.get("actual")),
+                "estimate": _f(r.get("epsEstimate") or r.get("estimate")),
+                "surprisePct": _f(r.get("surprisePercent") or r.get("surprisePct")),
+            })
+
+        # sort latest → oldest
+        history.sort(key=lambda x: x["date"], reverse=True)
+
+        return {
+            "status": "ok",
+            "symbol": sym,
+            "next_earnings_date": nxt_date,
+            "next": nxt_obj,
+            "events": {
+                "ex_dividend_date": ex_div,
+                "dividend_date": div_date,
+            },
+            "history": history,
+        }
+
+    except Exception as e:
+        return {"status": "error", "error_code": "YQ_EARNINGS_FAILED", "message": str(e)}
+
+# ---------- NEW: analyst ----------
+def get_analyst(symbol: str) -> Json:
+    """
+    Normalize to:
+    {
+      status, symbol,
+      recommendation_key, recommendation,
+      price_target_low, price_target_mean, price_target_high,
+      trend: [{period, strongBuy, buy, hold, sell, strongSell}]
+    }
+    """
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return {"status": "error", "error_code": "EMPTY_SYMBOL", "message": "Symbol is required"}
+
+    try:
+        tq = Ticker(sym, asynchronous=False, formatted=False, validate=False)
+        res = tq.get_modules(["financialData", "recommendationTrend"])
+        node = _get_symbol_node(res, sym)
+
+        fin = node.get("financialData") or {}
+        rec = node.get("recommendationTrend") or {}
+
+        # recommendation score/key
+        recommendation = _f(fin.get("recommendationMean"))
+        recommendation_key = rec.get("trend", [{}])[0].get("recommendationKey") if isinstance(rec.get("trend"), list) and rec.get("trend") else fin.get("recommendationKey")
+        if not recommendation_key:
+            recommendation_key = fin.get("recommendationKey")
+
+        # price targets
+        price_target_low = _f(fin.get("targetLowPrice") or fin.get("priceTargetLow"))
+        price_target_mean = _f(fin.get("targetMeanPrice") or fin.get("priceTargetMean"))
+        price_target_high = _f(fin.get("targetHighPrice") or fin.get("priceTargetHigh"))
+
+        trend_list = []
+        t = rec.get("trend")
+        if isinstance(t, list):
+            for r in t:
+                trend_list.append({
+                    "period": r.get("period"),
+                    "strongBuy": int(r.get("strongBuy") or 0),
+                    "buy": int(r.get("buy") or 0),
+                    "hold": int(r.get("hold") or 0),
+                    "sell": int(r.get("sell") or 0),
+                    "strongSell": int(r.get("strongSell") or 0),
+                })
+
+        return {
+            "status": "ok",
+            "symbol": sym,
+            "recommendation_key": recommendation_key,
+            "recommendation": recommendation,
+            "price_target_low": price_target_low,
+            "price_target_mean": price_target_mean,
+            "price_target_high": price_target_high,
+            "trend": trend_list,
+        }
+
+    except Exception as e:
+        return {"status": "error", "error_code": "YQ_ANALYST_FAILED", "message": str(e)}
+
+# ---------- NEW: company profile/overview ----------
+def get_overview(symbol: str) -> Json:
+    sym = (symbol or "").upper().strip()
+    if not sym:
+        return {"status": "error", "error_code": "EMPTY_SYMBOL", "message": "Symbol is required"}
+
+    try:
+        tq = Ticker(sym, asynchronous=False, formatted=False, validate=False)
+
+        res = tq.get_modules(["summaryProfile"]) or {}
+        node = _get_symbol_node(res, sym)  # always dict from our helper
+
+        # Some tickers return {summaryProfile: {...}}, others return the profile dict directly.
+        if isinstance(node, dict) and isinstance(node.get("summaryProfile"), dict):
+            prof = node["summaryProfile"]
+        elif isinstance(node, dict):
+            prof = node
+        else:
+            prof = {}
+
+        def pick(*keys):
+            for k in keys:
+                v = prof.get(k)
+                if v not in (None, "", []):
+                    return v
+            return None
+
+        return {
+            "status": "ok",
+            "symbol": sym,
+            "sector": pick("sector"),
+            "industry": pick("industry"),
+            "full_time_employees": pick("fullTimeEmployees", "full_time_employees"),
+            "city": pick("city"),
+            "state": pick("state"),
+            "country": pick("country"),
+            "zip": pick("zip"),
+            "address1": pick("address1", "address"),
+            "phone": pick("phone"),
+            "website": pick("website"),
+            "ir_website": pick("irWebsite"),
+            "long_business_summary": pick("longBusinessSummary", "long_business_summary"),
+        }
+
+    except Exception as e:
+        return {"status": "error", "error_code": "YQ_PROFILE_FAILED", "message": str(e)}
+    
+def _date_iso(d: Any) -> Optional[str]:
+    t = _to_epoch_utc(d)
+    if t is None:
+        return None
+    return datetime.fromtimestamp(t, tz=timezone.utc).date().isoformat()
+
+def _first_list(obj: Any) -> List[dict]:
+    """
+    Yahoo modules sometimes nest lists under varying keys. This returns
+    the first list of dicts found within a module dict.
+    """
+    if isinstance(obj, list):
+        return obj
+    if isinstance(obj, dict):
+        for v in obj.values():
+            if isinstance(v, list):
+                return v
+            if isinstance(v, dict):
+                lst = _first_list(v)
+                if lst:
+                    return lst
+    return []
+
+
+def _get_symbol_node(res: Any, sym: str) -> Dict[str, Any]:
+    """
+    get_modules(...) can return:
+      - { "AAPL": { ...modules... } }
+      - { ...modules... }  (already the node)
+      - { "error": ... } / string / None
+    Normalize to a dict or {}.
+    """
+    if isinstance(res, dict):
+        # preferred: nested by symbol
+        sub = res.get(sym)
+        if isinstance(sub, dict):
+            return sub
+        # sometimes it's already the node (modules at top level)
+        return res if any(isinstance(v, (dict, list)) for v in res.values()) else {}
+    return {}
