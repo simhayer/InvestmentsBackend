@@ -16,9 +16,14 @@ from routers.investment_routes import router as investment_router
 
 app = FastAPI()
 
+origins = [
+    "http://localhost:3000",
+    "https://investments-backend-1db4.vercel.app",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allow_headers=["*"],
