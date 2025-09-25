@@ -1,174 +1,98 @@
-# services/ai_service_perplexity_basic.py
-from __future__ import annotations
-
 import os
+from typing import Any, Dict, List, Optional, Tuple
 import json
-import re
-import datetime as dt
-from typing import Any, Dict
+from openai import OpenAI
+from services.helpers.ai.json_helpers import S, E, extract_json
 
-from openai import OpenAI  # Perplexity is OpenAI-compatible
-
-
-# ----------------------------
-# Config (env vars)
-# ----------------------------
 PPLX_API_KEY = os.getenv("PPLX_API_KEY")
 PPLX_BASE_URL = os.getenv("PPLX_BASE_URL", "https://api.perplexity.ai")
-PPLX_MODEL = os.getenv("PPLX_MODEL", "sonar-pro")  # or "sonar-reasoning-pro"
-
-# Optional search controls (keep simple)
+PPLX_MODEL = os.getenv("PPLX_MODEL", "sonar-pro")  # e.g., sonar-pro / sonar-reasoning-pro
 SEARCH_RECENCY = os.getenv("PPLX_SEARCH_RECENCY", "month")  # day|week|month|year
-DOMAIN_FILTER = [d.strip() for d in os.getenv("PPLX_DOMAIN_FILTER", "").split(",") if d.strip()]
 
-# ----------------------------
-# Helpers
-# ----------------------------
-def _now_utc_iso() -> str:
-    return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+if not PPLX_API_KEY:
+    raise RuntimeError("PPLX_API_KEY is not set")
 
-def _to_dict(holding: Any) -> Dict[str, Any]:
-    """Tolerant conversion of Pydantic v1/v2/dataclass/plain object -> dict."""
-    if isinstance(holding, dict):
-        return holding
-    if hasattr(holding, "model_dump"):   # Pydantic v2
-        return holding.model_dump()      # type: ignore[attr-defined]
-    if hasattr(holding, "dict"):         # Pydantic v1
-        return holding.dict()            # type: ignore[attr-defined]
-    if hasattr(holding, "__dict__"):
-        return dict(holding.__dict__)
-    return {"symbol": str(holding)}
+_client = OpenAI(api_key=PPLX_API_KEY, base_url=PPLX_BASE_URL)
 
-def _force_json(text: str) -> Dict[str, Any]:
-    """Try to parse JSON; if not, try to extract the biggest {...} block; else wrap."""
-    try:
-        return json.loads(text)
-    except Exception:
-        pass
-    # Try to grab a JSON object substring
-    m = re.search(r"\{.*\}", text, flags=re.S)
-    if m:
-        try:
-            return json.loads(m.group(0))
-        except Exception:
-            pass
-    # Fallback: wrap as rationale
-    return {
-        "rating": "watch",
-        "rationale": text[:1200],
-        "key_risks": [],
-        "suggestions": [],
-        "sources": [],
-        "disclaimer": "This is educational information, not financial advice.",
+# Small, fixed schema communicated to the model
+MINI_SCHEMA_DOC = {
+  "schema_version": "1.1",
+  "symbol": "string (ticker, uppercased)",
+  "headline": "string (<= 160 chars)",
+  "recommendation": "buy | hold | sell | neutral",
+  "conviction": "number in [0,1]",
+  "rationale": [{"text": "string (<=25 words)", "source_idx": "int"}],  # <=4
+  "highlights": [  # <=6
+    {
+      "label": "string",
+      "value": "string | number | {low:number, high:number}",
+      "as_of": "YYYY-MM-DD (optional)",
+      "source_idx": "int"
     }
-
-def _normalize_rating(v: Any) -> str:
-    r = str(v or "watch").lower().strip()
-    return r if r in {"hold", "sell", "watch", "diversify"} else "watch"
-
-
-# ----------------------------
-# Public function
-# ----------------------------
-def analyze_investment_holding_pplx(holding: Any) -> Dict[str, Any]:
-    """
-    Fresh Perplexity-only analysis (no Yahoo/news you provide).
-    Returns a dict your UI can display:
-      rating, rationale, key_risks[], suggestions[], data_notes[], disclaimer, sources[].
-    """
-    if not PPLX_API_KEY:
-        return {
-            "error": "missing_perplexity_api_key",
-            "message": "Set PPLX_API_KEY in your environment.",
-        }
-
-    h = _to_dict(holding)
-    symbol = (h.get("symbol") or "").upper().strip()
-    name = (h.get("name") or "").strip()
-    asset_type = (h.get("type") or "stock").lower().strip()
-
-    if not symbol:
-        return {"error": "missing_symbol"}
-
-    client = OpenAI(api_key=PPLX_API_KEY, base_url=PPLX_BASE_URL)
-
-    # Keep the prompt minimal but clear; ask for strict JSON keys.
-    system = (
-    "You are a cautious retail investing explainer. Use web search to gather the latest, "
-    "reliable facts (dividends, earnings, analyst actions, material risks). "
-    "Prefer primary/company sources (IR pages, SEC filings, official press releases) and major outlets "
-    "(Reuters, AP, WSJ, Barron's). Avoid YouTube, opinion blogs, and technical analysis signals. "
-    "Do not provide personalized financial advice or price targets. "
-    "Return VALID JSON ONLY with keys: "
-    "rating (hold|sell|watch|diversify), rationale (string), key_risks (string[]), "
-    "suggestions (string[]), sources ({title?, url}[]), events ({date?, label, url?}[]), "
-    "next_dates ({earnings_date?: string, ex_dividend_date?: string}), disclaimer (string)."
-)
-
-    user_msg = {
-    "holding": {"symbol": symbol, "name": name, "type": asset_type},
-    "task": (
-        "Analyze this security for a retail investor.\n"
-        "- Focus on **what changed in the last 30 days** (earnings, dividend, guidance, rating actions, litigation).\n"
-        "- Provide a conservative single-word rating from {hold, sell, watch, diversify} with a concise rationale.\n"
-        "- Give 3–5 risks and 2–4 suggestions (≤12 words each).\n"
-        "- Extract **upcoming dates**: next earnings_date and ex_dividend_date if published by trusted sources.\n"
-        "- Add 2–6 reputable sources (no YouTube, no TA blogs).\n"
-        "Return ONLY JSON. No extra text."
-    ),
-    "json_example": {
-        "rating": "watch",
-        "rationale": "Stable NIM; trimmed loan growth; dividend maintained; watch CRE exposure.",
-        "key_risks": ["CRE stress rising", "Regional economy sensitivity", "Funding cost pressure"],
-        "suggestions": ["Monitor next earnings call", "Diversify across regions", "Track payout ratio"],
-        "sources": [{"title": "Q2 press release", "url": "https://..."}],
-        "events": [{"date": "2025-08-21", "label": "Ex-dividend", "url": "https://..."}],
-        "next_dates": {"earnings_date": "2025-10-24", "ex_dividend_date": "2025-11-21"},
-        "disclaimer": "This is educational information, not financial advice."
-    },
+  ],
+  "risks": [{"title": "string", "detail": "string", "source_idx": "int"}],  # <=4
+  "citations": [{"title": "string", "url": "https://..."}]  # <=6
 }
 
-    # Perplexity search knobs (optional but helpful)
-    extra = {
-        "search_recency_filter": SEARCH_RECENCY,  # day|week|month|year
-        "return_images": False,
-    }
-    if DOMAIN_FILTER:
-        extra["search_domain_filter"] = DOMAIN_FILTER
+SYSTEM_PROMPT = f"""
+You are a cautious retail investing explainer.
+RULES:
+- Use web search. Prefer primary sources (company IR/SEC) and reputable finance outlets.
+- Be extractive and conservative. If unsure, omit.
+- OUTPUT SIZE (strict): rationale ≤ 4 bullets, highlights ≤ 6 facts, risks ≤ 4, citations ≤ 6.
+- No markdown, no prose outside JSON.
+- Wrap the ONLY JSON object between these sentinels, exactly:
+  {S}
+  ...JSON here...
+  {E}
+""".strip()
 
-    # Simple call; no response_format (keeps things SDK-agnostic)
-    resp = client.chat.completions.create(
+def _user_payload(symbol: str) -> dict:
+    sym = symbol.strip().upper()
+    return {
+        "task": "Analyze this investment symbol.",
+        "holding": {"symbol": sym},
+        "format": "Return ONLY a single JSON object between sentinels that matches this schema",
+        "schema": MINI_SCHEMA_DOC,
+        "notes": (
+            "Keep strings short. Avoid control characters. "
+            "Do not include citation markers like [1] in text; put sources in citations[]. "
+        ),
+    }
+
+def _call_pplx(payload: str) -> Tuple[str, Optional[List[dict]]]:
+    """One call to Perplexity via the OpenAI-compatible client. Returns (text, provider_citations?)."""
+    # castedMessages = [{"role": m["role"], "content": m["content"]} for m in messages]
+    resp = _client.chat.completions.create(
         model=PPLX_MODEL,
         messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(user_msg)},
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": json.dumps(_user_payload(payload))},
         ],
-        temperature=0.2,
-        max_tokens=900,
-        extra_body=extra,
+        temperature=0.0,
+        max_tokens=1600,
+        # Perplexity-specific knobs live in extra_body
+        extra_body={
+            "search_recency_filter": SEARCH_RECENCY,  # day|week|month|year
+            "return_images": False,
+        },
     )
+    text = (resp.choices[0].message.content or "").strip()
+    # Perplexity sometimes attaches top-level citations; not in OpenAI spec, so guard it
+    citations = getattr(resp, "citations", None)
+    return text, citations
+    
+def analyze_investment_symbol_pplx(symbol: str) -> Dict[str, Any]:
+    if not symbol or not symbol.strip():
+        return {"error": "missing_symbol"}
 
-    raw_txt = (resp.choices[0].message.content or "{}").strip()
-    obj = _force_json(raw_txt)
+    text, prov_citations = _call_pplx(symbol)
 
-    rating = _normalize_rating(obj.get("rating"))
-    analysis = {
-        "symbol": symbol,
-        "as_of_utc": _now_utc_iso(),
-        "pnl_abs": None,          # unknown (we're not doing portfolio math here)
-        "pnl_pct": None,          # unknown
-        "market_context": {},     # intentionally empty (no Yahoo)
-        "rating": rating,
-        "rationale": obj.get("rationale", ""),
-        "key_risks": obj.get("key_risks", []) or [],
-        "suggestions": obj.get("suggestions", []) or [],
-        "data_notes": [
-            "Live analysis via Perplexity Sonar (web search).",
-            f"Model: {PPLX_MODEL}, Recency: {SEARCH_RECENCY}",
-        ],
-        "disclaimer": obj.get("disclaimer", "This is educational information, not financial advice."),
-        # optional for UI:
-        "sources": obj.get("sources", []) or [],
-        "provider_used": "perplexity",
-    }
-    return analysis
+    try:
+        data = extract_json(text)
+    except Exception as e:
+        return {"error": "parse_failed", "detail": str(e), "raw": text, "citations": prov_citations}
+
+    # normalize/ensure citations exist (prefer model’s, else provider’s)
+    data["citations"] = data.get("citations") or prov_citations
+    return data
