@@ -19,6 +19,7 @@ app = FastAPI()
 origins = [
     "http://localhost:3000",
     "https://investments-backend-1db4.vercel.app",
+    "https://investmentai.life",
 ]
 
 app.add_middleware(

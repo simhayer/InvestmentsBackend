@@ -24,6 +24,7 @@ AUTH_COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
 AUTH_COOKIE_SAMESITE = "none"
 # Set to False only for local HTTP; must be True on HTTPS
 AUTH_COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "true").lower() == "true"
+AUTH_COOKIE_DOMAIN = os.getenv("AUTH_COOKIE_DOMAIN", None)  # e.g. ".yourdomain.com"
 
 
 @router.post("/register")
@@ -53,6 +54,7 @@ def login(
         secure=AUTH_COOKIE_SECURE,
         samesite=AUTH_COOKIE_SAMESITE,
         max_age=AUTH_COOKIE_MAX_AGE,
+        domain=AUTH_COOKIE_DOMAIN,
         path="/",
     )
     return resp
