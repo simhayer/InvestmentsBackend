@@ -19,7 +19,7 @@ from services.auth_service import get_current_user
 
 # Plaid setup
 configuration = Configuration(
-    host=Environment.Sandbox,
+    host=os.getenv("PLAID_ENV", "sandbox").lower() == "production" and Environment.Production or Environment.Sandbox,
     api_key={
         "clientId": os.getenv("PLAID_CLIENT_ID"),
         "secret": os.getenv("PLAID_SECRET"),

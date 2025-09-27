@@ -21,7 +21,7 @@ router = APIRouter()
 # --- Cookie config ---
 AUTH_COOKIE_NAME = os.getenv("AUTH_COOKIE_NAME", "auth_token")
 AUTH_COOKIE_MAX_AGE = 60 * 60 * 24 * 7  # 7 days
-AUTH_COOKIE_SAMESITE = "none"
+AUTH_COOKIE_SAMESITE = "none"  # 'lax' for locahost, 'none' for prod
 # Set to False only for local HTTP; must be True on HTTPS
 AUTH_COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "true").lower() == "true"
 AUTH_COOKIE_DOMAIN = os.getenv("AUTH_COOKIE_DOMAIN", None)  # e.g. ".yourdomain.com"
