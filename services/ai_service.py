@@ -7,6 +7,9 @@ from services.helpers.ai.analyze_portfolio_linkup import analyze_portfolio_linku
 from services.helpers.ai.analyze_holding_linkup import analyze_holding_linkup, analyze_holding_only_linkup
 from services.yahoo_service import get_full_stock_data
 from services.helpers.ai.analyze_holding_perplexity import analyze_investment_symbol_pplx
+from services.helpers.ai.analyze_portfolio_perplexity import analyze_portfolio_pplx
+from services.helpers.ai.risk import compute_risk
+from services.helpers.ai.riskai import generate_ai_risk_summary
 from typing import Any, Dict
 
 llm = ChatOpenAI(
@@ -34,6 +37,14 @@ def analyze_investment_portfolio(holdings: list[dict[str, Any]]) -> dict[str, An
     #     return json.loads(raw)
     # except Exception:
     #     return {"error": "Could not parse portfolio analysis output", "raw": raw}
+
+def analyze_portfolio_perplexity(holdings: list[dict[str, Any]]) -> dict[str, Any]:
+    result = analyze_portfolio_pplx(holdings)
+    risk = compute_risk(result["summary"], result["positions"])
+    risk["ai"] = generate_ai_risk_summary(risk, result["summary"], result["positions"])
+    result["risk"] = risk
+
+    return result
 
 def analyze_investment_symbol_perplexity(symbol: str) -> Dict[str, Any]:
     # holding = {"symbol": symbol}
