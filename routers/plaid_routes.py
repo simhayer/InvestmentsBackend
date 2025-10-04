@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 import os
 from fastapi import APIRouter, HTTPException, Body
 from plaid import Configuration, ApiClient, Environment
@@ -195,12 +196,19 @@ def sync_plaid_holdings(user_id: int, plaid_holdings: List[Dict], db: Session):
         if h.external_id not in seen_ids:
             db.delete(h)
 
+    # update the synced_at timestamp for all tokens of this user
+    tokens = db.query(UserAccess).filter_by(user_id=str(user_id)).all()
+    for t in tokens:
+        t.synced_at = datetime.now(timezone.utc)
+
     db.commit()
 
 class InstitutionOut(BaseModel):
+    id: str
     institution_name: str
     institution_id: str
     created_at: str
+    synced_at: str | None = None
 
 @router.get("/institutions", response_model=List[InstitutionOut])
 async def get_connected_institutions(
@@ -212,9 +220,11 @@ async def get_connected_institutions(
 
         return [
             {
+                "id": ua.id,
                 "institution_name": ua.institution_name,
                 "institution_id": ua.institution_id,
                 "created_at": ua.created_at.isoformat(),
+                "synced_at": ua.synced_at.isoformat() if ua.synced_at else None,
             }
             for ua in institutions
             if ua.institution_id and ua.institution_name

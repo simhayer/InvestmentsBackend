@@ -1,7 +1,7 @@
 # services/portfolio/analyzer_ai.py
 from __future__ import annotations
 
-from collections import defaultdict, Counter
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
