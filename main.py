@@ -12,6 +12,7 @@ from routers.finnhub_routes import router as finnhub_router  # keep this as-is
 from routers.plaid_routes import router as plaid_routers
 from routers.ai_routes import router as ai_router  # keep this as-is
 from routers.investment_routes import router as investment_router
+from routers.portfolio_routes import router as portfolio_router
 
 
 app = FastAPI()
@@ -37,6 +38,7 @@ app.include_router(finnhub_router, prefix="/api/finnhub")
 app.include_router(plaid_routers, prefix="/api/plaid")
 app.include_router(ai_router, prefix="/api/ai")
 app.include_router(investment_router, prefix="/api/market")
+app.include_router(portfolio_router, prefix="/api/portfolio")
 
 # db startup
 from database import Base, engine
