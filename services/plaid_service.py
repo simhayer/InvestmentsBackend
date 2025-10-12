@@ -33,3 +33,20 @@ def fetch_plaid_holdings_for_user(user_id: str, db: Session) -> List[Dict]:
             continue
 
     return all_holdings
+
+
+
+def get_connections(userId: str, db: Session) -> List[Dict]:
+    institutions = db.query(UserAccess).filter(UserAccess.user_id == str(userId)).all()
+
+    return [
+        {
+            "id": ua.id,
+            "institution_name": ua.institution_name,
+            "institution_id": ua.institution_id,
+            "created_at": ua.created_at.isoformat(),
+            "synced_at": ua.synced_at.isoformat() if ua.synced_at else None,
+        }
+        for ua in institutions
+        if ua.institution_id and ua.institution_name
+    ]

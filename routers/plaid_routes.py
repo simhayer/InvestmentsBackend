@@ -17,6 +17,7 @@ from pydantic import BaseModel
 from models.holding import Holding
 from typing import List, Dict
 from services.auth_service import get_current_user
+from services.plaid_service import get_connections
 
 # Plaid setup
 configuration = Configuration(
@@ -216,18 +217,6 @@ async def get_connected_institutions(
     user=Depends(get_current_user),
 ):
     try:
-        institutions = db.query(UserAccess).filter(UserAccess.user_id == str(user.id)).all()
-
-        return [
-            {
-                "id": ua.id,
-                "institution_name": ua.institution_name,
-                "institution_id": ua.institution_id,
-                "created_at": ua.created_at.isoformat(),
-                "synced_at": ua.synced_at.isoformat() if ua.synced_at else None,
-            }
-            for ua in institutions
-            if ua.institution_id and ua.institution_name
-        ]
+        return get_connections(user.id, db)
     except Exception as e:
         raise HTTPException(status_code=500, detail="Failed to fetch institutions")

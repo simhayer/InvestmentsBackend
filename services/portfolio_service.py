@@ -2,13 +2,14 @@
 from __future__ import annotations
 from typing import Any, Dict, List, Tuple
 from decimal import Decimal
-import math, time
+import  time
 
 from sqlalchemy.orm import Session
 from services.finnhub_service import FinnhubService
-from services.holding_service import get_all_holdings
+from services.holding_service import get_all_holdings, get_holdings_with_live_prices_top
 # If you already have get_holdings_with_live_prices, we’ll reuse it directly:
 from services.holding_service import get_holdings_with_live_prices
+from services.plaid_service import get_connections
 
 Number = float | int | Decimal
 
@@ -76,33 +77,10 @@ async def get_portfolio_summary(
             {"key": k, "value": round(v, 2), "weight": round(v / market_value * 100.0, 2)}
             for k, v in sorted(d.items(), key=lambda x: -x[1])
         ]
+    
+    enriched_top = await get_holdings_with_live_prices_top(user_id, db, finnhub, currency=currency, top_only=True, top_n=top_n)
 
-    # Top positions by weight
-    def position_value(h: Dict[str, Any]) -> float:
-        v = _to_float(h.get("value"))
-        if v > 0:
-            return v
-        return _to_float(h.get("current_price")) * _to_float(h.get("quantity"))
-
-    sorted_positions = sorted(items, key=position_value, reverse=True)
-    top_positions = []
-    for h in sorted_positions[:top_n]:
-        v = position_value(h)
-        qty = _to_float(h.get("quantity"))
-        curr = _to_float(h.get("current_price"))
-        pur = _to_float(h.get("purchase_price"))
-        pc  = _to_float(h.get("previous_close")) if "previous_close" in h else _to_float(h.get("previousClose"))
-        unreal = (curr - pur) * qty if pur > 0 else None
-        dayp   = (curr - pc) * qty if pc > 0 else None
-        top_positions.append({
-            "symbol": h.get("symbol"),
-            "name": h.get("name"),
-            "type": h.get("type"),
-            "value": round(v, 2),
-            "weight": round(v / market_value * 100.0, 2) if market_value > 0 else None,
-            "unrealized_pl": None if unreal is None else round(unreal, 2),
-            "day_pl": None if dayp is None else round(dayp, 2),
-        })
+    connections = get_connections(user_id, db)
 
     return {
         "as_of": enriched.get("as_of", int(time.time())),
@@ -118,5 +96,6 @@ async def get_portfolio_summary(
             "by_type": normalize_alloc(alloc_by_type),
             "by_account": normalize_alloc(alloc_by_account),
         },
-        "top_positions": top_positions,
+        "top_positions": enriched_top.get("items", []),
+        "connections": connections,
     }

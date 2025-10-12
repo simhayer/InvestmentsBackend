@@ -16,7 +16,6 @@ async def analyze_portfolio_endpoint(
 ):
     holdings = get_all_holdings(user.id, db)
     return await run_in_threadpool(analyze_portfolio_perplexity, holdings)
-    # return await run_in_threadpool(analyze_investment_portfolio, holdings)
 
 class SymbolReq(BaseModel):
     symbol: str
