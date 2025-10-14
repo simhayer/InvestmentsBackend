@@ -12,7 +12,7 @@ router = APIRouter()
 @router.get("/latest-for-user")
 async def get_latest_news_for_user(user=Depends(get_current_user) ,db: Session = Depends(get_db), ):
     holdings = get_all_holdings(user.id, db)
-    holdingSymbols = [str(h.get("symbol")) for h in holdings if isinstance(h.get("symbol"), str)]
+    holdingSymbols = [str(h.symbol) for h in holdings if isinstance(h.symbol, str)]
     if not holdingSymbols:
         return {"news": []}
     

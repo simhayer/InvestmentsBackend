@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 import json
 from datetime import datetime, timezone
+from models.holding import Holding
 
 # ---- AI client & JSON helpers (adjust paths to your project) ----
 from services.helpers.ai.json_helpers import S, E, extract_json
@@ -24,7 +25,7 @@ class Position:
 
 
 def analyze_portfolio_pplx(
-    rows: List[Dict[str, Any]],
+    rows: List[Holding], 
     *,
     symbol_analyzer: Optional[Callable[[str], Dict[str, Any]]] = None,  # your existing per-symbol function
     analyze_top_n: int = 12,
@@ -188,10 +189,10 @@ def _pnl_for_row(r: Dict[str, Any]) -> Tuple[Optional[float], Optional[float]]:
     pnl_pct = ((mv / cost) - 1.0) * 100.0 if cost > 0 else None
     return pnl_abs, pnl_pct
 
-def _winners_losers(rows: List[Dict[str, Any]], limit: int = 3):
+def _winners_losers(rows: List[Holding], limit: int = 3):
     scored = []
     for r in rows:
-        sym = str(r.get("symbol") or "").upper()
+        sym = str(r.symbol or "").upper()
         if not sym: continue
         _, pnl_pct = _pnl_for_row(r)
         if pnl_pct is None: continue
@@ -201,7 +202,7 @@ def _winners_losers(rows: List[Dict[str, Any]], limit: int = 3):
     return winners, losers
 
 def generate_portfolio_insights_pplx(
-    *, summary: Dict[str, Any], positions: List[Dict[str, Any]], rows: List[Dict[str, Any]],
+    *, summary: Dict[str, Any], positions: List[Dict[str, Any]], rows: List[Holding],
     portfolio_return_pct: Optional[float], benchmark_return_pct: Optional[float]
 ) -> Tuple[List[Dict[str, Any]], str]:
     winners, losers = _winners_losers(rows)

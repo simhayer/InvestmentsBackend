@@ -1,9 +1,10 @@
 from decimal import Decimal
-import time
+from typing import Any, Dict, List, Tuple, Optional
 from sqlalchemy.orm import Session
+from models.holding import Holding, HoldingOut
 from services.finnhub_service import FinnhubService
-from models.holding import Holding
-from typing import Any, Dict, List, Tuple
+from math import fsum
+import time
 
 def _to_float(x: Any) -> float:
     if isinstance(x, Decimal):
@@ -13,46 +14,93 @@ def _to_float(x: Any) -> float:
     except Exception:
         return 0.0
 
-def _position_value(h: Dict[str, Any]) -> float:
-    v = _to_float(h.get("value"))
-    if v > 0:
-        return v
-    return _to_float(h.get("current_price")) * _to_float(h.get("quantity"))
+def _key(symbol: Optional[str], typ: Optional[str]) -> str:
+    s = (symbol or "").upper().strip()
+    t = (typ or "").lower().strip()
+    return f"{s}:{t}" if t else s
 
-def _enrich_pl_fields(h: Dict[str, Any]) -> Dict[str, Any]:
-    # returns a copy with day_pl / unrealized_pl
-    out = dict(h)
-    qty  = _to_float(h.get("quantity"))
-    curr = _to_float(h.get("current_price"))
-    pur  = _to_float(h.get("purchase_price"))
-    pc   = _to_float(h.get("previous_close")) if "previous_close" in h else _to_float(h.get("previousClose"))
-    out["day_pl"] = None if pc <= 0 else round((curr - pc) * qty, 2)
-    out["unrealized_pl"] = None if pur <= 0 else round((curr - pur) * qty, 2)
+def _position_value(h: HoldingOut) -> float:
+    v = _to_float(getattr(h, "value", 0.0))
+    return v if v > 0 else _to_float(h.current_price) * _to_float(h.quantity)
+
+def _enrich_pl_fields(h: HoldingOut) -> HoldingOut:
+    out = h.model_copy(deep=True)
+    qty  = _to_float(getattr(h, "quantity", 0.0))
+    curr = getattr(h, "current_price", None)
+    pur  = getattr(h, "purchase_price", None)
+    pc   = getattr(h, "previous_close", None)
+
+    curr_f = _to_float(curr) if curr is not None else None
+    pur_f  = _to_float(pur)  if pur  is not None else None
+    pc_f   = _to_float(pc)   if pc   is not None else None
+
+    out.day_pl = None if (curr_f is None or pc_f is None or pc_f <= 0) \
+        else round((curr_f - pc_f) * qty, 2)
+    out.unrealized_pl = None if (curr_f is None or pur_f is None or pur_f <= 0) \
+        else round((curr_f - pur_f) * qty, 2)
     return out
 
-def get_all_holdings(user_id: str, db: Session) -> list[dict[str, Any]]:
-    """
-    Get all holdings for a user.
-    """
-    holdings = db.query(Holding).filter_by(user_id=user_id).all()
+def get_all_holdings(user_id: str, db: Session) -> List[Holding]:
+    return db.query(Holding).filter_by(user_id=user_id).all()
 
-    return [
-        {
-            "id": h.id,
-            "symbol": h.symbol,
-            "name": h.name,
-            "type": h.type,
-            "quantity": h.quantity,
-            "purchase_price": h.purchase_price,
-            "current_price": h.current_price,
-            "value": h.value,
-            "currency": h.currency,
-            "institution": h.institution,
-            "account_name": h.account_name,
-            "source": h.source,
+async def get_holdings_with_live_prices_top(
+    user_id: str,
+    db: Session,
+    finnhub: FinnhubService,
+    currency: str = "USD",
+    *,
+    top_only: bool = False,
+    top_n: int = 5,
+    include_weights: bool = True,
+) -> Dict[str, Any]:
+    rows = get_all_holdings(user_id, db)
+    if not rows:
+        return {
+            "items": [],
+            "as_of": int(time.time()),
+            "price_status": "live",
+            "requested_currency": currency.upper(),
         }
-        for h in holdings
+
+    # 1) Request and normalize quote keys to our _key format
+    pairs: List[Tuple[str, str]] = [
+        ((h.symbol or ""), (h.type or "")) for h in rows if (h.symbol or "").strip()
     ]
+    quotes_raw = await finnhub.get_prices(pairs=pairs, currency=currency)
+
+    normalized_quotes: Dict[str, Dict[str, Any]] = {}
+    for k, v in (quotes_raw or {}).items():
+        if isinstance(k, (tuple, list)):
+            kk = _key(k[0] if k else None, (k[1] if len(k) > 1 else None))
+        else:
+            kk = _key(str(k), None)
+        if v and v.get("currentPrice") not in (None, 0):
+            normalized_quotes[kk] = v
+
+    # 2) Build enriched items (current_price / previous_close / value / price_status)
+    items = enrich_holdings(rows, normalized_quotes, currency)
+
+    # compute top regardless of top_only
+    market_value = sum(max(_position_value(it), 0.0) for it in items)
+    sorted_items = sorted(items, key=_position_value, reverse=True)
+
+    top_items: List[HoldingOut] = []
+    for it in sorted_items[: max(1, top_n)]:
+        v = _position_value(it)
+        copy = _enrich_pl_fields(it)      # fills day_pl & unrealized_pl
+        copy.value = round(v, 2)
+        if include_weights:
+            copy.weight = round(v / market_value * 100.0, 2) if market_value > 0 else None
+        top_items.append(copy)
+
+    payload = {
+        "items": items if not top_only else top_items,   # <— when top_only, return only top
+        "top_items": top_items,                           # <— always include enriched top slice
+        "as_of": int(time.time()),
+        "price_status": "live",
+        "requested_currency": currency.upper(),
+    }
+    return payload
 
 async def get_holdings_with_live_prices(
     user_id: str,
@@ -60,47 +108,15 @@ async def get_holdings_with_live_prices(
     finnhub: FinnhubService,
     currency: str = "USD",
 ) -> Dict[str, Any]:
-    """
-    Returns holdings enriched with live prices from Finnhub.
-    Never mutates DB; this is a read-time aggregation.
-    """
     rows = get_all_holdings(user_id, db)
-
     if not rows:
-        return {"items": [], "as_of": int(time.time()), "price_status": "live"}
+        return {"items": [], "as_of": int(time.time()), "price_status": "live", "requested_currency": currency.upper()}
 
-    # De-dupe by (symbol, type) because the same security can appear across accounts.
-    pairs: List[Tuple[str, str]] = list({(h["symbol"], h["type"]) for h in rows})
+    pairs: List[Tuple[str, str]] = [(h.symbol or "", h.type or "") for h in rows if h.symbol and h.symbol.strip()]
     quotes = await finnhub.get_prices(pairs=pairs, currency=currency)
+    filtered_quotes = {k: v for k, v in quotes.items() if v and v.get("currentPrice") is not None and v.get("currentPrice") != 0}
 
-    items: List[Dict[str, Any]] = []
-    for h in rows:
-        q = quotes.get(h["symbol"])
-
-        # Convert Decimal -> float for arithmetic if your model uses Decimal
-        qty = float(h["quantity"]) if isinstance(h["quantity"], Decimal) else (h["quantity"] or 0.0)
-
-        enriched = dict(h)  # shallow copy
-        if q and q.get("currentPrice"):
-            live_price = float(q["currentPrice"])
-            enriched["current_price"] = live_price
-            enriched["previous_close"] = float(q.get("previousClose") or 0)
-            enriched["currency"] = q.get("currency", currency.upper())
-            enriched["value"] = round(live_price * qty, 2)
-            enriched["price_status"] = "live"
-        else:
-            # Keep whatever you had in DB, but mark as unavailable
-            enriched["price_status"] = "unavailable"
-
-            # If DB has price, recompute value to be consistent
-            if enriched.get("current_price") is not None:
-                try:
-                    enriched["value"] = round(float(enriched["current_price"]) * qty, 2)
-                except Exception:
-                    pass
-
-        items.append(enriched)
-
+    items = enrich_holdings(rows, filtered_quotes, currency)
     return {
         "items": items,
         "as_of": int(time.time()),
@@ -108,78 +124,52 @@ async def get_holdings_with_live_prices(
         "requested_currency": currency.upper(),
     }
 
-async def get_holdings_with_live_prices_top(
-    user_id: str,
-    db,
-    finnhub,
+def enrich_holdings(
+    holdings: List[Holding],
+    prices: Dict[str, Dict[str, Any]],
     currency: str = "USD",
-    *,
-    top_only: bool = False,
-    top_n: int = 5,
-    include_weights: bool = True,
-) -> Dict[str, Any]:
-    """
-    Returns holdings enriched with live prices from Finnhub.
-    If top_only=True, returns the top N positions by value but keeps the SAME shape.
-    Never mutates DB.
-    """
-    rows = get_all_holdings(user_id, db)
-    if not rows:
-        return {"items": [], "as_of": int(time.time()), "price_status": "live", "requested_currency": currency.upper()}
+) -> List[HoldingOut]:
+    enriched: List[HoldingOut] = []
+    for h in holdings:
+        k = _key(h.symbol, h.type)
+        q = prices.get(k) or prices.get(_key(h.symbol, None))  # fallback to symbol-only
 
-    # De-dupe by (symbol, type) because the same security can appear across accounts.
-    pairs: List[Tuple[str, str]] = list({(h["symbol"], h["type"]) for h in rows})
-    quotes = await finnhub.get_prices(pairs=pairs, currency=currency)
+        qty = _to_float(h.quantity)
 
-    items: List[Dict[str, Any]] = []
-    for h in rows:
-        q = quotes.get(h["symbol"])
-        qty = _to_float(h.get("quantity") or 0.0)
+        dto = HoldingOut(
+            id=h.id,
+            user_id=h.user_id,
+            source=h.source,
+            external_id=h.external_id,
+            symbol=h.symbol,
+            name=h.name,
+            type=h.type,
+            quantity=h.quantity,
+            current_price=h.current_price,
+            purchase_price=h.purchase_price,
+            value=h.value,
+            account_name=h.account_name,
+            institution=h.institution,
+            currency=h.currency,
+        )
 
-        enriched = dict(h)  # shallow copy
-        if q and q.get("currentPrice"):
+        if q and q.get("currentPrice") is not None:
             live_price = _to_float(q["currentPrice"])
-            enriched["current_price"] = live_price
-            enriched["previous_close"] = _to_float(q.get("previousClose") or 0)
-            enriched["currency"] = q.get("currency", currency.upper())
-            enriched["value"] = round(live_price * qty, 2)
-            enriched["price_status"] = "live"
+            dto.current_price = live_price
+            dto.previous_close = (
+                _to_float(q.get("previousClose")) if q.get("previousClose") is not None else None
+            )
+            dto.currency = q.get("currency") or (dto.currency or currency.upper())
+            dto.value = round(live_price * qty, 2)
+            dto.price_status = "live"
         else:
-            enriched["price_status"] = "unavailable"
-            # If DB had a price, recompute value consistently
-            if enriched.get("current_price") is not None:
+            dto.price_status = "unavailable"
+            if dto.current_price is not None:
                 try:
-                    enriched["value"] = round(_to_float(enriched["current_price"]) * qty, 2)
+                    dto.value = round(_to_float(dto.current_price) * qty, 2)
                 except Exception:
                     pass
 
-        items.append(enriched)
+        enriched.append(dto)
 
-    # If not requesting top, return as-is (original behavior)
-    payload = {
-        "items": items,
-        "as_of": int(time.time()),
-        "price_status": "live",
-        "requested_currency": currency.upper(),
-    }
-    if not top_only or not items:
-        return payload
-
-    # Compute market value to calculate weights
-    market_value = 0.0
-    for it in items:
-        v = _position_value(it)
-        market_value += max(v, 0.0)
-
-    # Pick top N by value; keep SAME item shape and just add optional fields
-    sorted_items = sorted(items, key=_position_value, reverse=True)
-    top_items: List[Dict[str, Any]] = []
-    for it in sorted_items[: max(1, top_n)]:
-        v = _position_value(it)
-        copy = _enrich_pl_fields(it)
-        copy["value"] = round(v, 2)  # ensure consistent value
-        if include_weights:
-            copy["weight"] = round(v / market_value * 100.0, 2) if market_value > 0 else None
-        top_items.append(copy)
-
-    return {**payload, "items": top_items}
+    return enriched

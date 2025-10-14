@@ -11,6 +11,7 @@ from services.helpers.ai.analyze_portfolio_perplexity import analyze_portfolio_p
 from services.helpers.ai.risk import compute_risk
 from services.helpers.ai.riskai import generate_ai_risk_summary
 from typing import Any, Dict
+from models.holding import Holding
 
 llm = ChatOpenAI(
     temperature=0.0,
@@ -38,7 +39,7 @@ def analyze_investment_portfolio(holdings: list[dict[str, Any]]) -> dict[str, An
     # except Exception:
     #     return {"error": "Could not parse portfolio analysis output", "raw": raw}
 
-def analyze_portfolio_perplexity(holdings: list[dict[str, Any]]) -> dict[str, Any]:
+def analyze_portfolio_perplexity(holdings: list[Holding]) -> dict[str, Any]:
     result = analyze_portfolio_pplx(holdings)
     risk = compute_risk(result["summary"], result["positions"])
     risk["ai"] = generate_ai_risk_summary(risk, result["summary"], result["positions"])
