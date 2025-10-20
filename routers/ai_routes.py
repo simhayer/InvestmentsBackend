@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from pydantic import BaseModel
 from fastapi import APIRouter, Body, Query
-from services.portfolio_summary import summarize_portfolio_news, PortfolioSummary
+from services.portfolio_summary import summarize_portfolio_news
 from services.finnhub_news_service import get_company_news_for_symbols
 from typing import List
 
@@ -46,16 +46,24 @@ async def portfolio_news_summary(
     )
 
     # 2) Summarize as a portfolio brief
-    summary = await summarize_portfolio_news(news_by_symbol, symbols=symbols)
+    news_by_symbol_dict = {
+        symbol: [item.__dict__ if hasattr(item, "__dict__") else dict(item) for item in items]
+        for symbol, items in news_by_symbol.items()
+    }
+    summary_text = await summarize_portfolio_news(news_by_symbol_dict, symbols=symbols)
 
-    # 3) (Optionally) inject top sources from raw news if model returned none
-    if not summary.get("sources"):
-        urls = []
-        for arr in news_by_symbol.values():
-            for it in arr:
-                u = it.get("url")
-                if u and u not in urls:
-                    urls.append(u)
-        summary["sources"] = urls[:8]
+    urls: list[str] = []
+    for arr in news_by_symbol.values():
+        for it in arr:
+            u = it.get("url")
+            if u and u not in urls:
+                urls.append(u)
 
-    return summary
+    return {
+        "summary": summary_text,
+        "highlights": [],       # (optional) you can derive separately later
+        "risks": [],            # (optional)
+        "per_symbol": {},       # (optional)
+        "sentiment": 0,         # (optional)
+        "sources": urls[:8],
+    }
