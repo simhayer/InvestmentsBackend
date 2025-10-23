@@ -64,7 +64,9 @@ async def search_symbols(
     svc: FinnhubService = Depends(get_finnhub_service),
 ):
     try:
-        return await svc.search_symbols(query)
+        results = await svc.search_symbols(query)
+        limit = 5
+        return results[:limit]
     except FinnhubServiceError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
