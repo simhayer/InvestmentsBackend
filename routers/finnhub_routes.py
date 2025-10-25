@@ -60,7 +60,6 @@ async def get_prices(
 @router.get("/search")
 async def search_symbols(
     query: str,
-    user=Depends(get_current_user),
     svc: FinnhubService = Depends(get_finnhub_service),
 ):
     try:

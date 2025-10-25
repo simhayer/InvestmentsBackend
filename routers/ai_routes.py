@@ -9,6 +9,7 @@ from pydantic import BaseModel
 from fastapi import APIRouter, Body, Query
 from services.portfolio_summary import summarize_portfolio_news
 from services.finnhub_news_service import get_company_news_for_symbols
+from services.helpers.linkup.symbol_analysis import get_linkup_symbol_analysis
 from typing import List
 
 router = APIRouter()
@@ -24,9 +25,13 @@ async def analyze_portfolio_endpoint(
 class SymbolReq(BaseModel):
     symbol: str
 
+# @router.post("/analyze-symbol")
+# async def analyze_symbol_endpoint(req: SymbolReq, user=Depends(get_current_user)):
+#     return await run_in_threadpool(analyze_investment_symbol_perplexity, req.symbol)
+
 @router.post("/analyze-symbol")
 async def analyze_symbol_endpoint(req: SymbolReq, user=Depends(get_current_user)):
-    return await run_in_threadpool(analyze_investment_symbol_perplexity, req.symbol)
+    return await run_in_threadpool(get_linkup_symbol_analysis, req.symbol)
 
 @router.post("/news-summary")
 async def portfolio_news_summary(

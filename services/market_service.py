@@ -1,9 +1,18 @@
 # services/market_service.py
 from __future__ import annotations
 
-from typing import Any, Dict, List, Tuple
+import json
+import os
+from typing import Any, Dict, List, Tuple, cast
 from datetime import datetime, timezone, timedelta
-from services.helpers.ai.market_helper import generate_ai_summary
+from services.helpers.linkup.linkup_summary import get_linkup_market_summary
+from models.market_summary import MarketSummary
+import hashlib
+import redis
+REDIS_URL = os.getenv("REDIS_URL")
+r = redis.from_url(REDIS_URL) if REDIS_URL else None
+CACHE_KEY = "linkup:market_summary"
+TTL_SEC = 1800  # 30 min
 
 from sqlalchemy.orm import Session
 
@@ -141,7 +150,7 @@ def get_market_overview_cached(db: Session, *, max_age_sec: int = 60) -> Json:
             return payload
 
     # 2) DB
-    max_age_sec_for_db = max_age_sec * 15
+    max_age_sec_for_db = max_age_sec
     db_latest = db_read_latest(db)
     if db_latest:
         fetched_at = db_latest.get("fetched_at")
@@ -156,7 +165,6 @@ def get_market_overview_cached(db: Session, *, max_age_sec: int = 60) -> Json:
         # If data fresh but AI summary stale/missing, refresh just the summary
         if not is_stale and _needs_ai_refresh(db_latest):
             try:
-                _attach_ai_summary(db_latest)
                 db_upsert_latest(db, db_latest)
                 _MEM[MEM_KEY] = (datetime.now(timezone.utc), db_latest)
             except Exception:
@@ -170,11 +178,6 @@ def get_market_overview_cached(db: Session, *, max_age_sec: int = 60) -> Json:
 
     # 3) Build fresh, then attach AI summary, persist + history
     fresh = build_overview_payload()
-    try:
-        _attach_ai_summary(fresh)
-    except Exception:
-        # Make sure API never fails
-        pass
 
     db_upsert_latest(db, fresh)
     db_append_history(db, fresh)
@@ -185,22 +188,10 @@ def get_market_overview_cached(db: Session, *, max_age_sec: int = 60) -> Json:
 # in refresh_market_overview()
 def refresh_market_overview(db: Session) -> Json:
     fresh = build_overview_payload()
-    try:
-        _attach_ai_summary(fresh)
-    except Exception:
-        pass
     db_upsert_latest(db, fresh)
     db_append_history(db, fresh)
     _MEM[MEM_KEY] = (datetime.now(timezone.utc), fresh)
     return fresh
-
-# helper: (add below Core builders)
-def _attach_ai_summary(payload: Json) -> Json:
-    # Generate from current items; never throw
-    res = generate_ai_summary(payload.get("items") or [])
-    payload["ai_summary"] = res.get("text")
-    payload["ai_meta"] = res.get("meta")
-    return payload
 
 def _needs_ai_refresh(db_latest: Json, *, ttl_minutes: int = 180) -> bool:
     # Refresh if missing or older than ttl
@@ -214,3 +205,29 @@ def _needs_ai_refresh(db_latest: Json, *, ttl_minutes: int = 180) -> bool:
         return (datetime.now(timezone.utc) - prev) > timedelta(minutes=ttl_minutes)
     except Exception:
         return True
+
+def _etag_for(obj: dict) -> str:
+    return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()
+
+def get_market_summary_cached(db: Session) -> Tuple[Json, datetime]:
+    ...
+    latest = (
+        db.query(MarketSummary)
+        .order_by(MarketSummary.created_at.desc())
+        .limit(1)
+        .one_or_none()
+    )
+    if latest and (datetime.now(timezone.utc) - cast(datetime, latest.created_at)) < timedelta(seconds=TTL_SEC):
+        return latest.payload, cast(datetime, latest.created_at)
+
+    fresh = get_linkup_market_summary()
+    rec = MarketSummary(
+        as_of=datetime.fromisoformat(fresh["as_of"]),
+        market=fresh["market"],
+        payload=fresh,
+    )
+    db.add(rec)
+    db.commit()
+    if r:
+        r.setex(CACHE_KEY, TTL_SEC, json.dumps(fresh))
+    return fresh, cast(datetime, rec.created_at)

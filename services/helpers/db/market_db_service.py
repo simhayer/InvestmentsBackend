@@ -13,7 +13,6 @@ def db_read_latest(db: Session) -> Optional[Json]:
     return {
         "symbols": record.symbols,
         "items": record.items,
-        "ai_summary": record.ai_summary,
         "fetched_at": record.fetched_at.isoformat() if record.fetched_at else None,
     }
 
@@ -22,7 +21,6 @@ def db_upsert_latest(db: Session, payload: Json) -> None:
     latest = MarketOverviewLatest(
         symbols=payload["symbols"],
         items=payload["items"],
-        ai_summary=payload.get("ai_summary"),
         fetched_at=datetime.utcnow(),
     )
     db.add(latest)
@@ -32,7 +30,6 @@ def db_append_history(db: Session, payload: Json) -> None:
     hist = MarketOverviewHistory(
         symbols=payload["symbols"],
         items=payload["items"],
-        ai_summary=payload.get("ai_summary"),
     )
     db.add(hist)
     db.commit()
