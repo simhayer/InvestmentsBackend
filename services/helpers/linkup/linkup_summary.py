@@ -66,7 +66,7 @@ def get_linkup_market_summary() -> dict:
         "(S&P 500, NASDAQ, Dow Jones, yields, CPI, Fed policy, energy, etc.). "
         "Use reliable sources like Bloomberg, Reuters, and WSJ."
         ),
-        depth="standard",
+        depth="deep",
         output_type="structured",
         structured_output_schema=json.dumps(schema),
         include_images=False,

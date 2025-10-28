@@ -5,7 +5,7 @@ import math
 import time
 from datetime import datetime, timezone, timedelta, date
 
-from typing import Any, Dict, Callable, List, Optional, Tuple, Type
+from typing import Any, Dict, Callable, Iterable, List, Optional, Tuple, Type
 
 from yahooquery import Ticker
 import pandas as pd
@@ -903,3 +903,161 @@ def _get_symbol_node(res: Any, sym: str) -> Dict[str, Any]:
         # sometimes it's already the node (modules at top level)
         return res if any(isinstance(v, (dict, list)) for v in res.values()) else {}
     return {}
+
+
+# --- plug your cache helpers here (no-ops shown) ---
+def _cache_get_many(symbols: List[str]) -> Dict[str, Optional[Json]]:
+    return {s: None for s in symbols}
+
+def _cache_set_many(kv: Dict[str, Json], ttl_seconds: int = 60) -> None:
+    pass
+
+def _missing_fields(payload: Dict[str, Any]) -> List[str]:
+    return [k for k in ("current_price", "currency", "previous_close") if payload.get(k) is None]
+
+def get_full_stock_data_many(symbols: Iterable[str]) -> Dict[str, Json]:
+    """
+    Bulk version of get_full_stock_data:
+      - Single yahooquery.Ticker call for many symbols
+      - Fetch only minimal modules needed
+      - Returns {symbol: payload}
+    """
+    syms = [s.upper().strip() for s in symbols if s and s.strip()]
+    if not syms:
+        return {}
+
+    # cache first
+    cached_map = _cache_get_many(syms)
+    fresh_needed = [s for s, v in cached_map.items() if not v]
+
+    out: Dict[str, Json] = {s: v for s, v in cached_map.items() if v}
+
+    if not fresh_needed:
+        return out
+
+    # Minimal modules for your payload
+    # price: name/currency/exchange/market times, previous close
+    # summaryDetail: current price, 52w range, dividend_yield, trailing PE etc.
+    # financialData: recommendation, targetMeanPrice, profitability metrics
+    # defaultKeyStatistics: priceToBook, sometimes beta fallback
+    modules = ["price", "summaryDetail", "financialData", "defaultKeyStatistics"]
+
+    # One Ticker for all missing symbols
+    tq = Ticker(fresh_needed, asynchronous=False, formatted=False, validate=False)
+
+    # Single network round for each module set
+    price_all = tq.get_modules("price") or {}
+    sumdet_all = tq.get_modules("summaryDetail") or {}
+    fin_all = tq.get_modules("financialData") or {}
+    stats_all = tq.get_modules("defaultKeyStatistics") or {}
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    write_back: Dict[str, Json] = {}
+
+    for sym in fresh_needed:
+        try:
+            price = _ensure_symbol_dict(price_all, sym)
+            sd    = _ensure_symbol_dict(sumdet_all, sym)
+            fd    = _ensure_symbol_dict(fin_all, sym)
+            ks    = _ensure_symbol_dict(stats_all, sym)
+
+            short_name = price.get("shortName") or price.get("longName")
+            currency   = price.get("currency")
+            exchange   = price.get("exchangeName") or price.get("fullExchangeName")
+
+            current = _fnum(sd.get("regularMarketPrice") or price.get("regularMarketPrice"))
+            previous = _fnum(price.get("regularMarketPreviousClose") or sd.get("previousClose"))
+
+            # range & fundamentals
+            high_52 = _fnum(sd.get("fiftyTwoWeekHigh"))
+            low_52  = _fnum(sd.get("fiftyTwoWeekLow"))
+
+            pe_ratio     = _fnum(sd.get("trailingPE"))
+            forward_pe   = _fnum(sd.get("forwardPE") or fd.get("forwardPE"))
+            price_to_book = _fnum(ks.get("priceToBook") or sd.get("priceToBook"))
+            beta         = _fnum(sd.get("beta") or ks.get("beta"))
+            dividend_yield = _fnum(sd.get("dividendYield"))
+            market_cap   = _fnum(sd.get("marketCap") or price.get("marketCap"))
+
+            return_on_equity = _fnum(fd.get("returnOnEquity"))
+            profit_margins   = _fnum(fd.get("profitMargins"))
+            earnings_growth  = _fnum(fd.get("earningsGrowth"))
+            revenue_growth   = _fnum(fd.get("revenueGrowth"))
+            recommendation   = _fnum(fd.get("recommendationMean"))
+            recommendation_key = fd.get("recommendationKey")
+            target_price     = _fnum(fd.get("targetMeanPrice"))
+
+            quote_ts = (
+                price.get("regularMarketTime")
+                or price.get("postMarketTime")
+                or price.get("preMarketTime")
+            )
+            quote_time_utc = _iso_utc_from_ts(quote_ts)
+
+            day_change      = (current - previous) if (current is not None and previous is not None) else None
+            day_change_pct  = _pct(current, previous)
+            dist_high_pct   = _dist_pct(current, high_52)
+            dist_low_pct    = _dist_pct(current, low_52)
+
+            payload: Json = {
+                "status": "ok",
+                "symbol": sym,
+                "name": short_name,
+                "currency": currency,
+                "exchange": exchange,
+                "quote_time_utc": quote_time_utc,
+                # Prices
+                "current_price": current,
+                "previous_close": previous,
+                "day_change": day_change,
+                "day_change_pct": day_change_pct,
+                # Range
+                "52_week_high": high_52,
+                "52_week_low": low_52,
+                "distance_from_52w_high_pct": dist_high_pct,
+                "distance_from_52w_low_pct": dist_low_pct,
+                # Fundamentals
+                "market_cap": market_cap,
+                "pe_ratio": pe_ratio,
+                "forward_pe": forward_pe,
+                "price_to_book": price_to_book,
+                "beta": beta,
+                "dividend_yield": dividend_yield,
+                "return_on_equity": return_on_equity,
+                "profit_margins": profit_margins,
+                "earnings_growth": earnings_growth,
+                "revenue_growth": revenue_growth,
+                "recommendation": recommendation,
+                "recommendation_key": recommendation_key,
+                "target_price": target_price,
+                # Quality & provenance
+                "data_quality": {
+                    "source": "Yahoo Finance via yahooquery",
+                    "fetched_at_utc": now_iso,
+                    "is_stale": False if not quote_time_utc else (
+                        (datetime.now(timezone.utc) - datetime.fromisoformat(quote_time_utc.replace("Z", "+00:00"))) > timedelta(days=2)
+                    ),
+                    "missing_fields": _missing_fields({
+                        "current_price": current,
+                        "currency": currency,
+                        "previous_close": previous,
+                    }),
+                },
+            }
+
+            out[sym] = payload
+            write_back[sym] = payload
+
+        except Exception as e:
+            out[sym] = {
+                "status": "error",
+                "symbol": sym,
+                "error_code": "YQ_MANY_FAILURE",
+                "message": str(e),
+            }
+
+    if write_back:
+        _cache_set_many(write_back, ttl_seconds=60)  # minute-bucket is typical
+
+    return out
