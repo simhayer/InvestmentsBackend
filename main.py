@@ -25,6 +25,7 @@ origins = [
     "https://investments-backend-1db4.vercel.app",
     "https://investmentai.life",
     "https://www.wallstreetai.io",
+    "https://wallstreetai.io",
 ]
 
 app.add_middleware(
