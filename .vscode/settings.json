@@ -1,0 +1,10 @@
+{
+  "python.defaultInterpreterPath": "${workspaceFolder}/venv/Scripts/python.exe",
+  "python.analysis.diagnosticMode": "openFilesOnly",
+  "python.analysis.indexing": false,
+  "python.analysis.memory.keepLibraryAst": false,
+  "python.analysis.exclude": ["venv"],
+  "files.watcherExclude": { "**/venv/**": true, "**/__pycache__/**": true },
+  "search.exclude": { "**/venv": true, "**/__pycache__": true },
+  "git.autofetch": false
+}

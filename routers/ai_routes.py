@@ -12,7 +12,6 @@ from services.finnhub_news_service import get_company_news_for_symbols
 from services.helpers.linkup.symbol_analysis import get_linkup_symbol_analysis
 from services.helpers.linkup.portfolio_analysis import get_portfolio_ai_layers_from_quotes
 from services.yahoo_service import get_full_stock_data_many
-from typing import List
 
 router = APIRouter()
 
@@ -53,7 +52,7 @@ class SymbolReq(BaseModel):
 
 @router.post("/analyze-symbol")
 async def analyze_symbol_endpoint(req: SymbolReq, user=Depends(get_current_user)):
-    return dummy_holding_response
+    # return dummy_holding_response
     return await run_in_threadpool(get_linkup_symbol_analysis, req.symbol)
 
 @router.post("/news-summary")

@@ -54,7 +54,7 @@ def login(
         secure=AUTH_COOKIE_SECURE,
         samesite= "none" if AUTH_COOKIE_SAMESITE == "none" else "lax",
         max_age=AUTH_COOKIE_MAX_AGE,
-        # domain=AUTH_COOKIE_DOMAIN,
+        domain=AUTH_COOKIE_DOMAIN,
         path="/",
     )
     return resp

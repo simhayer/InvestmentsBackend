@@ -269,6 +269,7 @@ def get_full_stock_data(symbol: str) -> Json:
 
     except Exception as e:
         # Hardened error surface (covers CSRF/crumb & shape mismatches)
+        print("Error in get_full_stock_data:", str(e))
         return {
             "status": "error",
             "error_code": "YAHOOQUERY_FAILURE",
@@ -353,6 +354,7 @@ def get_price_history(symbol: str, period: str = "1y", interval: str = "1d") -> 
         return {"status": "ok", "symbol": sym, "period": period, "interval": interval, "points": points}
 
     except Exception as e:
+        print("Error in get_price_history:", str(e))
         return {"status": "error", "error_code": "YQ_HISTORY_FAILED", "message": str(e)}    
 def _to_epoch_utc(x: Any) -> int | None:
     """Coerce pandas Timestamp / datetime / date / epoch / ISO string to epoch seconds (UTC)."""
@@ -512,6 +514,7 @@ def get_financials(symbol: str, period: str = "annual") -> Json:
         # return {"status": "error", "error_code": "YQ_FINANCIALS_FAILED", "message": 'Fallback to statement DFs if AFD is empty'}
 
     except Exception as e:
+        print("Error in get_financial_data:", str(e))
         return {"status": "error", "error_code": "YQ_FINANCIALS_FAILED", "message": str(e)}
 
 def _financials_df_fallback(sym: str, period: str) -> Json:
@@ -606,6 +609,7 @@ def _financials_df_fallback(sym: str, period: str) -> Json:
         }
 
     except Exception as e:
+        print("Error in _financials_df_fallback:", str(e))
         return {"status": "error", "error_code": "YQ_FINANCIALS_FALLBACK_FAILED", "message": str(e)}
 
 # --- new little helpers for calendarEvents quirks ---
