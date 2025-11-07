@@ -3,12 +3,11 @@
 from sqlalchemy.orm import Session
 from models.access_token import UserAccess
 from plaid.model.investments_holdings_get_request import InvestmentsHoldingsGetRequest
-from plaid_config import client  # <- Make sure you import your configured client
+from plaid_config import client
 from typing import List, Dict
 
 
 def fetch_plaid_holdings_for_user(user_id: str, db: Session) -> List[Dict]:
-    # access_tokens = db.query(UserAccess).filter_by(user_id=user_id).all()
     access_tokens = db.query(UserAccess).filter_by(user_id=str(user_id)).all()
     all_holdings = []
 

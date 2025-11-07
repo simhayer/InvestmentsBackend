@@ -19,6 +19,7 @@ from services.helpers.db.market_db_service import (
     db_upsert_latest,
     db_append_history,
 )
+from utils.common_helpers import safe_float
 
 REDIS_URL = os.getenv("REDIS_URL")
 r = redis.from_url(REDIS_URL) if REDIS_URL else None
@@ -92,13 +93,6 @@ def sanitize_json(obj: Any) -> Any:
 # ---------------------------
 # Data shaping helpers
 # ---------------------------
-def _safe_float(x: Any) -> float | None:
-    try:
-        v = float(x)
-        return None if _is_nonfinite_number(v) else v
-    except Exception:
-        return None
-
 
 def _sparkline_params(symbol: str) -> tuple[str, str]:
     s = symbol.upper()
@@ -146,10 +140,10 @@ def _build_item(symbol: str, quote: Json, hist: Json) -> Json:
             "error": quote.get("message") or quote.get("error_code"),
         }
 
-    price = _safe_float(quote.get("current_price"))
-    prev = _safe_float(quote.get("previous_close"))
+    price = safe_float(quote.get("current_price"))
+    prev = safe_float(quote.get("previous_close"))
     change_abs = (price - prev) if (price is not None and prev is not None) else None
-    change_pct = _safe_float(quote.get("day_change_pct"))
+    change_pct = safe_float(quote.get("day_change_pct"))
     currency = ccy_override or quote.get("currency") or "USD"
 
     spark: List[float] = []

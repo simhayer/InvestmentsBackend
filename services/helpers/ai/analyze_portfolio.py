@@ -2,12 +2,10 @@
 from __future__ import annotations
 
 import json
-import math
 import datetime as dt
-from typing import Any, Optional, Dict, List
+from typing import Any, Dict, List
 from collections import defaultdict
 from utils.common_helpers import round, pct_change, safe_float
-
 
 def _position_value(pos: Dict[str, Any]) -> float:
     """

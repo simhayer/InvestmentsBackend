@@ -1,7 +1,6 @@
 import json
-import math
 import datetime as dt
-from typing import Any, Optional
+from typing import Any
 from services.yahoo_service import get_full_stock_data
 from schemas.holding import HoldingInput
 from schemas.ai_analysis import AnalysisOutput
