@@ -1,6 +1,6 @@
 # services/portfolio_service.py
 from __future__ import annotations
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List
 from decimal import Decimal
 from math import fsum
 import time
@@ -16,7 +16,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from sqlalchemy.dialects.postgresql import insert
 
-from models.potfolio_analysis import PortfolioAnalysis
+from models.portfolio_analysis import PortfolioAnalysis
 from services.holding_service import get_all_holdings
 from services.yahoo_service import get_full_stock_data_many
 from services.helpers.linkup.portfolio_linkup_v2 import get_portfolio_ai_layers_from_quotes

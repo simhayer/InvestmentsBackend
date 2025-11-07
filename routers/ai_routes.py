@@ -1,7 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from services.auth_service import get_current_user
-from services.ai_service import analyze_investment_portfolio, analyze_investment_symbol_perplexity, analyze_portfolio_perplexity
 from services.holding_service import get_all_holdings
 from sqlalchemy.orm import Session
 from database import get_db
@@ -11,8 +10,6 @@ from services.portfolio_service import get_or_compute_portfolio_analysis
 from services.portfolio_summary import summarize_portfolio_news
 from services.finnhub_news_service import get_company_news_for_symbols
 from services.helpers.linkup.symbol_analysis import get_linkup_symbol_analysis
-from services.helpers.linkup.portfolio_linkup_v2 import get_portfolio_ai_layers_from_quotes
-from services.yahoo_service import get_full_stock_data_many
 
 router = APIRouter()
 

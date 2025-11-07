@@ -5,23 +5,7 @@ from typing import Any, Optional
 from services.yahoo_service import get_full_stock_data
 from schemas.holding import HoldingInput
 from schemas.ai_analysis import AnalysisOutput
-
-# ---------- Helpers ----------
-def _safe_float(x: Any) -> Optional[float]:
-    try:
-        if x is None or (isinstance(x, float) and math.isnan(x)):
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-def _pct_change(cur: Optional[float], base: Optional[float]) -> Optional[float]:
-    if cur is None or base in (None, 0):
-        return None
-    return (cur / base - 1.0) * 100.0
-
-def _round(x: Optional[float], d: int = 4) -> Optional[float]:
-    return None if x is None else round(float(x), d)
+from utils.common_helpers import pct_change, safe_float, round
 
 def analyze_holding(holding: HoldingInput, llm: Any) -> AnalysisOutput:
     """
@@ -47,46 +31,46 @@ def analyze_holding(holding: HoldingInput, llm: Any) -> AnalysisOutput:
         }
 
     # Prefer Yahoo’s current_price over provided, but keep user-provided as fallback
-    current_price = _safe_float(yh.get("current_price")) or _safe_float(holding.get("current_price"))
-    purchase_price = _safe_float(holding.get("purchase_price"))
-    quantity = _safe_float(holding.get("quantity")) or 0.0
+    current_price = safe_float(yh.get("current_price")) or safe_float(holding.get("current_price"))
+    purchase_price = safe_float(holding.get("purchase_price"))
+    quantity = safe_float(holding.get("quantity")) or 0.0
     currency = holding.get("currency") or yh.get("currency") or "USD"
 
     # Portfolio math
     cost_basis = (purchase_price or 0.0) * quantity
     market_value = (current_price or 0.0) * quantity
     pnl_abs = market_value - cost_basis
-    pnl_pct = _pct_change(market_value, cost_basis)
+    pnl_pct = pct_change(market_value, cost_basis)
 
     # Price context
-    prev_close = _safe_float(yh.get("previous_close"))
+    prev_close = safe_float(yh.get("previous_close"))
     day_change = None if (current_price is None or prev_close is None) else (current_price - prev_close)
-    day_change_pct = _pct_change(current_price, prev_close)
-    dist_from_high_pct = _safe_float(yh.get("distance_from_52w_high_pct"))
-    dist_from_low_pct = _safe_float(yh.get("distance_from_52w_low_pct"))
+    day_change_pct = pct_change(current_price, prev_close)
+    dist_from_high_pct = safe_float(yh.get("distance_from_52w_high_pct"))
+    dist_from_low_pct = safe_float(yh.get("distance_from_52w_low_pct"))
 
     # Fundamentals context (may be None for ETFs/crypto)
-    pe_ratio = _safe_float(yh.get("pe_ratio"))
-    forward_pe = _safe_float(yh.get("forward_pe"))
-    price_to_book = _safe_float(yh.get("price_to_book"))
-    dividend_yield = _safe_float(yh.get("dividend_yield"))
-    beta = _safe_float(yh.get("beta"))
+    pe_ratio = safe_float(yh.get("pe_ratio"))
+    forward_pe = safe_float(yh.get("forward_pe"))
+    price_to_book = safe_float(yh.get("price_to_book"))
+    dividend_yield = safe_float(yh.get("dividend_yield"))
+    beta = safe_float(yh.get("beta"))
 
     # Build compact context for the model (ONLY what it should read)
     market_context = {
-        "current_price": _round(current_price, 4),
-        "previous_close": _round(prev_close, 4),
-        "day_change": _round(day_change, 4),
-        "day_change_pct": _round(day_change_pct, 4),
-        "52_week_high": _round(_safe_float(yh.get("52_week_high")), 4),
-        "52_week_low": _round(_safe_float(yh.get("52_week_low")), 4),
-        "distance_from_52w_high_pct": _round(dist_from_high_pct, 4),
-        "distance_from_52w_low_pct": _round(dist_from_low_pct, 4),
-        "pe_ratio": _round(pe_ratio, 4),
-        "forward_pe": _round(forward_pe, 4),
-        "price_to_book": _round(price_to_book, 4),
-        "dividend_yield": _round(dividend_yield, 4),
-        "beta": _round(beta, 4),
+        "current_price": round(current_price, 4),
+        "previous_close": round(prev_close, 4),
+        "day_change": round(day_change, 4),
+        "day_change_pct": round(day_change_pct, 4),
+        "52_week_high": round(safe_float(yh.get("52_week_high")), 4),
+        "52_week_low": round(safe_float(yh.get("52_week_low")), 4),
+        "distance_from_52w_high_pct": round(dist_from_high_pct, 4),
+        "distance_from_52w_low_pct": round(dist_from_low_pct, 4),
+        "pe_ratio": round(pe_ratio, 4),
+        "forward_pe": round(forward_pe, 4),
+        "price_to_book": round(price_to_book, 4),
+        "dividend_yield": round(dividend_yield, 4),
+        "beta": round(beta, 4),
         "exchange": yh.get("exchange"),
         "currency": currency,
     }
@@ -146,10 +130,10 @@ def analyze_holding(holding: HoldingInput, llm: Any) -> AnalysisOutput:
             "currency": currency,
         },
         "computed": {
-            "cost_basis": _round(cost_basis, 4),
-            "market_value": _round(market_value, 4),
-            "pnl_abs": _round(pnl_abs, 4),
-            "pnl_pct": _round(pnl_pct, 4),
+            "cost_basis": round(cost_basis, 4),
+            "market_value": round(market_value, 4),
+            "pnl_abs": round(pnl_abs, 4),
+            "pnl_pct": round(pnl_pct, 4),
         },
         "market_context": market_context,
         "style_hint": style_hint,
@@ -188,8 +172,8 @@ def analyze_holding(holding: HoldingInput, llm: Any) -> AnalysisOutput:
         obj = {
             "symbol": symbol,
             "as_of_utc": dt.datetime.utcnow().isoformat(),
-            "pnl_abs": _round(pnl_abs, 4),
-            "pnl_pct": _round(pnl_pct, 4),
+            "pnl_abs": round(pnl_abs, 4),
+            "pnl_pct": round(pnl_pct, 4),
             "market_context": market_context,
             "rating": "watch",
             "rationale": ai.content[:1200],
@@ -202,8 +186,8 @@ def analyze_holding(holding: HoldingInput, llm: Any) -> AnalysisOutput:
     # Ensure required fields exist + fill with our computed numbers
     obj.setdefault("symbol", symbol)
     obj.setdefault("as_of_utc", dt.datetime.utcnow().isoformat())
-    obj.setdefault("pnl_abs", _round(pnl_abs, 4))
-    obj.setdefault("pnl_pct", _round(pnl_pct, 4))
+    obj.setdefault("pnl_abs", round(pnl_abs, 4))
+    obj.setdefault("pnl_pct", round(pnl_pct, 4))
     obj["market_context"] = market_context  # overwrite with trusted numbers
     obj.setdefault("data_notes", data_notes)
     obj.setdefault("disclaimer", "This is educational information, not financial advice.")

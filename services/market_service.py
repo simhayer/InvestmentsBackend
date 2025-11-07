@@ -212,7 +212,7 @@ def _needs_ai_refresh(db_latest: Json, *, ttl_minutes: int = 180) -> bool:
         return True
 
 
-def _etag_for(obj: dict) -> str:
+def etag_for(obj: dict) -> str:
     # Only used where you need a deterministic hash of JSON-serializable dicts
     return hashlib.sha256(json.dumps(obj, sort_keys=True).encode()).hexdigest()
 

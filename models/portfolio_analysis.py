@@ -1,6 +1,6 @@
 # models/portfolio_analysis.py
 from __future__ import annotations
-from sqlalchemy import Column, Integer, DateTime, UniqueConstraint, func
+from sqlalchemy import DateTime, UniqueConstraint, func
 from sqlalchemy.dialects.postgresql import JSONB
 from database import Base
 from sqlalchemy.orm import Mapped, mapped_column

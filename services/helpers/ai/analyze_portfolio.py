@@ -6,37 +6,23 @@ import math
 import datetime as dt
 from typing import Any, Optional, Dict, List
 from collections import defaultdict
+from utils.common_helpers import round, pct_change, safe_float
 
-def _safe_float(x: Any) -> Optional[float]:
-    try:
-        if x is None or (isinstance(x, float) and math.isnan(x)):
-            return None
-        return float(x)
-    except Exception:
-        return None
-
-def _round(x: Optional[float], d: int = 4) -> Optional[float]:
-    return None if x is None else round(float(x), d)
-
-def _pct_change(cur: Optional[float], base: Optional[float]) -> Optional[float]:
-    if cur is None or base in (None, 0):
-        return None
-    return (cur / base - 1.0) * 100.0
 
 def _position_value(pos: Dict[str, Any]) -> float:
     """
     Prefer explicit `value`; else quantity*current_price; else 0.
     """
-    val = _safe_float(pos.get("value"))
+    val = safe_float(pos.get("value"))
     if val is not None:
         return val
-    q = _safe_float(pos.get("quantity")) or 0.0
-    cp = _safe_float(pos.get("current_price")) or 0.0
+    q = safe_float(pos.get("quantity")) or 0.0
+    cp = safe_float(pos.get("current_price")) or 0.0
     return q * cp
 
 def _cost_basis(pos: Dict[str, Any]) -> float:
-    q = _safe_float(pos.get("quantity")) or 0.0
-    pp = _safe_float(pos.get("purchase_price")) or 0.0
+    q = safe_float(pos.get("quantity")) or 0.0
+    pp = safe_float(pos.get("purchase_price")) or 0.0
     return q * pp
 
 def analyze_portfolio(holdings: List[Dict[str, Any]], llm: Any) -> str:
@@ -94,11 +80,11 @@ def analyze_portfolio(holdings: List[Dict[str, Any]], llm: Any) -> str:
             "market_value": mv,
             "cost_basis": cb,
             "pnl_abs": mv - cb,
-            "pnl_pct": _pct_change(mv, cb),
+            "pnl_pct": pct_change(mv, cb),
         })
 
     pnl_abs = total_mv - total_cb
-    pnl_pct = _pct_change(total_mv, total_cb)
+    pnl_pct = pct_change(total_mv, total_cb)
 
     # ---- Weights & exposures
     def _weights_by(key: str) -> List[Dict[str, Any]]:
@@ -113,11 +99,11 @@ def analyze_portfolio(holdings: List[Dict[str, Any]], llm: Any) -> str:
         out = []
         for it in items:
             if key == "type":
-                out.append({"type": it["label"], "weight_pct": _round(it["weight_pct"], 4)})
+                out.append({"type": it["label"], "weight_pct": round(it["weight_pct"], 4)})
             elif key == "currency":
-                out.append({"currency": it["label"], "weight_pct": _round(it["weight_pct"], 4)})
+                out.append({"currency": it["label"], "weight_pct": round(it["weight_pct"], 4)})
             else:
-                out.append({"institution": it["label"], "weight_pct": _round(it["weight_pct"], 4)})
+                out.append({"institution": it["label"], "weight_pct": round(it["weight_pct"], 4)})
         return out
 
     by_type = _weights_by("type")
@@ -130,7 +116,7 @@ def analyze_portfolio(holdings: List[Dict[str, Any]], llm: Any) -> str:
         w = (p["market_value"] / total_mv * 100.0) if total_mv > 0 else 0.0
         weights.append({"symbol": p["symbol"], "weight_pct": w, "pnl_pct": p["pnl_pct"]})
     weights.sort(key=lambda x: x["weight_pct"], reverse=True)
-    top_positions = [{"symbol": w["symbol"], "weight_pct": _round(w["weight_pct"], 4), "pnl_pct": _round(w["pnl_pct"], 4)} for w in weights[:5]]
+    top_positions = [{"symbol": w["symbol"], "weight_pct": round(w["weight_pct"], 4), "pnl_pct": round(w["pnl_pct"], 4)} for w in weights[:5]]
 
     # Herfindahl-Hirschman Index using fractional weights (0-1)
     hh_index = 0.0
@@ -138,9 +124,9 @@ def analyze_portfolio(holdings: List[Dict[str, Any]], llm: Any) -> str:
         f = (w["weight_pct"] or 0.0) / 100.0
         hh_index += f * f
 
-    top_1 = _round(weights[0]["weight_pct"], 4) if weights else 0.0
-    top_3 = _round(sum(w["weight_pct"] for w in weights[:3]), 4) if weights else 0.0
-    top_5 = _round(sum(w["weight_pct"] for w in weights[:5]), 4) if weights else 0.0
+    top_1 = round(weights[0]["weight_pct"], 4) if weights else 0.0
+    top_3 = round(sum(w["weight_pct"] for w in weights[:3]), 4) if weights else 0.0
+    top_5 = round(sum(w["weight_pct"] for w in weights[:5]), 4) if weights else 0.0
 
     # ---- Heuristic diversification score (0-100)
     # Penalize concentration (HHI), large top weights, and single-currency exposure
@@ -156,10 +142,10 @@ def analyze_portfolio(holdings: List[Dict[str, Any]], llm: Any) -> str:
     payload = {
         "as_of_utc": as_of,
         "totals": {
-            "market_value": _round(total_mv, 4),
-            "cost_basis": _round(total_cb, 4),
-            "pnl_abs": _round(pnl_abs, 4),
-            "pnl_pct": _round(pnl_pct, 4),
+            "market_value": round(total_mv, 4),
+            "cost_basis": round(total_cb, 4),
+            "pnl_abs": round(pnl_abs, 4),
+            "pnl_pct": round(pnl_pct, 4),
         },
         "exposures": {
             "by_type": by_type,
@@ -168,12 +154,12 @@ def analyze_portfolio(holdings: List[Dict[str, Any]], llm: Any) -> str:
         },
         "top_positions": top_positions,
         "concentration": {
-            "hh_index": _round(hh_index, 6),
-            "top_1_weight_pct": _round(top_1, 4),
-            "top_3_weight_pct": _round(top_3, 4),
-            "top_5_weight_pct": _round(top_5, 4),
+            "hh_index": round(hh_index, 6),
+            "top_1_weight_pct": round(top_1, 4),
+            "top_3_weight_pct": round(top_3, 4),
+            "top_5_weight_pct": round(top_5, 4),
         },
-        "diversification_score": _round(diversification_score, 4),
+        "diversification_score": round(diversification_score, 4),
         "must_include": [
             "Overall portfolio rating (strong|balanced|concentrated|risky|needs_rebalance).",
             "Risk level (low|moderate|high).",
