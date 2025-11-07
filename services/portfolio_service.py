@@ -11,6 +11,16 @@ from services.holding_service import get_holdings_with_live_prices_top
 from services.plaid_service import get_connections
 from models.holding import HoldingOut
 
+from datetime import datetime, timedelta, timezone
+from sqlalchemy.orm import Session
+from sqlalchemy import func
+from sqlalchemy.dialects.postgresql import insert
+
+from models.potfolio_analysis import PortfolioAnalysis
+from services.holding_service import get_all_holdings
+from services.yahoo_service import get_full_stock_data_many
+from services.helpers.linkup.portfolio_linkup_v2 import get_portfolio_ai_layers_from_quotes
+
 Number = float | int | Decimal
 
 def _to_float(x: Number | None) -> float:
@@ -107,3 +117,82 @@ async def get_portfolio_summary(
         "top_positions": enriched.get("top_items", []),
         "connections": connections,
     }
+
+
+
+TTL_HOURS = 24
+
+def get_or_compute_portfolio_analysis(
+    user_id: int,
+    db: Session,
+    *,
+    base_currency: str = "CAD",
+    days_of_news: int = 7,
+    targets: dict[str, int] | None = None,
+    force: bool = False,
+):
+    now = datetime.now(timezone.utc)
+
+    # 1) If we have a fresh row (<=24h) and not forced, return it
+    row = (
+        db.query(PortfolioAnalysis)
+          .filter(PortfolioAnalysis.user_id == user_id)
+          .first()
+    )
+    if row and not force:
+        age = now - row.created_at
+        if age <= timedelta(hours=TTL_HOURS):
+            rem = timedelta(hours=TTL_HOURS) - age
+            meta = {
+                "cached": True,
+                "cached_at": row.created_at.isoformat(),
+                "ttl_seconds_remaining": int(rem.total_seconds()),
+            }
+            return row.data, meta
+
+    # 2) Compute fresh
+    holdings = get_all_holdings(str(user_id), db)
+    if not holdings:
+        return None, {"reason": "no_holdings"}
+
+    symbols = [h.symbol for h in holdings if h.symbol]
+    if not symbols:
+        return None, {"reason": "no_valid_symbols"}
+
+    quotes_map = get_full_stock_data_many(symbols)
+
+    ai_layers = get_portfolio_ai_layers_from_quotes(
+        quotes_map=quotes_map,
+        base_currency=base_currency,
+        days_of_news=days_of_news,
+        include_sources=False,
+        timeout=60,
+        targets={k: float(v) for k, v in targets.items()} if targets else None,
+        symbols_preferred_order=symbols,
+    )
+
+    data = {
+        "version": "v1",                 # bump if analysis logic changes
+        "computed_at": now.isoformat(),  # for debugging/UX
+        "params": {
+            "base_currency": base_currency,
+            "days_of_news": days_of_news,
+            "targets": targets,
+        },
+        "ai_layers": ai_layers,
+    }
+
+    # 3) Upsert one row per user (overwrite data + timestamp)
+    stmt = insert(PortfolioAnalysis).values(
+        user_id=user_id,
+        data=data,
+    )
+    upsert = stmt.on_conflict_do_update(
+        index_elements=["user_id"],
+        set_={"data": stmt.excluded.data, "created_at": func.now()},
+    )
+    db.execute(upsert)
+    db.commit()
+
+    meta = {"cached": False, "cached_at": now.isoformat(), "ttl_seconds_remaining": TTL_HOURS * 3600}
+    return data, meta

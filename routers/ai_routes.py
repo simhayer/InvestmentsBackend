@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from pydantic import BaseModel
 from fastapi import APIRouter, Query
+from services.portfolio_service import get_or_compute_portfolio_analysis
 from services.portfolio_summary import summarize_portfolio_news
 from services.finnhub_news_service import get_company_news_for_symbols
 from services.helpers.linkup.symbol_analysis import get_linkup_symbol_analysis
@@ -17,39 +18,28 @@ router = APIRouter()
 
 @router.post("/analyze-portfolio")
 async def analyze_portfolio_endpoint(
+    force: bool = Query(False, description="Bypass cache and recompute now"),
     user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    
-    # returning dummy response for now
-    if (1==1):
-        return dummy_holding_response_v2
-    # 1. Fetch holdings for this user
-    holdings = get_all_holdings(user.id, db)
-    if not holdings:
-        raise HTTPException(status_code=400, detail="No holdings found for this user")
-
-    # 2. Extract symbols
-    symbols = [h.symbol for h in holdings if h.symbol]
-    if not symbols:
-        raise HTTPException(status_code=400, detail="No valid symbols found")
-
-    # 3. Bulk Yahoo fetch (fast, cached)
-    quotes_map = get_full_stock_data_many(symbols)
-
-    # 4. Call Linkup AI
-    ai_layers = get_portfolio_ai_layers_from_quotes(
-        quotes_map=quotes_map,
+    data, meta = get_or_compute_portfolio_analysis(
+        user_id=user.id,
+        db=db,
         base_currency="CAD",
         days_of_news=7,
-        include_sources=False,
-        timeout=60,
-        targets={"Equities": 60, "Bonds": 30, "Cash": 10},  # optional
-        symbols_preferred_order=[h.symbol for h in holdings],  # keeps consistent symbol tags
+        targets={"Equities": 60, "Bonds": 30, "Cash": 10},
+        force=force,
     )
+    if data is None:
+        reason = meta.get("reason") if isinstance(meta, dict) else "unknown"
+        raise HTTPException(status_code=400, detail=f"Cannot analyze portfolio: {reason}")
 
-    # 5. Return AI-only layer (or merge later on frontend/backend)
-    return {"status": "ok", "user_id": user.id, "ai_layers": ai_layers}
+    return {
+        "status": "ok",
+        "user_id": user.id,
+        **meta,
+        "ai_layers": data["ai_layers"],
+    }
 
 class SymbolReq(BaseModel):
     symbol: str
