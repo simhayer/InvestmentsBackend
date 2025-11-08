@@ -17,24 +17,6 @@ def strip_code_fences(s: str) -> str:
         s = s[:-3]
     return s
 
-# def extract_json(text: str) -> Dict[str, Any]:
-#     if S in text and E in text:
-#         text = text.split(S, 1)[1].split(E, 1)[0]
-    
-#     text = strip_code_fences(clean_control_chars(text)).strip()
-    
-#     try:
-#         obj = json.loads(text)
-#     except json.JSONDecodeError:
-#         text2 = re.sub(r",(\s*[}\]])", r"\1", text) 
-#         obj = json.loads(text2)
-    
-#     if isinstance(obj, str):
-#         obj = json.loads(obj)
-#     if not isinstance(obj, dict):
-#         raise ValueError("Expected a JSON object")
-#     return obj
-
 def _core_parse(text: str) -> Any:
     """Parse JSON from text, handling sentinels, code fences, control chars, trailing commas."""
     if S in text and E in text:

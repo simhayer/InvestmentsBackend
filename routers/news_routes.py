@@ -2,10 +2,8 @@ from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from database import get_db
 from services.auth_service import get_current_user
-from services.linkup_service import fetch_latest_news_for_holdings
 from services.holding_service import get_all_holdings
 from services.finnhub_news_service import get_company_news_for_symbols
-from typing import List
 
 router = APIRouter()
 

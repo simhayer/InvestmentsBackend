@@ -158,44 +158,6 @@ AI_LAYERS_SCHEMA_V2: Dict[str, Any] = {
             },
         },
 
-        # ---------------- NEW: Performance Analysis (commentary on deterministic metrics) ----------------
-        "performance_analysis": {
-            "type": "object",
-            "description": "AI commentary on quantitative metrics (leaders/laggards/shifts).",
-            "additionalProperties": False,
-            "properties": {
-                "summary": {"type": "string"},
-                "leaders": {"type": "array", "items": {"type": "string"}},
-                "laggards": {"type": "array", "items": {"type": "string"}},
-                "notable_shifts": {"type": "array", "items": {"type": "string"}},
-            },
-        },
-
-        # ---------------- NEW: Sentiment Layer ----------------
-        "sentiment": {
-            "type": "object",
-            "description": "Aggregated tone and narrative drivers for held assets.",
-            "additionalProperties": False,
-            "properties": {
-                "overall_sentiment": {"type": "string", "enum": ["bullish", "neutral", "bearish"]},
-                "sources_considered": {"type": "array", "items": {"type": "string"}},
-                "drivers": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "theme": {"type": "string"},
-                            "tone": {"type": "string", "enum": ["positive", "neutral", "negative"]},
-                            "impact": {"type": "string"},
-                        },
-                        "required": ["theme"],
-                    },
-                },
-                "summary": {"type": "string"},
-            },
-        },
-
         # ---------------- NEW: Predictions Layer ----------------
         "predictions": {
             "type": "object",
@@ -221,40 +183,6 @@ AI_LAYERS_SCHEMA_V2: Dict[str, Any] = {
                         "required": ["symbol", "expected_direction"],
                     },
                 },
-            },
-        },
-
-        # ---------------- Explainability ----------------
-        "explainability": {
-            "type": "object",
-            "properties": {
-                "assumptions": {"type": "array", "items": {"type": "string"}},
-                "confidence_overall": {"type": "number", "minimum": 0, "maximum": 1},
-                # New: optional per-section confidence here
-                "section_confidence": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "news": {"type": "number"},
-                        "catalysts": {"type": "number"},
-                        "actions": {"type": "number"},
-                        "sentiment": {"type": "number"},
-                        "predictions": {"type": "number"},
-                        "scenarios": {"type": "number"},
-                    },
-                },
-                "limitations": {"type": "array", "items": {"type": "string"}},
-            },
-        },
-
-        # v1 field remains for compatibility; frontend may still read this
-        "section_confidence": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "scenarios": {"type": "number"},
-                "news": {"type": "number"},
-                "actions": {"type": "number"},
             },
         },
 
@@ -395,17 +323,22 @@ def get_portfolio_ai_layers_from_quotes(
         f"INSTRUCTION:\n{json.dumps(instruction, ensure_ascii=False)}"
     )
 
-    response = client.search(
-        query=query,
-        depth="standard",
-        output_type="structured",
-        structured_output_schema=json.dumps(AI_LAYERS_SCHEMA_V2),
-        include_images=False,
-        include_sources=include_sources,
-        from_date=from_date.date(),
-        to_date=to_date.date(),
-    )
-    return response
+    try:
+        response = client.search(
+            query=query,
+            depth="standard",
+            output_type="structured",
+            structured_output_schema=json.dumps(AI_LAYERS_SCHEMA_V2),
+            include_images=False,
+            include_sources=include_sources,
+            from_date=from_date.date(),
+            to_date=to_date.date(),
+        )
+
+        return response
+    except Exception as e:
+        # logger.error(f"Error occurred while fetching portfolio AI layers: {e}")
+        return {"error": str(e)}
 
 
 def assemble_portfolio_report(

@@ -1,7 +1,7 @@
-from sqlalchemy import Column, Integer, Text, DateTime, func
+from sqlalchemy import Integer, Text, DateTime, func
 from sqlalchemy.dialects.postgresql import JSONB, ARRAY
-from database import Base  # import your existing Base
-from sqlalchemy.orm import  Mapped, mapped_column, relationship
+from database import Base
+from sqlalchemy.orm import  mapped_column
 
 class MarketOverviewLatest(Base):
     __tablename__ = "market_overview_latest"

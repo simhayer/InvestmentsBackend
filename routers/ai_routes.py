@@ -1,55 +1,40 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from services.auth_service import get_current_user
-from services.ai_service import analyze_investment_portfolio, analyze_investment_symbol_perplexity, analyze_portfolio_perplexity
 from services.holding_service import get_all_holdings
 from sqlalchemy.orm import Session
 from database import get_db
 from pydantic import BaseModel
 from fastapi import APIRouter, Query
-from services.portfolio_summary import summarize_portfolio_news
-from services.finnhub_news_service import get_company_news_for_symbols
+from services.portfolio_service import get_or_compute_portfolio_analysis
 from services.helpers.linkup.symbol_analysis import get_linkup_symbol_analysis
-from services.helpers.linkup.portfolio_linkup_v2 import get_portfolio_ai_layers_from_quotes
-from services.yahoo_service import get_full_stock_data_many
 
 router = APIRouter()
 
 @router.post("/analyze-portfolio")
 async def analyze_portfolio_endpoint(
+    force: bool = Query(False, description="Bypass cache and recompute now"),
     user=Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
-    
-    # returning dummy response for now
-    if (1==1):
-        return dummy_holding_response_v2
-    # 1. Fetch holdings for this user
-    holdings = get_all_holdings(user.id, db)
-    if not holdings:
-        raise HTTPException(status_code=400, detail="No holdings found for this user")
-
-    # 2. Extract symbols
-    symbols = [h.symbol for h in holdings if h.symbol]
-    if not symbols:
-        raise HTTPException(status_code=400, detail="No valid symbols found")
-
-    # 3. Bulk Yahoo fetch (fast, cached)
-    quotes_map = get_full_stock_data_many(symbols)
-
-    # 4. Call Linkup AI
-    ai_layers = get_portfolio_ai_layers_from_quotes(
-        quotes_map=quotes_map,
+    data, meta = get_or_compute_portfolio_analysis(
+        user_id=user.id,
+        db=db,
         base_currency="CAD",
         days_of_news=7,
-        include_sources=False,
-        timeout=60,
-        targets={"Equities": 60, "Bonds": 30, "Cash": 10},  # optional
-        symbols_preferred_order=[h.symbol for h in holdings],  # keeps consistent symbol tags
+        targets={"Equities": 60, "Bonds": 30, "Cash": 10},
+        force=force,
     )
+    if data is None:
+        reason = meta.get("reason") if isinstance(meta, dict) else "unknown"
+        raise HTTPException(status_code=400, detail=f"Cannot analyze portfolio: {reason}")
 
-    # 5. Return AI-only layer (or merge later on frontend/backend)
-    return {"status": "ok", "user_id": user.id, "ai_layers": ai_layers}
+    return {
+        "status": "ok",
+        "user_id": user.id,
+        **meta,
+        "ai_layers": data["ai_layers"],
+    }
 
 class SymbolReq(BaseModel):
     symbol: str
@@ -58,47 +43,6 @@ class SymbolReq(BaseModel):
 async def analyze_symbol_endpoint(req: SymbolReq, user=Depends(get_current_user)):
     # return dummy_holding_response
     return await run_in_threadpool(get_linkup_symbol_analysis, req.symbol)
-
-@router.post("/news-summary")
-async def portfolio_news_summary(
-    user=Depends(get_current_user),
-    db: Session = Depends(get_db),
-    days_back: int = Query(7, ge=1, le=30),
-    per_symbol_limit: int = Query(6, ge=1, le=20),
-):
-    holdings = get_all_holdings(user.id, db)
-    symbols = [h.symbol for h in holdings]
-    if not symbols:
-        return {"summary": "", "highlights": [], "risks": [], "per_symbol": {}, "sentiment": 0, "sources": []}
-
-    # 1) Fetch recent news per symbol
-    news_by_symbol = await get_company_news_for_symbols(
-        symbols, days_back=days_back, limit_per_symbol=per_symbol_limit
-    )
-
-    # 2) Summarize as a portfolio brief
-    news_by_symbol_dict = {
-        symbol: [item.__dict__ if hasattr(item, "__dict__") else dict(item) for item in items]
-        for symbol, items in news_by_symbol.items()
-    }
-    summary_text = await summarize_portfolio_news(news_by_symbol_dict, symbols=symbols)
-
-    urls: list[str] = []
-    for arr in news_by_symbol.values():
-        for it in arr:
-            u = it.get("url")
-            if u and u not in urls:
-                urls.append(u)
-
-    return {
-        "summary": summary_text,
-        "highlights": [],       # (optional) you can derive separately later
-        "risks": [],            # (optional)
-        "per_symbol": {},       # (optional)
-        "sentiment": 0,         # (optional)
-        "sources": urls[:8],
-    }
-
 
 dummy_holding_response = {
     "summary": "Apple Inc. (AAPL) stock has recently hit record highs in 2025, driven primarily by strong demand for the iPhone 17 series in key markets like the U.S. and China. Loop Capital upgraded the stock from hold to buy, raising the price target significantly to $315, citing a multi-year iPhone replacement cycle and ongoing shipment expansion through 2027. Other analysts, including Evercore ISI and Goldman Sachs, have also raised price targets and ratings, expecting upside in upcoming earnings and continued momentum. Apple's market capitalization is nearing $4 trillion, making it the second-most valuable company globally, surpassing Microsoft. Despite a challenging year with tariff impacts and underperformance relative to some tech peers, recent strong sales and product innovation have revitalized investor confidence. Risks include geopolitical tensions affecting supply chains and competitive pressures. Technically, the stock is in an uptrend with new all-time highs and strong momentum indicators. Key upcoming events include the fiscal Q4 earnings report expected on October 30, 2025. Overall, the outlook is bullish with significant upside potential based on product demand and strategic growth in services and AI integration.",

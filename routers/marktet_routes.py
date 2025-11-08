@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy.orm import Session
 from database import get_db
-from services.market_service import _etag_for, get_market_overview_cached, get_market_summary_cached, refresh_market_overview
+from services.market_service import etag_for, get_market_overview_cached, get_market_summary_cached, refresh_market_overview
 
 router = APIRouter()
 
@@ -14,7 +14,7 @@ def get_market_overview(db: Session = Depends(get_db)):
 @router.get("/summary")
 def summary(request: Request, response: Response, db: Session = Depends(get_db)):
     data, stored_at = get_market_summary_cached(db)  # stored_at = datetime (tz-aware)
-    etag = _etag_for(data)
+    etag = etag_for(data)
 
     inm = request.headers.get("if-none-match")
     if inm and inm == etag:
