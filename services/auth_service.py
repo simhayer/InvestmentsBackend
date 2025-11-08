@@ -134,3 +134,30 @@ def get_current_user(
         raise HTTPException(status_code=401, detail="Invalid token payload")
 
     return _load_user_by_sub(db, sub)
+
+RESET_TOKEN_EXPIRE_MINUTES = int(os.getenv("RESET_TOKEN_EXPIRE_MINUTES", "30"))
+JWT_RESET_SECRET_KEY = os.getenv("JWT_RESET_SECRET_KEY", "change-reset-secret-in-prod")
+
+def create_password_reset_token(user_id: int) -> str:
+    now = datetime.now(timezone.utc)
+    exp = now + timedelta(minutes=RESET_TOKEN_EXPIRE_MINUTES)
+    payload = {
+        "sub": str(user_id),
+        "purpose": "password_reset",
+        "iat": int(now.timestamp()),
+        "exp": int(exp.timestamp()),
+    }
+    return jwt.encode(payload, JWT_RESET_SECRET_KEY, algorithm=ALGORITHM)
+
+def decode_password_reset_token(token: str) -> Dict[str, Any]:
+    try:
+        payload = jwt.decode(token, JWT_RESET_SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("purpose") != "password_reset":
+            raise JWTError("Invalid purpose")
+        return payload
+    except JWTError:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired reset token",
+            headers={"WWW-Authenticate": "Bearer"},
+        )

@@ -16,6 +16,14 @@ from services.auth_service import (
 )
 from database import get_db
 
+from pydantic import BaseModel, EmailStr
+from services.auth_service import (
+    get_password_hash,
+    create_password_reset_token,
+    decode_password_reset_token,
+)
+from urllib.parse import urlencode
+
 router = APIRouter()
 
 # --- Cookie config ---
@@ -27,6 +35,7 @@ AUTH_COOKIE_SAMESITE = "lax"
 AUTH_COOKIE_SECURE = os.getenv("AUTH_COOKIE_SECURE", "true").lower() == "true"
 AUTH_COOKIE_DOMAIN = os.getenv("AUTH_COOKIE_DOMAIN", None)  # e.g. ".yourdomain.com"
 
+FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
 @router.post("/register")
 def register(user: general.UserCreate, db: Session = Depends(get_db)):
@@ -72,3 +81,48 @@ def logout():
 @router.get("/me")
 def me(user: User = Depends(get_current_user)):
     return {"id": user.id, "email": user.email}
+
+class ForgotPasswordIn(BaseModel):
+    email: EmailStr
+
+class ResetPasswordIn(BaseModel):
+    token: str
+    new_password: str
+
+def _send_reset_email(to_email: str, reset_url: str):
+    # Replace with your mailer; this is a stub so you can see it fast in logs.
+    print(f"[MAIL] To: {to_email}\nReset your password: {reset_url}\n")
+
+@router.post("/password/forgot")
+def forgot_password(payload: ForgotPasswordIn, db: Session = Depends(get_db)):
+    # Look up user silently
+    user = crud.get_user_by_email(db, payload.email)
+    if user:
+        token = create_password_reset_token(user.id)
+        qs = urlencode({"token": token})
+        reset_url = f"{FRONTEND_URL}/reset-password?{qs}"
+        _send_reset_email(payload.email, reset_url)
+    # Always respond OK to prevent user enumeration
+    return {"ok": True}
+
+@router.post("/password/reset")
+def reset_password(payload: ResetPasswordIn, db: Session = Depends(get_db)):
+    data = decode_password_reset_token(payload.token)  # raises 401 if bad/expired
+    sub = data.get("sub")
+    user = db.get(User, int(sub)) if sub is not None else None
+    if not user:
+        # Also avoids saying whether the token/user is real
+        raise HTTPException(status_code=400, detail="Invalid reset request")
+
+    if len(payload.new_password) < 8:
+        raise HTTPException(status_code=422, detail="Password too short")
+
+    # Update password
+    user.hashed_password = get_password_hash(payload.new_password)
+    db.add(user)
+    db.commit()
+
+    # (Optional) Clear any existing auth cookie so user must sign in again
+    resp = JSONResponse({"ok": True})
+    resp.delete_cookie(AUTH_COOKIE_NAME, path="/", domain=AUTH_COOKIE_DOMAIN)
+    return resp
