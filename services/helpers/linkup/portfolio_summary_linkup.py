@@ -1,610 +1,217 @@
-# -*- coding: utf-8 -*-
 """
-Linkup orchestration for portfolio AI layers (v2.1, professional prompt).
+run_portfolio_pipeline.py
 
-What’s new vs v2:
-- Keeps ALL original keys (backwards compatible).
-- Adds two OPTIONAL, presentation-focused fields:
-  * rebalance_paths: Aggressive/Balanced/CapitalPreservation (maps to STEP 4)
-  * market_outlook: short_term, medium_term, key_opportunities, key_risks (maps to STEP 4/5)
-- Instruction builder now follows the 5-STEP brief (TASK, CONTEXT, REFERENCES, EVALUATE, ITERATE)
-  while preserving strict JSON schema compliance and “AI-only, do not overwrite deterministic
-  metrics” constraints.
+Orchestrator that:
+1. Builds portfolio metrics from dummy Plaid positions.
+2. Calls all 4 agents:
+   - news_sentiment_agent
+   - performance_agent
+   - scenarios_rebalance_agent
+   - summarry_agennt  (summary)
+3. Prints the combined result.
 
-Safe rollout:
-- professional_mode=True by default (can be disabled).
-- include_sources flag continues to control whether Linkup is asked to retrieve citations.
-
-Dependencies:
-- .linkup_config.client -> your LinkupClient with .search(...)
+Adjust import names / signatures to match your actual modules.
 """
 
 from __future__ import annotations
 
-import json
-from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
-from .linkup_config import client  # your LinkupClient
+# -----------------------------------------------------------
+# Imports: adjust to your actual function names
+# -----------------------------------------------------------
 
-# -----------------------------------------------------------------------------
-# v2.1 AI-only schema (backward compatible with v2)
-# -----------------------------------------------------------------------------
+# Example: each agent exposes a single `run_*` function that returns JSON.
+# Change these if your file exports are different.
+from .news_sentiment_agent import call_link_up_for_news
+from .performance_agent import call_link_up_for_performance
+from .scenarios_rebalance_agent import call_link_up_for_rebalance
+from .summary_agent import call_link_up_for_summary
 
-AI_LAYERS_SCHEMA_V2_1: Dict[str, Any] = {
-    "type": "object",
-    "additionalProperties": False,
-    "properties": {
-        # ---------------- News & Events ----------------
-        "latest_developments": {
-            "type": "array",
-            "minItems": 3,
-            "maxItems": 15,
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "headline": {"type": "string"},
-                    "date": {"type": "string", "description": "ISO-8601 UTC or YYYY-MM-DD"},
-                    "source": {"type": "string"},
-                    "url": {"type": "string"},
-                    "cause": {"type": "string"},
-                    "impact": {"type": "string"},
-                    "assets_affected": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["headline", "date"],
-            },
-        },
+# Portfolio metrics – either a function or a class.
+# Option A: function
+from ..portfolio_metrics import build_metrics_from_plaid
 
-        # ---------------- Catalysts ----------------
-        "catalysts": {
-            "type": "array",
-            "maxItems": 15,
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "date": {"type": "string", "description": "ISO-8601 UTC or YYYY-MM-DD"},
-                    "type": {
-                        "type": "string",
-                        "description": "earnings, macro, product, vote, guidance, regulatory, etc.",
-                    },
-                    "description": {"type": "string"},
-                    "expected_direction": {"type": "string", "enum": ["up", "down", "unclear", "neutral"]},
-                    "magnitude_basis": {"type": "string"},
-                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                    "assets_affected": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["type", "description"],
-            },
-        },
+# If you instead have a class, comment the above and use:
+# from portfolio_metrics import PortfolioMetrics
 
-        # ---------------- Scenarios ----------------
-        "scenarios": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "bull": {"type": "string"},
-                "base": {"type": "string"},
-                "bear": {"type": "string"},
-                "probabilities": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "bull": {"type": "number"},
-                        "base": {"type": "number"},
-                        "bear": {"type": "number"},
-                    },
-                },
-            },
-        },
 
-        # ---------------- Actions ----------------
-        "actions": {
-            "type": "array",
-            "description": "Prioritized, concrete next steps",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "title": {"type": "string"},
-                    "rationale": {"type": "string"},
-                    "impact": {"type": "string", "enum": ["low", "medium", "high"]},
-                    "urgency": {"type": "string", "enum": ["low", "medium", "high"]},
-                    "effort": {"type": "string", "enum": ["low", "medium", "high"]},
-                    "targets": {"type": "array", "items": {"type": "string"}},
-                    "category": {
-                        "type": "string",
-                        "description": "rebalance, alert, tax, hedge, research, liquidity",
-                    },
-                },
-                "required": ["title", "rationale"],
-            },
-        },
+# -----------------------------------------------------------
+# 1. Dummy Plaid positions for testing
+# -----------------------------------------------------------
 
-        # ---------------- Alerts ----------------
-        "alerts": {
-            "type": "array",
-            "description": "Thresholds user asked to monitor",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "condition": {
-                        "type": "string",
-                        "description": "e.g., SBSI <-10% from 30D high or BTC volatility > X",
-                    },
-                    "status": {"type": "string", "enum": ["ok", "triggered", "snoozed"]},
-                },
-                "required": ["condition", "status"],
-            },
-        },
-
-        # ---------------- Risks ----------------
-        "risks_list": {
-            "type": "array",
-            "items": {
-                "type": "object",
-                "additionalProperties": False,
-                "properties": {
-                    "risk": {"type": "string"},
-                    "why_it_matters": {"type": "string"},
-                    "monitor": {"type": "string"},
-                    "assets_affected": {"type": "array", "items": {"type": "string"}},
-                },
-                "required": ["risk", "why_it_matters"],
-            },
-        },
-
-        # ---------------- Performance Analysis ----------------
-        "performance_analysis": {
-            "type": "object",
-            "description": "AI commentary on quantitative metrics (leaders/laggards/shifts).",
-            "additionalProperties": False,
-            "properties": {
-                "summary": {"type": "string"},
-                "leaders": {"type": "array", "items": {"type": "string"}},
-                "laggards": {"type": "array", "items": {"type": "string"}},
-                "notable_shifts": {"type": "array", "items": {"type": "string"}},
-            },
-        },
-
-        # ---------------- Sentiment Layer ----------------
-        "sentiment": {
-            "type": "object",
-            "description": "Aggregated tone and narrative drivers for held assets.",
-            "additionalProperties": False,
-            "properties": {
-                "overall_sentiment": {"type": "string", "enum": ["bullish", "neutral", "bearish"]},
-                "sources_considered": {"type": "array", "items": {"type": "string"}},
-                "drivers": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "theme": {"type": "string"},
-                            "tone": {"type": "string", "enum": ["positive", "neutral", "negative"]},
-                            "impact": {"type": "string"},
-                        },
-                        "required": ["theme"],
-                    },
-                },
-                "summary": {"type": "string"},
-            },
-        },
-
-        # ---------------- Predictions Layer ----------------
-        "predictions": {
-            "type": "object",
-            "description": "Short-horizon directional outlook (informational-only).",
-            "additionalProperties": False,
-            "properties": {
-                "forecast_window": {"type": "string", "description": "e.g., '30D', '90D'"},
-                "assets": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "additionalProperties": False,
-                        "properties": {
-                            "symbol": {"type": "string"},
-                            "expected_direction": {"type": "string", "enum": ["up", "down", "neutral"]},
-                            "expected_change_pct": {"type": "number"},
-                            "confidence": {"type": "number", "minimum": 0, "maximum": 1},
-                            "rationale": {"type": "string"},
-                        },
-                        "required": ["symbol", "expected_direction"],
-                    },
-                },
-            },
-        },
-
-        # ---------------- NEW (optional): Rebalance Paths (maps to STEP 4) ----------------
-        "rebalance_paths": {
-            "type": "object",
-            "description": "Three profile-based rebalancing paths.",
-            "additionalProperties": False,
-            "properties": {
-                "aggressive_growth": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "summary": {"type": "string"},
-                        "allocation_notes": {"type": "array", "items": {"type": "string"}},
-                        "actions": {"type": "array", "items": {"type": "string"}},
-                        "risk_flags": {"type": "array", "items": {"type": "string"}},
-                    },
-                },
-                "balanced_growth": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "summary": {"type": "string"},
-                        "allocation_notes": {"type": "array", "items": {"type": "string"}},
-                        "actions": {"type": "array", "items": {"type": "string"}},
-                        "risk_flags": {"type": "array", "items": {"type": "string"}},
-                    },
-                },
-                "capital_preservation": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "summary": {"type": "string"},
-                        "allocation_notes": {"type": "array", "items": {"type": "string"}},
-                        "actions": {"type": "array", "items": {"type": "string"}},
-                        "risk_flags": {"type": "array", "items": {"type": "string"}},
-                    },
-                },
-            },
-        },
-
-        # ---------------- NEW (optional): Market Outlook (maps to STEP 4/5) ----------------
-        "market_outlook": {
-            "type": "object",
-            "description": "Short and medium term outlook, with opportunities and risks.",
-            "additionalProperties": False,
-            "properties": {
-                "short_term": {"type": "string"},
-                "medium_term": {"type": "string"},
-                "key_opportunities": {"type": "array", "items": {"type": "string"}},
-                "key_risks": {"type": "array", "items": {"type": "string"}},
-            },
-        },
-
-        # ---------------- Explainability ----------------
-        "explainability": {
-            "type": "object",
-            "properties": {
-                "assumptions": {"type": "array", "items": {"type": "string"}},
-                "confidence_overall": {"type": "number", "minimum": 0, "maximum": 1},
-                "section_confidence": {
-                    "type": "object",
-                    "additionalProperties": False,
-                    "properties": {
-                        "news": {"type": "number"},
-                        "catalysts": {"type": "number"},
-                        "actions": {"type": "number"},
-                        "sentiment": {"type": "number"},
-                        "predictions": {"type": "number"},
-                        "scenarios": {"type": "number"},
-                        "rebalance_paths": {"type": "number"},
-                        "market_outlook": {"type": "number"},
-                    },
-                },
-                "limitations": {"type": "array", "items": {"type": "string"}},
-            },
-        },
-
-        # v1 compatibility
-        "section_confidence": {
-            "type": "object",
-            "additionalProperties": False,
-            "properties": {
-                "scenarios": {"type": "number"},
-                "news": {"type": "number"},
-                "actions": {"type": "number"},
-            },
-        },
-
-        # ---------------- Summary & Disclaimer ----------------
-        "summary": {"type": "string"},
-        "disclaimer": {"type": "string"},
+DUMMY_PLAID_POSITIONS: List[Dict[str, Any]] = [
+    {
+        "symbol": "AAPL",              # US equity
+        "quantity": 25,
+        "cost_basis": 7500.00,         # in base_currency (e.g. CAD)
+        "name": "Apple Inc.",
+        "asset_class": "equity",
+        "sector": "Information Technology",
+        "region": "US",
     },
-    "required": ["summary", "disclaimer"],
-}
-
-# Public alias for compatibility
-AI_LAYERS_SCHEMA_V2 = AI_LAYERS_SCHEMA_V2_1
-AI_LAYERS_SCHEMA = AI_LAYERS_SCHEMA_V2_1
-
-
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-
-def _extract_symbols_from_quotes(quotes_map: Dict[str, Dict[str, Any]]) -> List[str]:
-    """
-    Use keys of quotes_map if they are symbols; otherwise fall back to payload['symbol'].
-    Dedupes and preserves insertion order.
-    """
-    seen = {}
-    for k, v in quotes_map.items():
-        sym = (k or "").strip().upper()
-        if not sym and isinstance(v, dict):
-            sym = (v.get("symbol") or "").strip().upper()
-        if sym:
-            seen.setdefault(sym, True)
-    return list(seen.keys())
-
-
-def _build_instruction_professional(
-    *,
-    base_currency: str,
-    symbols: List[str],
-    news_from_iso: str,
-    news_to_iso: str,
-    targets: Optional[Dict[str, float]],
-    forecast_window: str,
-) -> Dict[str, Any]:
-    """
-    Professional 5-STEP instruction (maps to your brief) while keeping strict JSON output.
-    """
-    return {
-        "role": "You are a professional portfolio analyst and financial strategist. "
-                "Generate ONLY the requested AI sections per the JSON schema provided.",
-        "step_1_task": [
-            "Classify holdings into Core / Speculative / Hedge (do NOT restate deterministic weights).",
-            "Provide portfolio breakdown, diversification check, performance assessment, and rebalance recommendations "
-            "as narrative that maps into actions/rebalance_paths without re-computing hard metrics.",
-            "Create three rebalancing paths: Aggressive Growth, Balanced Growth, Capital Preservation.",
-            "Provide a data-driven, news-aware market outlook informed by recent developments.",
-            "End with an optimized rebalance suggestion (within actions) for the next 6–12 months.",
-        ],
-        "step_2_context": [
-            "Assume North American markets (NASDAQ, NYSE, TSX) as reference.",
-            "Incorporate recent market trends, earnings, rates, sector rotations where supported.",
-            "Tone: professional yet conversational—like a private wealth advisor.",
-            "If growth-oriented, favor AI/tech/ETFs in core; flag higher-risk names (biotech, mining, psychedelics) as speculative.",
-        ],
-        "step_3_references": [
-            "Use credible market insights/news. When quoting or summarizing sources, include inline citations "
-            "in the exact format: 【source†L#-L#】 and prefer recent sources.",
-            "When unavailable, rely on sensible probabilistic reasoning and clearly mark assumptions in explainability.limitations.",
-        ],
-        "step_4_evaluate": [
-            "Check coherence: are narrative recommendations consistent with observed performance and concentration?",
-            "Highlight leaders/laggards and notable shifts; assess diversification and concentration risks.",
-            "For the rebalance plan, use Trim/Hold/Add style language in actions and within each rebalance path; avoid prescriptive advice.",
-        ],
-        "step_5_iterate": [
-            "Perform one iteration: refine allocations/suggestions for better balance and expected return; "
-            "note the refinement in explainability.assumptions or limitations.",
-        ],
-        "constraints": [
-            "STRICTLY conform to the provided JSON schema.",
-            "Populate assets_affected using ONLY the provided held symbols.",
-            "Do NOT invent or echo deterministic metrics/allocations/performance computed by the system.",
-            "Return only fields supported by evidence or sensible probabilistic reasoning; omit unsupported fields.",
-            "All content is informational, not investment advice. Avoid liability-inducing phrasing.",
-            "Keep tone clear, data-backed, and concise. Use % and $ in numerical statements where applicable.",
-        ],
-        "portfolio_context": {
-            "base_currency": base_currency,
-            "symbols": symbols,
-            "targets": targets or {},
-        },
-        "news_window_iso_utc": {"from": news_from_iso, "to": news_to_iso},
-        "predictions": {"forecast_window": forecast_window},
-        # Map the STEP deliverables to schema sections the model must populate:
-        "deliverables_to_schema": {
-            "latest_developments": True,
-            "catalysts": True,
-            "scenarios": True,
-            "actions": True,
-            "risks_list": True,
-            "performance_analysis": True,
-            "sentiment": True,
-            "predictions": True,
-            "rebalance_paths": True,
-            "market_outlook": True,
-            "summary": True,
-            "disclaimer": True,
-        },
-    }
-
-
-def _build_instruction_legacy(
-    *,
-    base_currency: str,
-    symbols: List[str],
-    news_from_iso: str,
-    news_to_iso: str,
-    targets: Optional[Dict[str, float]],
-    forecast_window: str,
-) -> Dict[str, Any]:
-    """
-    Original deterministic instruction block (v2 style).
-    """
-    return {
-        "role": "You are a portfolio analyst. Generate ONLY the requested AI sections.",
-        "objectives": [
-            # v1
-            "Consolidate latest developments and catalysts linked to held symbols.",
-            "Draft bull/base/bear scenarios with probabilities and clear basis.",
-            "Propose 3–6 prioritized actions with rationale (rebalance, alert, tax, hedge, research).",
-            "List explicit portfolio risks with what to monitor.",
-            "Provide a concise summary and a standard disclaimer.",
-            # v2 additions
-            "Summarize quantitative performance drivers (leaders, laggards, notable shifts).",
-            "Aggregate sentiment across credible sources and identify narrative drivers.",
-            f"Provide a short-horizon predictions layer (window: {forecast_window}) with rationale and confidence.",
-        ],
-        "constraints": [
-            "STRICTLY conform to the provided JSON schema.",
-            "Populate `assets_affected` using ONLY the provided held symbols.",
-            "Do NOT invent or echo deterministic metrics/allocations/performance computed by the system.",
-            "Return only fields you can support with evidence or sensible probabilistic reasoning.",
-            "Omit fields you cannot support; do NOT write 'N/A'.",
-            "All content is informational, not investment advice.",
-        ],
-        "portfolio_context": {
-            "base_currency": base_currency,
-            "symbols": symbols,
-            "targets": targets or {},
-        },
-        "news_window_iso_utc": {"from": news_from_iso, "to": news_to_iso},
-        "predictions": {"forecast_window": forecast_window},
-    }
-
-
-# -----------------------------------------------------------------------------
-# Public API
-# -----------------------------------------------------------------------------
-
-def get_portfolio_ai_layers_from_quotes(
-    *,
-    quotes_map: Dict[str, Dict[str, Any]],
-    base_currency: str = "USD",
-    days_of_news: int = 7,
-    include_sources: bool = False,
-    timeout: int = 60,
-    targets: Optional[Dict[str, float]] = None,
-    symbols_preferred_order: Optional[List[str]] = None,
-    forecast_window: str = "30D",
-    professional_mode: bool = True,
-) -> Dict[str, Any]:
-    """
-    Build AI-only portfolio sections using symbols derived from quotes_map (v2.1).
-
-    Parameters
-    ----------
-    quotes_map : dict
-        Your Yahoo bulk payload: {symbol: {...yahoo fields...}}
-    base_currency : str
-        Contextual currency label for the narrative.
-    days_of_news : int
-        Lookback window for news/catalysts.
-    include_sources : bool
-        Whether to ask Linkup to return sources (citations).
-    timeout : int
-        Linkup call timeout (seconds).
-    targets : Optional[dict]
-        Optional target weights (e.g., {"Equities": 60, "Bonds": 30, "Cash": 10})
-    symbols_preferred_order : Optional[List[str]]
-        If your app has canonical symbols (e.g., without -USD suffix), pass them;
-        we’ll use this list as the `assets_affected` vocabulary.
-    forecast_window : str
-        Predictions horizon (e.g., "30D", "90D"). Informational-only.
-    professional_mode : bool
-        If True, uses the 5-STEP professional instruction. Otherwise falls back to legacy v2.
-
-    Returns
-    -------
-    Dict[str, Any]  (matches AI_LAYERS_SCHEMA_V2_1)
-    """
-    now = datetime.now(timezone.utc)
-    to_date = now
-    from_date = to_date - timedelta(days=days_of_news)
-
-    symbols = (
-        [s.strip().upper() for s in (symbols_preferred_order or []) if s] or
-        _extract_symbols_from_quotes(quotes_map)
-    )
-
-    instruction = (
-        _build_instruction_professional(
-            base_currency=base_currency,
-            symbols=symbols,
-            news_from_iso=from_date.date().isoformat(),
-            news_to_iso=to_date.date().isoformat(),
-            targets=targets,
-            forecast_window=forecast_window,
-        )
-        if professional_mode
-        else _build_instruction_legacy(
-            base_currency=base_currency,
-            symbols=symbols,
-            news_from_iso=from_date.date().isoformat(),
-            news_to_iso=to_date.date().isoformat(),
-            targets=targets,
-            forecast_window=forecast_window,
-        )
-    )
-
-    # The actual prompt that goes to Linkup
-    query = (
-        "Portfolio AI layers only.\n\n"
-        "Follow the INSTRUCTION block and produce STRICT JSON per the schema.\n\n"
-        f"INSTRUCTION:\n{json.dumps(instruction, ensure_ascii=False)}"
-    )
-
-    response = client.search(
-        query=query,
-        depth="standard",
-        output_type="structured",
-        structured_output_schema=json.dumps(AI_LAYERS_SCHEMA_V2_1),
-        include_images=False,
-        include_sources=include_sources,
-        from_date=from_date.date(),
-        to_date=to_date.date(),
-        timeout=timeout,
-    )
-    return response
-
-
-def assemble_portfolio_report(
-    *,
-    precomputed_core: Dict[str, Any],
-    ai_layers: Dict[str, Any],
-    base_currency: Optional[str] = None,
-) -> Dict[str, Any]:
-    """
-    Merge AI sections into your precomputed_core, without overwriting deterministic fields.
-    The result matches your full portfolio schema contract. v2.1 adds new keys.
-    """
-    out = dict(precomputed_core)  # shallow copy
-
-    # Timestamp hygiene (only if you didn't already set them)
-    now_iso = datetime.now(timezone.utc).isoformat()
-    out.setdefault("as_of", now_iso)
-    if base_currency:
-        out.setdefault("base_currency", base_currency)
-    out.setdefault("timestamps", {})
-    out["timestamps"].setdefault("calculated_at", now_iso)
-
-    # Attach legacy + new AI keys, only if present and non-null
-    ai_keys = [
-        # v1
-        "latest_developments",
-        "catalysts",
-        "scenarios",
-        "actions",
-        "alerts",
-        "risks_list",
-        "explainability",
-        "section_confidence",
-        "summary",
-        "disclaimer",
-        # v2 additions
-        "performance_analysis",
-        "sentiment",
-        "predictions",
-        # v2.1 additions
-        "rebalance_paths",
-        "market_outlook",
-    ]
-
-    for key in ai_keys:
-        if key in ai_layers and ai_layers[key] is not None:
-            out[key] = ai_layers[key]
-
-    return out
-
-
-__all__ = [
-    "AI_LAYERS_SCHEMA",
-    "AI_LAYERS_SCHEMA_V2",
-    "AI_LAYERS_SCHEMA_V2_1",
-    "get_portfolio_ai_layers_from_quotes",
-    "assemble_portfolio_report",
+    {
+        "symbol": "NVDA",              # US equity, growth/AI
+        "quantity": 10,
+        "cost_basis": 5200.00,
+        "name": "NVIDIA Corporation",
+        "asset_class": "equity",
+        "sector": "Information Technology",
+        "region": "US",
+    },
+    {
+        "symbol": "MSFT",              # US mega-cap
+        "quantity": 15,
+        "cost_basis": 6000.00,
+        "name": "Microsoft Corporation",
+        "asset_class": "equity",
+        "sector": "Information Technology",
+        "region": "US",
+    },
+    {
+        "symbol": "VFV.TO",            # TSX S&P 500 ETF (CAD)
+        "quantity": 30,
+        "cost_basis": 3600.00,
+        "name": "Vanguard S&P 500 Index ETF",
+        "asset_class": "etf",
+        "sector": "Multi-sector",
+        "region": "Canada",
+    },
+    {
+        "symbol": "SHOP.TO",           # Canadian growth equity
+        "quantity": 12,
+        "cost_basis": 1800.00,
+        "name": "Shopify Inc.",
+        "asset_class": "equity",
+        "sector": "Information Technology",
+        "region": "Canada",
+    },
+    {
+        "symbol": "BTC-USD",           # Crypto (priced in USD)
+        "quantity": 0.15,
+        "cost_basis": 5500.00,
+        "name": "Bitcoin",
+        "asset_class": "crypto",
+        "sector": "Crypto",
+        "region": "Global",
+    },
+    {
+        "symbol": "CASH",              # Cash “position”
+        "quantity": 1,
+        "cost_basis": 2000.00,
+        "name": "Cash Balance",
+        "asset_class": "cash",
+        "sector": "Cash",
+        "region": "Canada",
+    },
 ]
+
+
+# -----------------------------------------------------------
+# 2. Optional: simple classification helper
+# -----------------------------------------------------------
+
+def simple_classification_from_metrics(metrics: Dict[str, Any]) -> Dict[str, str]:
+    """
+    Very rough demo classification:
+
+      - ETFs and diversified names -> 'core'
+      - Crypto and very volatile stuff -> 'speculative'
+      - Cash -> 'hedge'
+
+    You can replace this with your own logic or a dedicated classification agent.
+    """
+    classifications: Dict[str, str] = {}
+    per_symbol = metrics["per_symbol"]
+
+    for sym, s in per_symbol.items():
+        asset_class = s.get("asset_class", "")
+        mdd = s.get("max_drawdown_1Y_pct")
+
+        if asset_class == "cash" or sym == "CASH":
+            classifications[sym] = "hedge"
+        elif asset_class == "etf":
+            classifications[sym] = "core"
+        elif asset_class == "crypto":
+            classifications[sym] = "speculative"
+        else:
+            # crude: high max drawdown -> speculative
+            if mdd is not None and mdd < -40:
+                classifications[sym] = "speculative"
+            else:
+                classifications[sym] = "core"
+
+    return classifications
+
+
+# -----------------------------------------------------------
+# 3. Orchestrator
+# -----------------------------------------------------------
+
+def run_portfolio_pipeline() -> Dict[str, Any]:
+    base_currency = "CAD"
+    benchmark_ticker = "SPY"
+
+    # --- Metrics from Plaid + Yahoo ---
+    # If you have a class instead:
+    # metrics = PortfolioMetrics(DUMMY_PLAID_POSITIONS, base_currency, benchmark_ticker).to_dict()
+    metrics = build_metrics_from_plaid(
+        plaid_positions=DUMMY_PLAID_POSITIONS,
+        base_currency=base_currency,
+        benchmark_ticker=benchmark_ticker,
+    )
+
+    symbols = list(metrics["per_symbol"].keys())
+    classification = simple_classification_from_metrics(metrics)
+
+    # --- Agent 1: news & sentiment ---
+    # Expected signature in news_sentiment_agent.py:
+    # def run_news_sentiment_agent(base_currency: str, symbols: List[str]) -> Dict[str, Any]:
+    news_sentiment_json = call_link_up_for_news(
+        base_currency=base_currency,
+        symbols=symbols,
+    )
+    # --- Agent 2: performance & predictions ---
+    # Expected signature in performance_agent.py:
+    # def run_performance_agent(base_currency: str, metrics: Dict[str, Any]) -> Dict[str, Any]:
+    performance_json = call_link_up_for_performance(
+        base_currency=base_currency,
+        symbols=symbols,
+        metrics=metrics,
+    )
+
+    # --- Agent 3: scenarios, rebalance paths, market outlook, actions ---
+    # Expected signature in scenarios_rebalance_agent.py:
+    # def run_scenarios_rebalance_agent(base_currency: str,
+    #                                   symbols: List[str],
+    #                                   metrics: Dict[str, Any],
+    #                                   classification: Dict[str, str]) -> Dict[str, Any]:
+    scenarios_json = call_link_up_for_rebalance(
+        base_currency=base_currency,
+        symbols=symbols,
+        metrics=metrics,
+        classification=classification,
+    )
+
+    # --- Agent 4: summary & disclaimer ---
+    # Expected signature in summarry_agennt.py:
+    # def run_summary_agent(news_json: Dict[str, Any],
+    #                       performance_json: Dict[str, Any],
+    #                       scenarios_json: Dict[str, Any]) -> Dict[str, Any]:
+    summary_json = call_link_up_for_summary(
+        news_sentiment_json=news_sentiment_json,
+        performance_predictions_json=performance_json,
+        scenarios_rebalance_json=scenarios_json,
+    )
+
+    # --- Combine everything into one object for your app ---
+    final_payload: Dict[str, Any] = {
+        "metrics": metrics,
+        "classification": classification,
+        "news_sentiment": news_sentiment_json,
+        "performance": performance_json,
+        "scenarios_rebalance": scenarios_json,
+        "summary": summary_json,
+    }
+
+    return final_payload
