@@ -19,7 +19,7 @@ from sqlalchemy.dialects.postgresql import insert
 from models.portfolio_analysis import PortfolioAnalysis
 from services.holding_service import get_all_holdings
 from services.yahoo_service import get_full_stock_data_many
-from services.helpers.linkup.portfolio_linkup_v2 import get_portfolio_ai_layers_from_quotes
+from services.helpers.linkup.portfolio_summary_linkup import run_portfolio_pipeline
 
 Number = float | int | Decimal
 
@@ -161,15 +161,7 @@ def get_or_compute_portfolio_analysis(
 
     quotes_map = get_full_stock_data_many(symbols)
 
-    ai_layers = get_portfolio_ai_layers_from_quotes(
-        quotes_map=quotes_map,
-        base_currency=base_currency,
-        days_of_news=days_of_news,
-        include_sources=False,
-        timeout=60,
-        targets={k: float(v) for k, v in targets.items()} if targets else None,
-        symbols_preferred_order=symbols,
-    )
+    ai_layers = run_portfolio_pipeline()
 
     data = {
         "version": "v1",                 # bump if analysis logic changes
