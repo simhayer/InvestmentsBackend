@@ -30,22 +30,42 @@ def _enrich_pl_fields(h: HoldingOut) -> HoldingOut:
     out = h.model_copy(deep=True)
 
     qty  = _to_float(getattr(h, "quantity", 0.0))
+
     curr = getattr(h, "current_price", None)
-    # Prefer explicit unit cost if present, else legacy purchase_price
-    pur  = getattr(h, "purchase_unit_price", None) or getattr(h, "purchase_price", None)
     pc   = getattr(h, "previous_close", None)
 
+    total_cost = getattr(h, "purchase_amount_total", None)
+    unit_cost  = getattr(h, "purchase_unit_price", None) or getattr(h, "purchase_price", None)
+    value      = getattr(h, "value", None)
+
     curr_f = _to_float(curr) if curr is not None else None
-    pur_f  = _to_float(pur)  if pur  is not None else None
     pc_f   = _to_float(pc)   if pc   is not None else None
+    total_cost_f = _to_float(total_cost) if total_cost is not None else None
+    unit_cost_f  = _to_float(unit_cost)  if unit_cost  is not None else None
+    value_f      = _to_float(value)      if value      is not None else None
 
-    # Intraday P/L
-    out.day_pl = None if (curr_f is None or pc_f is None or pc_f <= 0) \
-        else round((curr_f - pc_f) * qty, 2)
+    # --- Day P/L (based on previous close) ---
+    if curr_f is not None and pc_f is not None and pc_f > 0 and qty > 0:
+        out.day_pl = round((curr_f - pc_f) * qty, 2)
+    else:
+        out.day_pl = None
 
-    # Total unrealized P/L
-    out.unrealized_pl = None if (curr_f is None or pur_f is None or pur_f <= 0) \
-        else round((curr_f - pur_f) * qty, 2)
+    # --- Unrealized P/L (total & %) ---
+    # Prefer total-based calc using current total value & total cost basis
+    if total_cost_f is not None and total_cost_f > 0 and value_f is not None:
+        pl = value_f - total_cost_f
+        out.unrealized_pl = round(pl, 2)
+        out.unrealized_pl_pct = round((value_f / total_cost_f - 1.0) * 100.0, 2)
+
+    # Fallback: per-unit math if only unit price is known
+    elif curr_f is not None and unit_cost_f is not None and unit_cost_f > 0 and qty > 0:
+        pl = (curr_f - unit_cost_f) * qty
+        out.unrealized_pl = round(pl, 2)
+        out.unrealized_pl_pct = round((curr_f / unit_cost_f - 1.0) * 100.0, 2)
+
+    else:
+        out.unrealized_pl = None
+        out.unrealized_pl_pct = None
 
     return out
 
@@ -119,13 +139,59 @@ async def get_holdings_with_live_prices(
 ) -> Dict[str, Any]:
     rows = get_all_holdings(user_id, db)
     if not rows:
-        return {"items": [], "as_of": int(time.time()), "price_status": "live", "requested_currency": currency.upper()}
+        return {
+            "items": [],
+            "as_of": int(time.time()),
+            "price_status": "live",
+            "requested_currency": currency.upper(),
+        }
 
-    pairs: List[Tuple[str, str]] = [(h.symbol or "", h.type or "") for h in rows if h.symbol and h.symbol.strip()]
+    # 1) Get quotes
+    pairs: List[Tuple[str, str]] = [
+        (h.symbol or "", h.type or "")
+        for h in rows
+        if h.symbol and h.symbol.strip()
+    ]
     quotes = await finnhub.get_prices(pairs=pairs, currency=currency)
-    filtered_quotes = {k: v for k, v in quotes.items() if v and v.get("currentPrice") is not None and v.get("currentPrice") != 0}
 
-    items = enrich_holdings(rows, filtered_quotes, currency)
+    filtered_quotes = {
+        k: v
+        for k, v in (quotes or {}).items()
+        if v and v.get("currentPrice") not in (None, 0)
+    }
+
+    # 2) Build base DTOs with live prices (enrich_holdings sets dto.current_price, dto.previous_close, dto.value when it has a quote)
+    raw_items = enrich_holdings(rows, filtered_quotes, currency)
+
+    # 3) Ensure every item has a correct `value` derived from price * quantity
+    market_value = 0.0
+    for it in raw_items:
+        qty = _to_float(getattr(it, "quantity", 0.0))
+        price = _to_float(getattr(it, "current_price", 0.0))
+
+        if price > 0 and qty > 0:
+            it.value = round(price * qty, 2)
+        else:
+            # fallback to whatever is already there, but never let it be negative
+            it.value = max(_to_float(getattr(it, "value", 0.0)), 0.0)
+
+        market_value += it.value
+
+    # 4) Recompute P/L + weight for each item using the *fresh* value
+    items: List[HoldingOut] = []
+    for it in raw_items:
+        enriched = _enrich_pl_fields(it)   # uses value + purchase_amount_total / unit price
+        enriched.value = it.value          # keep the same total value
+
+        enriched.current_value = enriched.value
+
+        if market_value > 0 and enriched.value is not None and enriched.value > 0:
+            enriched.weight = round(enriched.value / market_value * 100.0, 2)
+        else:
+            enriched.weight = None
+
+        items.append(enriched)
+
     return {
         "items": items,
         "as_of": int(time.time()),
