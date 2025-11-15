@@ -20,24 +20,33 @@ def _key(symbol: Optional[str], typ: Optional[str]) -> str:
     return f"{s}:{t}" if t else s
 
 def _position_value(h: HoldingOut) -> float:
-    v = _to_float(getattr(h, "value", 0.0))
-    return v if v > 0 else _to_float(h.current_price) * _to_float(h.quantity)
+    # Prefer explicit total value, fall back to price * qty
+    v = _to_float(getattr(h, "value", 0.0) or getattr(h, "current_value", 0.0))
+    if v > 0:
+        return v
+    return _to_float(h.current_price) * _to_float(h.quantity)
 
 def _enrich_pl_fields(h: HoldingOut) -> HoldingOut:
     out = h.model_copy(deep=True)
+
     qty  = _to_float(getattr(h, "quantity", 0.0))
     curr = getattr(h, "current_price", None)
-    pur  = getattr(h, "purchase_price", None)
+    # Prefer explicit unit cost if present, else legacy purchase_price
+    pur  = getattr(h, "purchase_unit_price", None) or getattr(h, "purchase_price", None)
     pc   = getattr(h, "previous_close", None)
 
     curr_f = _to_float(curr) if curr is not None else None
     pur_f  = _to_float(pur)  if pur  is not None else None
     pc_f   = _to_float(pc)   if pc   is not None else None
 
+    # Intraday P/L
     out.day_pl = None if (curr_f is None or pc_f is None or pc_f <= 0) \
         else round((curr_f - pc_f) * qty, 2)
+
+    # Total unrealized P/L
     out.unrealized_pl = None if (curr_f is None or pur_f is None or pur_f <= 0) \
         else round((curr_f - pur_f) * qty, 2)
+
     return out
 
 def get_all_holdings(user_id: str, db: Session) -> List[Holding]:
@@ -151,6 +160,11 @@ def enrich_holdings(
             account_name=h.account_name,
             institution=h.institution,
             currency=h.currency,
+            purchase_amount_total=getattr(h, "purchase_amount_total", None),
+            purchase_unit_price=getattr(h, "purchase_unit_price", None),
+            unrealized_pl=getattr(h, "unrealized_pl", None),
+            unrealized_pl_pct=getattr(h, "unrealized_pl_pct", None),
+            current_value=getattr(h, "current_value", None),
         )
 
         if q and q.get("currentPrice") is not None:

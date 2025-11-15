@@ -37,3 +37,16 @@ def parse_json_strict(maybe: Any) -> Dict[str, Any]:
         if not m:
             raise
         return json.loads(m.group(0))
+    
+
+def safe_div(n, d):
+    try:
+        return (n / d) if (n is not None and d not in (None, 0)) else None
+    except ZeroDivisionError:
+        return None
+    
+def num(x):
+    try:
+        return float(x) if x is not None else None
+    except Exception:
+        return None

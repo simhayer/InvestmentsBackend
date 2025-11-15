@@ -9,18 +9,25 @@ class Holding(Base):
     __tablename__ = "holdings"
 
     id: Mapped[int] = mapped_column(primary_key=True, index=True)
-    symbol: Mapped[str] = mapped_column()              # Ticker (e.g. BTC, AAPL)
-    name: Mapped[str] = mapped_column()                # Full name of the security
-    type: Mapped[str] = mapped_column()                # "equity", "crypto", etc.
-    quantity: Mapped[float] = mapped_column()          # How much the user owns
-    purchase_price: Mapped[float] = mapped_column()    # Price at which the user bought the asset
-    current_price: Mapped[float] = mapped_column()     # Latest market price
-    value: Mapped[float] = mapped_column()             # Quantity × current_price
-    currency: Mapped[str] = mapped_column()            # "USD", etc.
-    institution: Mapped[str] = mapped_column()         # "Wealthsimple", etc.
-    account_name: Mapped[str] = mapped_column()        # e.g. "401k", "IRA"
-    source: Mapped[str] = mapped_column()              # "plaid" or "manual"
+    symbol: Mapped[str] = mapped_column()
+    name: Mapped[str] = mapped_column()
+    type: Mapped[str] = mapped_column()
+    quantity: Mapped[float] = mapped_column()
+    purchase_price: Mapped[float] = mapped_column()
+    current_price: Mapped[float] = mapped_column()
+    value: Mapped[float] = mapped_column()
+    currency: Mapped[str] = mapped_column()
+    institution: Mapped[str] = mapped_column()
+    account_name: Mapped[str] = mapped_column()
+    source: Mapped[str] = mapped_column()
     external_id: Mapped[str] = mapped_column()
+
+    # NEW fields
+    purchase_amount_total: Mapped[float | None] = mapped_column(nullable=True)
+    purchase_unit_price: Mapped[float | None] = mapped_column(nullable=True)
+    unrealized_pl: Mapped[float | None] = mapped_column(nullable=True)
+    unrealized_pl_pct: Mapped[float | None] = mapped_column(nullable=True)
+    current_value: Mapped[float | None] = mapped_column(nullable=True)
 
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
     owner = relationship("User", back_populates="holdings")
@@ -51,6 +58,13 @@ class HoldingOut(BaseModel):
     day_pl: float | None = None
     unrealized_pl: float | None = None
     weight: float | None = None         # percentage of portfolio, if computed
+
+    # NEW fields
+    purchase_amount_total: float | None = None   # TOTAL cost basis
+    purchase_unit_price: float | None = None     # per-unit cost
+    unrealized_pl: float | None = None           # total P/L
+    unrealized_pl_pct: float | None = None       # % P/L
+    current_value: float | None = None           
 
     # If you want, add derived fields via @computed_field in Pydantic v2
 
