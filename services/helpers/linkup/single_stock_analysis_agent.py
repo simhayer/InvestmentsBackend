@@ -353,7 +353,7 @@ def call_link_up_for_single_stock(
                 depth="standard",
                 output_type="structured",
                 structured_output_schema=json.dumps(SINGLE_STOCK_SUMMARY_SCHEMA)
-            )ß
+            )
     except Exception as e:
         # logger.error(f"Error occurred while fetching portfolio AI layers: {e}")
         return {"error": str(e)}
