@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.concurrency import run_in_threadpool
 from services.auth_service import get_current_user
+from services.helpers.linkup.single_stock_analysis_agent import call_link_up_for_single_stock
 from services.holding_service import get_all_holdings
 from sqlalchemy.orm import Session
 from database import get_db
@@ -42,7 +43,7 @@ class SymbolReq(BaseModel):
 @router.post("/analyze-symbol")
 async def analyze_symbol_endpoint(req: SymbolReq, user=Depends(get_current_user)):
     # return dummy_holding_response
-    return await run_in_threadpool(get_linkup_symbol_analysis, req.symbol)
+    return await run_in_threadpool(call_link_up_for_single_stock, req.symbol)
 
 dummy_holding_response = {
     "summary": "Apple Inc. (AAPL) stock has recently hit record highs in 2025, driven primarily by strong demand for the iPhone 17 series in key markets like the U.S. and China. Loop Capital upgraded the stock from hold to buy, raising the price target significantly to $315, citing a multi-year iPhone replacement cycle and ongoing shipment expansion through 2027. Other analysts, including Evercore ISI and Goldman Sachs, have also raised price targets and ratings, expecting upside in upcoming earnings and continued momentum. Apple's market capitalization is nearing $4 trillion, making it the second-most valuable company globally, surpassing Microsoft. Despite a challenging year with tariff impacts and underperformance relative to some tech peers, recent strong sales and product innovation have revitalized investor confidence. Risks include geopolitical tensions affecting supply chains and competitive pressures. Technically, the stock is in an uptrend with new all-time highs and strong momentum indicators. Key upcoming events include the fiscal Q4 earnings report expected on October 30, 2025. Overall, the outlook is bullish with significant upside potential based on product demand and strategic growth in services and AI integration.",
