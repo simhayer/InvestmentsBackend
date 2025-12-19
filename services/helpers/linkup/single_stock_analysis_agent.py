@@ -27,9 +27,59 @@ Expected usage pattern:
 
 from __future__ import annotations
 
+import hashlib
 import json
+import os
+import time
 from typing import Any, Dict, Optional
 from .linkup_config import client
+try:
+    import redis as redis_sync  # redis-py for direct Redis/Upstash (redis:// / rediss://)
+except Exception:
+    redis_sync = None
+
+SINGLE_STOCK_CACHE_TTL_SEC = int(os.getenv("SINGLE_STOCK_CACHE_TTL_SEC", "86400"))  # default 24h
+LOCAL_CACHE_TTL_SEC = int(os.getenv("SINGLE_STOCK_LOCAL_CACHE_TTL_SEC", "60"))  # reduce Redis reads
+
+_redis_client = None
+
+def _get_redis_client():
+    global _redis_client
+    if _redis_client is not None:
+        return _redis_client
+    if not redis_sync:
+        return None
+    url = os.getenv("UPSTASH_REDIS_URL")
+    if not url:
+        return None
+    try:
+        _redis_client = redis_sync.from_url(url, decode_responses=True)
+    except Exception:
+        _redis_client = None
+    return _redis_client
+
+# small in-process cache to avoid repeated Redis GETs on the same key within a short window
+_LOCAL_CACHE: dict[str, tuple[float, Any]] = {}
+_MISS = object()
+
+
+def _local_get(key: str) -> Optional[Any]:
+    if LOCAL_CACHE_TTL_SEC <= 0:
+        return None
+    hit = _LOCAL_CACHE.get(key)
+    if not hit:
+        return None
+    expires_at, val = hit
+    if time.time() < expires_at:
+        return val
+    _LOCAL_CACHE.pop(key, None)
+    return None
+
+
+def _local_set(key: str, val: Any) -> None:
+    if LOCAL_CACHE_TTL_SEC <= 0:
+        return
+    _LOCAL_CACHE[key] = (time.time() + LOCAL_CACHE_TTL_SEC, val)
 
 
 # ============================================================
@@ -324,7 +374,7 @@ def build_single_stock_query(
             "rather than hallucinate.",
             "All content is informational and educational, not investment, tax, or legal advice.",
         ],
-        "stock_context": {
+    "stock_context": {
             "symbol": symbol,
             "base_currency": base_currency,
             "metrics_for_symbol": metrics_for_symbol or {},
@@ -333,7 +383,66 @@ def build_single_stock_query(
 
 
 # ============================================================
-# 3. Convenience function to call Linkup
+# 3. Cache helpers (shared across users)
+# ============================================================
+
+def _build_cache_key(
+    symbol: str,
+    base_currency: str,
+    metrics_for_symbol: Optional[Dict[str, Any]],
+) -> str:
+    """
+    Build a deterministic key so cached analyses are reused across users.
+    Metrics are hashed to keep the key small.
+    """
+    metrics_hash = "nometrics"
+    if metrics_for_symbol:
+        try:
+            blob = json.dumps(metrics_for_symbol, sort_keys=True, default=str)
+        except Exception:
+            blob = repr(metrics_for_symbol)
+        metrics_hash = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
+
+    return f"linkup:single_stock:{symbol.upper()}:{base_currency.upper()}:{metrics_hash}"
+
+
+def _cache_get(key: str) -> Optional[Dict[str, Any]]:
+    mem = _local_get(key)
+    if mem is _MISS:
+        return None
+    if mem is not None:
+        return mem
+
+    client = _get_redis_client()
+    if not client:
+        return None
+
+    try:
+        cached = client.get(key)
+        if cached:
+            payload = json.loads(cached)
+            _local_set(key, payload)
+            return payload
+        _local_set(key, _MISS)
+        return None
+    except Exception:
+        return None
+
+
+def _cache_set(key: str, payload: Dict[str, Any]) -> None:
+    client = _get_redis_client()
+    if not client:
+        return
+    try:
+        client.set(key, json.dumps(payload), ex=SINGLE_STOCK_CACHE_TTL_SEC)
+        _local_set(key, payload)
+    except Exception:
+        # Fail soft if Redis is unavailable
+        pass
+
+
+# ============================================================
+# 4. Convenience function to call Linkup
 # ============================================================
 
 def call_link_up_for_single_stock(
@@ -341,9 +450,20 @@ def call_link_up_for_single_stock(
     base_currency: Optional[str] = None,
     metrics_for_symbol: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
+    normalized_base_currency = (base_currency or "USD").upper()
+    cache_key = _build_cache_key(
+        symbol=symbol,
+        base_currency=normalized_base_currency,
+        metrics_for_symbol=metrics_for_symbol,
+    )
+
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+
     instruction = build_single_stock_query(
         symbol=symbol,
-        base_currency=base_currency,
+        base_currency=normalized_base_currency,
         metrics_for_symbol=metrics_for_symbol,
     )
 
@@ -359,4 +479,6 @@ def call_link_up_for_single_stock(
         return {"error": str(e)}
 
     # Assuming Linkup client already returns Python dict. If it's a string, json.loads it here.
+    if isinstance(response, dict) and not response.get("error"):
+        _cache_set(cache_key, response)
     return response

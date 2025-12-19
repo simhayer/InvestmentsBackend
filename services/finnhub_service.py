@@ -168,9 +168,20 @@ class FinnhubService:
         if not query:
             return []
         async with self._client(client) as c:
-            r = await c.get("https://finnhub.io/api/v1/search", params={"q": query, "token": self.api_key})
-            data = r.json()
-            return [item for item in data.get("result", []) if item.get("symbol") and item.get("description")]
+            try:
+                r = await c.get(
+                    "https://finnhub.io/api/v1/search",
+                    params={"q": query, "token": self.api_key},
+                )
+                if r.status_code >= 400:
+                    return []
+                try:
+                    data = r.json()
+                except ValueError:
+                    return []
+                return [item for item in data.get("result", []) if item.get("symbol") and item.get("description")]
+            except Exception:
+                return []
 
     async def fetch_quote(self, symbol: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
         async with self._client(client) as c:
