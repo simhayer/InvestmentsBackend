@@ -13,3 +13,9 @@
 *.tsbuildinfo
 
 *.pyc
+
+# local virtual env
+/venv/
+
+# local documentation scratch
+/readme.md
