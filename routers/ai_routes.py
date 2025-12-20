@@ -1,6 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.concurrency import run_in_threadpool
-from services.auth_service import get_current_user
 from services.helpers.linkup.single_stock_analysis_agent import call_link_up_for_single_stock
 from services.holding_service import get_all_holdings
 from sqlalchemy.orm import Session
@@ -9,13 +8,14 @@ from pydantic import BaseModel
 from fastapi import APIRouter, Query
 from services.portfolio_service import get_or_compute_portfolio_analysis
 from services.helpers.linkup.symbol_analysis import get_linkup_symbol_analysis
+from services.supabase_auth import get_current_db_user
 
 router = APIRouter()
 
 @router.post("/analyze-portfolio")
 async def analyze_portfolio_endpoint(
     force: bool = Query(False, description="Bypass cache and recompute now"),
-    user=Depends(get_current_user),
+    user=Depends(get_current_db_user),
     db: Session = Depends(get_db),
 ):
     data, meta = get_or_compute_portfolio_analysis(
@@ -41,7 +41,7 @@ class SymbolReq(BaseModel):
     symbol: str
 
 @router.post("/analyze-symbol")
-async def analyze_symbol_endpoint(req: SymbolReq, user=Depends(get_current_user)):
+async def analyze_symbol_endpoint(req: SymbolReq, user=Depends(get_current_db_user)):
     # return dummy_holding_response
     return await run_in_threadpool(call_link_up_for_single_stock, req.symbol)
 

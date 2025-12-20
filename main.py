@@ -1,8 +1,10 @@
 # main.py
 import os
-if os.getenv("DEBUGPY", "0") == "1":
-    import debugpy
-    debugpy.listen(("0.0.0.0", 5678))
+from dotenv import load_dotenv
+load_dotenv()
+# if os.getenv("DEBUGPY", "0") == "1":
+#     import debugpy
+#     debugpy.listen(("0.0.0.0", 5678))
     
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

@@ -16,9 +16,10 @@ from plaid.model.investments_holdings_get_request import InvestmentsHoldingsGetR
 from pydantic import BaseModel
 from models.holding import Holding
 from typing import List, Dict
-from services.auth_service import get_current_user
 from services.plaid_service import get_connections
 from utils.common_helpers import safe_div, num
+from models.user import User
+from services.supabase_auth import get_current_db_user
 
 # Plaid setup
 configuration = Configuration(
@@ -35,14 +36,15 @@ router = APIRouter()
 # ----------- LINK TOKEN ----------------
 
 @router.post("/create-link-token")
-async def create_link_token(user=Depends(get_current_user)):
+async def create_link_token(user: User = Depends(get_current_db_user)):
+
     try:
         request = LinkTokenCreateRequest(
             products=[Products("investments")],
             client_name="Investment Tracker",
             country_codes=[CountryCode("US"), CountryCode("CA")],
             language="en",
-            user=LinkTokenCreateRequestUser(client_user_id=str(user.id)),
+            user=LinkTokenCreateRequestUser(client_user_id=str(user.id))
         )
         response = client.link_token_create(request)
         return {"link_token": response.link_token}
@@ -61,7 +63,7 @@ async def exchange_token(
     institution_id: str = Body(None),
     institution_name: str = Body(None),
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    user: User = Depends(get_current_db_user),
 ):
     try:
         request = ItemPublicTokenExchangeRequest(public_token=public_token)
@@ -100,7 +102,7 @@ async def exchange_token(
 @router.get("/investments")
 async def get_investments(
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    user: User = Depends(get_current_db_user),
 ):
     token_entry = db.query(UserAccess).filter_by(user_id=str(user.id)).first()
     if not token_entry:
@@ -182,7 +184,7 @@ async def get_investments(
         })
 
     # Persist to DB
-    sync_plaid_holdings(user.id, normalized, db)
+    sync_plaid_holdings(str(user.id), normalized, db)
 
     return {
         "message": "Holdings synced",
@@ -190,7 +192,7 @@ async def get_investments(
         "holdings": normalized,
         "raw": response,  # keep for now while debugging; remove later
     }
-def sync_plaid_holdings(user_id: int, plaid_holdings: List[Dict], db: Session):
+def sync_plaid_holdings(user_id: str, plaid_holdings: List[Dict], db: Session):
     # Step 1: Fetch existing holdings
     existing_holdings = (
         db.query(Holding)
@@ -327,9 +329,10 @@ class InstitutionOut(BaseModel):
 @router.get("/institutions", response_model=List[InstitutionOut])
 async def get_connected_institutions(
     db: Session = Depends(get_db),
-    user=Depends(get_current_user),
+    user: User = Depends(get_current_db_user),
 ):
     try:
-        return get_connections(user.id, db)
+        return get_connections(str(user.id), db)
     except Exception as e:
+        print("Error fetching institutions:", e)
         raise HTTPException(status_code=500, detail="Failed to fetch institutions")

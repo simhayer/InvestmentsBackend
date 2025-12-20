@@ -1,14 +1,14 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 from database import get_db
-from services.auth_service import get_current_user
 from services.holding_service import get_all_holdings
 from services.finnhub_news_service import get_company_news_for_symbols
+from services.supabase_auth import get_current_db_user
 
 router = APIRouter()
 
 @router.get("/latest-for-user")
-async def get_latest_news_for_user(user=Depends(get_current_user) ,db: Session = Depends(get_db), ):
+async def get_latest_news_for_user(user=Depends(get_current_db_user) ,db: Session = Depends(get_db), ):
     holdings = get_all_holdings(user.id, db)
     holdingSymbols = [str(h.symbol) for h in holdings if isinstance(h.symbol, str)]
     if not holdingSymbols:

@@ -2,8 +2,8 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import List
+from services.supabase_auth import get_current_db_user
 
-from services.auth_service import get_current_user
 from services.finnhub_service import (
     FinnhubService,
     FinnhubServiceError,
@@ -28,7 +28,7 @@ class PriceRequest(BaseModel):
 async def get_price(
     symbol: str,
     type: str = "stock",
-    user=Depends(get_current_user),
+    user=Depends(get_current_db_user),
     svc: FinnhubService = Depends(get_finnhub_service),
 ):
     try:
@@ -42,7 +42,7 @@ async def get_price(
 @router.post("/prices")
 async def get_prices(
     request: PriceRequest,
-    user=Depends(get_current_user),
+    user=Depends(get_current_db_user),
     svc: FinnhubService = Depends(get_finnhub_service),
 ):
     if len(request.symbols) != len(request.types):
@@ -73,7 +73,7 @@ async def search_symbols(
 @router.get("/quote")
 async def fetch_quote(
     symbol: str,
-    user=Depends(get_current_user),
+    user=Depends(get_current_db_user),
     svc: FinnhubService = Depends(get_finnhub_service),
 ):
     try:
@@ -85,7 +85,7 @@ async def fetch_quote(
 @router.get("/profile")
 async def fetch_profile(
     symbol: str,
-    user=Depends(get_current_user),
+    user=Depends(get_current_db_user),
     svc: FinnhubService = Depends(get_finnhub_service),
 ):
     try:
@@ -98,7 +98,7 @@ async def fetch_profile(
 @router.get("/_batch-prices")
 async def fetch_prices_for_symbols(
     symbols: List[str],
-    user=Depends(get_current_user),
+    user=Depends(get_current_db_user),
     svc: FinnhubService = Depends(get_finnhub_service),
 ):
     try:

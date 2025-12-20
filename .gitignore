@@ -18,4 +18,8 @@
 /venv/
 
 # local documentation scratch
-/readme.md
+/readme.node_modules
+
+# cache files
+/.pytest_cache/ 
+/__pycache__/

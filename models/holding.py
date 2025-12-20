@@ -54,9 +54,7 @@ class HoldingOut(BaseModel):
     # Transient/computed fields (NOT in DB)
     previous_close: float | None = None
     price_status: str | None = None
-    previous_close: float | None = None
     day_pl: float | None = None
-    unrealized_pl: float | None = None
     weight: float | None = None         # percentage of portfolio, if computed
 
     # NEW fields
