@@ -17,5 +17,5 @@ def me(current_user: User = Depends(get_current_db_user)):
         id=current_user.id,
         supabase_user_id=current_user.supabase_user_id,
         email=current_user.email,
-        base_currency=current_user.currency,
+        base_currency=current_user.currency or "USD",
     )
