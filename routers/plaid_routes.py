@@ -20,6 +20,7 @@ from services.plaid_service import get_connections
 from utils.common_helpers import safe_div, num
 from models.user import User
 from services.supabase_auth import get_current_db_user
+from services.currency_service import maybe_auto_set_user_base_currency
 
 # Plaid setup
 configuration = Configuration(
@@ -185,6 +186,9 @@ async def get_investments(
 
     # Persist to DB
     sync_plaid_holdings(str(user.id), normalized, db)
+
+    # Auto-set base currency (only if not manual)
+    maybe_auto_set_user_base_currency(user, normalized, db)
 
     return {
         "message": "Holdings synced",

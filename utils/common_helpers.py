@@ -1,7 +1,19 @@
+from decimal import Decimal
 import math
 from typing import Any, Optional
 import json
-from typing import Any, Dict, List
+from typing import Any, Dict
+import httpx
+
+def to_float(x: Any) -> float:
+    if x is None:
+        return 0.0
+    if isinstance(x, Decimal):
+        return float(x)
+    try:
+        return float(x)
+    except Exception:
+        return 0.0
 
 def safe_float(x: Any) -> Optional[float]:
     try:
@@ -50,3 +62,19 @@ def num(x):
         return float(x) if x is not None else None
     except Exception:
         return None
+    
+def safe_json(resp: httpx.Response) -> Optional[Dict[str, Any]]:
+    try:
+        data = resp.json()
+    except ValueError:
+        return None
+    return data if isinstance(data, dict) else None
+
+def canonical_key(symbol: Optional[str], typ: Optional[str]) -> str:
+    """
+    Canonical key used across the app to avoid collisions and mismatch.
+    Matches your holdings layer _key(symbol, type): "AAPL:equity" or "AAPL".
+    """
+    s = (symbol or "").upper().strip()
+    t = (typ or "").lower().strip()
+    return f"{s}:{t}" if t else s

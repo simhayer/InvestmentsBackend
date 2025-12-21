@@ -1,78 +1,114 @@
-from decimal import Decimal
-from typing import Any, Dict, List, Tuple, Optional
+from __future__ import annotations
+import time
+import heapq
+from typing import Any, Dict, List, Tuple
 from sqlalchemy.orm import Session
 from models.holding import Holding, HoldingOut
 from services.finnhub_service import FinnhubService
-from math import fsum
-import time
+from utils.common_helpers import to_float
+from utils.common_helpers import canonical_key
 
-def _to_float(x: Any) -> float:
-    if isinstance(x, Decimal):
-        return float(x)
-    try:
-        return float(x)
-    except Exception:
-        return 0.0
-
-def _key(symbol: Optional[str], typ: Optional[str]) -> str:
-    s = (symbol or "").upper().strip()
-    t = (typ or "").lower().strip()
-    return f"{s}:{t}" if t else s
-
-def _position_value(h: HoldingOut) -> float:
-    # Prefer explicit total value, fall back to price * qty
-    v = _to_float(getattr(h, "value", 0.0) or getattr(h, "current_value", 0.0))
-    if v > 0:
-        return v
-    return _to_float(h.current_price) * _to_float(h.quantity)
-
-def _enrich_pl_fields(h: HoldingOut) -> HoldingOut:
-    out = h.model_copy(deep=True)
-
-    qty  = _to_float(getattr(h, "quantity", 0.0))
+def _compute_pl_fields(h: HoldingOut) -> None:
+    qty = to_float(getattr(h, "quantity", 0.0))
 
     curr = getattr(h, "current_price", None)
-    pc   = getattr(h, "previous_close", None)
+    pc = getattr(h, "previous_close", None)
 
     total_cost = getattr(h, "purchase_amount_total", None)
-    unit_cost  = getattr(h, "purchase_unit_price", None) or getattr(h, "purchase_price", None)
-    value      = getattr(h, "value", None)
+    unit_cost = getattr(h, "purchase_unit_price", None) or getattr(h, "purchase_price", None)
+    value = getattr(h, "value", None)
 
-    curr_f = _to_float(curr) if curr is not None else None
-    pc_f   = _to_float(pc)   if pc   is not None else None
-    total_cost_f = _to_float(total_cost) if total_cost is not None else None
-    unit_cost_f  = _to_float(unit_cost)  if unit_cost  is not None else None
-    value_f      = _to_float(value)      if value      is not None else None
+    curr_f = to_float(curr) if curr is not None else None
+    pc_f = to_float(pc) if pc is not None else None
+    total_cost_f = to_float(total_cost) if total_cost is not None else None
+    unit_cost_f = to_float(unit_cost) if unit_cost is not None else None
+    value_f = to_float(value) if value is not None else None
 
-    # --- Day P/L (based on previous close) ---
+    # Day P/L
     if curr_f is not None and pc_f is not None and pc_f > 0 and qty > 0:
-        out.day_pl = round((curr_f - pc_f) * qty, 2)
+        h.day_pl = round((curr_f - pc_f) * qty, 2)
     else:
-        out.day_pl = None
+        h.day_pl = None
 
-    # --- Unrealized P/L (total & %) ---
-    # Prefer total-based calc using current total value & total cost basis
+    # Unrealized P/L
     if total_cost_f is not None and total_cost_f > 0 and value_f is not None:
         pl = value_f - total_cost_f
-        out.unrealized_pl = round(pl, 2)
-        out.unrealized_pl_pct = round((value_f / total_cost_f - 1.0) * 100.0, 2)
-
-    # Fallback: per-unit math if only unit price is known
+        h.unrealized_pl = round(pl, 2)
+        h.unrealized_pl_pct = round((value_f / total_cost_f - 1.0) * 100.0, 2)
     elif curr_f is not None and unit_cost_f is not None and unit_cost_f > 0 and qty > 0:
         pl = (curr_f - unit_cost_f) * qty
-        out.unrealized_pl = round(pl, 2)
-        out.unrealized_pl_pct = round((curr_f / unit_cost_f - 1.0) * 100.0, 2)
-
+        h.unrealized_pl = round(pl, 2)
+        h.unrealized_pl_pct = round((curr_f / unit_cost_f - 1.0) * 100.0, 2)
     else:
-        out.unrealized_pl = None
-        out.unrealized_pl_pct = None
-
-    return out
+        h.unrealized_pl = None
+        h.unrealized_pl_pct = None
 
 def get_all_holdings(user_id: str, db: Session) -> List[Holding]:
     return db.query(Holding).filter_by(user_id=user_id).all()
 
-async def get_holdings_with_live_prices_top(
+# -----------------------
+# Mapping + enrichment
+# -----------------------
+
+def _base_dto_from_row(h: Holding, currency_default: str) -> HoldingOut:
+    return HoldingOut(
+        id=h.id,
+        user_id=h.user_id,
+        source=h.source,
+        external_id=h.external_id,
+        symbol=h.symbol,
+        name=h.name,
+        type=h.type,
+        quantity=h.quantity,
+        current_price=h.current_price,
+        purchase_price=h.purchase_price,
+        value=h.value,
+        account_name=h.account_name,
+        institution=h.institution,
+        currency=(h.currency or currency_default),
+        purchase_amount_total=getattr(h, "purchase_amount_total", None),
+        purchase_unit_price=getattr(h, "purchase_unit_price", None),
+        unrealized_pl=getattr(h, "unrealized_pl", None),
+        unrealized_pl_pct=getattr(h, "unrealized_pl_pct", None),
+        current_value=getattr(h, "current_value", None),
+    )
+
+
+def enrich_holdings(
+    holdings: List[Holding],
+    quotes: Dict[str, Dict[str, Any] | None],
+    currency: str = "USD",
+) -> List[HoldingOut]:
+    currency_default = currency.upper()
+    enriched: List[HoldingOut] = []
+
+    for h in holdings:
+        dto = _base_dto_from_row(h, currency_default)
+
+        k_full = canonical_key(h.symbol, h.type)
+        k_sym = canonical_key(h.symbol, None)
+        q = quotes.get(k_full) or quotes.get(k_sym)
+
+        qty = to_float(h.quantity)
+
+        if q and q.get("currentPrice") is not None:
+            live_price = to_float(q["currentPrice"])
+            dto.current_price = live_price
+            dto.previous_close = to_float(q.get("previousClose")) if q.get("previousClose") is not None else None
+            dto.currency = (q.get("currency") or dto.currency or currency_default).upper()
+            dto.price_status = "live"
+        else:
+            dto.price_status = "unavailable"
+
+        # set value consistently for everyone (live OR stored price)
+        price = to_float(dto.current_price)
+        dto.value = round(price * qty, 2) if price > 0 and qty > 0 else max(to_float(dto.value), 0.0)
+
+        enriched.append(dto)
+
+    return enriched
+
+async def get_holdings_with_live_prices(
     user_id: str,
     db: Session,
     finnhub: FinnhubService,
@@ -83,173 +119,63 @@ async def get_holdings_with_live_prices_top(
     include_weights: bool = True,
 ) -> Dict[str, Any]:
     rows = get_all_holdings(user_id, db)
+    as_of = int(time.time())
+    currency_up = currency.upper()
+
     if not rows:
         return {
             "items": [],
-            "as_of": int(time.time()),
+            "top_items": [],
+            "as_of": as_of,
             "price_status": "live",
-            "requested_currency": currency.upper(),
+            "requested_currency": currency_up,
         }
 
-    # 1) Request and normalize quote keys to our _key format
+    # request pairs
     pairs: List[Tuple[str, str]] = [
-        ((h.symbol or ""), (h.type or "")) for h in rows if (h.symbol or "").strip()
-    ]
-    quotes_raw = await finnhub.get_prices(pairs=pairs, currency=currency)
-
-    normalized_quotes: Dict[str, Dict[str, Any]] = {}
-    for k, v in (quotes_raw or {}).items():
-        if isinstance(k, (tuple, list)):
-            kk = _key(k[0] if k else None, (k[1] if len(k) > 1 else None))
-        else:
-            kk = _key(str(k), None)
-        if v and v.get("currentPrice") not in (None, 0):
-            normalized_quotes[kk] = v
-
-    # 2) Build enriched items (current_price / previous_close / value / price_status)
-    items = enrich_holdings(rows, normalized_quotes, currency)
-
-    # compute top regardless of top_only
-    market_value = sum(max(_position_value(it), 0.0) for it in items)
-    sorted_items = sorted(items, key=_position_value, reverse=True)
-
-    top_items: List[HoldingOut] = []
-    for it in sorted_items[: max(1, top_n)]:
-        v = _position_value(it)
-        copy = _enrich_pl_fields(it)      # fills day_pl & unrealized_pl
-        copy.value = round(v, 2)
-        if include_weights:
-            copy.weight = round(v / market_value * 100.0, 2) if market_value > 0 else None
-        top_items.append(copy)
-
-    payload = {
-        "items": items if not top_only else top_items,   # <— when top_only, return only top
-        "top_items": top_items,                           # <— always include enriched top slice
-        "as_of": int(time.time()),
-        "price_status": "live",
-        "requested_currency": currency.upper(),
-    }
-    return payload
-
-async def get_holdings_with_live_prices(
-    user_id: str,
-    db: Session,
-    finnhub: FinnhubService,
-    currency: str = "USD",
-) -> Dict[str, Any]:
-    rows = get_all_holdings(user_id, db)
-    if not rows:
-        return {
-            "items": [],
-            "as_of": int(time.time()),
-            "price_status": "live",
-            "requested_currency": currency.upper(),
-        }
-
-    # 1) Get quotes
-    pairs: List[Tuple[str, str]] = [
-        (h.symbol or "", h.type or "")
+        ((h.symbol or "").strip(), (h.type or "").strip())
         for h in rows
-        if h.symbol and h.symbol.strip()
+        if (h.symbol or "").strip()
     ]
-    quotes = await finnhub.get_prices(pairs=pairs, currency=currency)
 
-    filtered_quotes = {
-        k: v
-        for k, v in (quotes or {}).items()
-        if v and v.get("currentPrice") not in (None, 0)
-    }
+    quotes_raw = await finnhub.get_prices(pairs=pairs, currency=currency_up)
+    quotes = quotes_raw or {}
+    items = enrich_holdings(rows, quotes, currency_up)
 
-    # 2) Build base DTOs with live prices (enrich_holdings sets dto.current_price, dto.previous_close, dto.value when it has a quote)
-    raw_items = enrich_holdings(rows, filtered_quotes, currency)
-
-    # 3) Ensure every item has a correct `value` derived from price * quantity
+    # compute position values ONCE and reuse everywhere
+    valued: List[Tuple[float, HoldingOut]] = []
     market_value = 0.0
-    for it in raw_items:
-        qty = _to_float(getattr(it, "quantity", 0.0))
-        price = _to_float(getattr(it, "current_price", 0.0))
 
-        if price > 0 and qty > 0:
-            it.value = round(price * qty, 2)
+    for it in items:
+        v = max(to_float(getattr(it, "value", 0.0) or getattr(it, "current_value", 0.0)), 0.0)
+
+        # fallback if value wasn’t present for some reason
+        if v <= 0:
+            v = max(to_float(getattr(it, "current_price", 0.0)) * to_float(getattr(it, "quantity", 0.0)), 0.0)
+        v = round(v, 2)
+        it.value = v
+        it.current_value = v
+
+        market_value += v
+        valued.append((v, it))
+
+    # derived fields (weight + P/L) using cached values
+    for v, it in valued:
+        if include_weights and market_value > 0 and v > 0:
+            it.weight = round(v / market_value * 100.0, 2)
         else:
-            # fallback to whatever is already there, but never let it be negative
-            it.value = max(_to_float(getattr(it, "value", 0.0)), 0.0)
+            it.weight = None
 
-        market_value += it.value
+        _compute_pl_fields(it)
 
-    # 4) Recompute P/L + weight for each item using the *fresh* value
-    items: List[HoldingOut] = []
-    for it in raw_items:
-        enriched = _enrich_pl_fields(it)   # uses value + purchase_amount_total / unit price
-        enriched.value = it.value          # keep the same total value
-
-        enriched.current_value = enriched.value
-
-        if market_value > 0 and enriched.value is not None and enriched.value > 0:
-            enriched.weight = round(enriched.value / market_value * 100.0, 2)
-        else:
-            enriched.weight = None
-
-        items.append(enriched)
+    # top items WITHOUT sorting the full list
+    n = max(1, top_n)
+    top_items = [it for _, it in heapq.nlargest(n, valued, key=lambda t: t[0])]
 
     return {
-        "items": items,
-        "as_of": int(time.time()),
+        "items": top_items if top_only else items,
+        "top_items": top_items,
+        "as_of": as_of,
         "price_status": "live",
-        "requested_currency": currency.upper(),
+        "requested_currency": currency_up,
     }
-
-def enrich_holdings(
-    holdings: List[Holding],
-    prices: Dict[str, Dict[str, Any]],
-    currency: str = "USD",
-) -> List[HoldingOut]:
-    enriched: List[HoldingOut] = []
-    for h in holdings:
-        k = _key(h.symbol, h.type)
-        q = prices.get(k) or prices.get(_key(h.symbol, None))  # fallback to symbol-only
-
-        qty = _to_float(h.quantity)
-
-        dto = HoldingOut(
-            id=h.id,
-            user_id=h.user_id,
-            source=h.source,
-            external_id=h.external_id,
-            symbol=h.symbol,
-            name=h.name,
-            type=h.type,
-            quantity=h.quantity,
-            current_price=h.current_price,
-            purchase_price=h.purchase_price,
-            value=h.value,
-            account_name=h.account_name,
-            institution=h.institution,
-            currency=h.currency,
-            purchase_amount_total=getattr(h, "purchase_amount_total", None),
-            purchase_unit_price=getattr(h, "purchase_unit_price", None),
-            unrealized_pl=getattr(h, "unrealized_pl", None),
-            unrealized_pl_pct=getattr(h, "unrealized_pl_pct", None),
-            current_value=getattr(h, "current_value", None),
-        )
-
-        if q and q.get("currentPrice") is not None:
-            live_price = _to_float(q["currentPrice"])
-            dto.current_price = live_price
-            dto.previous_close = (
-                _to_float(q.get("previousClose")) if q.get("previousClose") is not None else None
-            )
-            dto.currency = q.get("currency") or (dto.currency or currency.upper())
-            dto.value = round(live_price * qty, 2)
-            dto.price_status = "live"
-        else:
-            dto.price_status = "unavailable"
-            if dto.current_price is not None:
-                try:
-                    dto.value = round(_to_float(dto.current_price) * qty, 2)
-                except Exception:
-                    pass
-
-        enriched.append(dto)
-
-    return enriched

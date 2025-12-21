@@ -1,220 +1,321 @@
 # services/finnhub_service.py
 from __future__ import annotations
-
-import os
-import time
 import asyncio
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+import os
 from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
+from utils.common_helpers import canonical_key, safe_json
 
 import httpx
 from dotenv import load_dotenv
-
 load_dotenv()
-
 
 class FinnhubServiceError(Exception):
     """Domain-level error for the Finnhub service."""
 
-
-def format_finnhub_symbol(symbol: str, is_crypto: bool = False) -> str:
+def format_finnhub_symbol(symbol: str, typ: str = "") -> str:
     """
-    Finnhub expects crypto as 'EXCHANGE:PAIR', e.g. BINANCE:BTCUSDT.
+    Finnhub quote endpoint expects:
+      - Stocks/ETFs: "AAPL"
+      - Crypto often as "EXCHANGE:PAIR" (e.g., "BINANCE:BTCUSDT")
     """
-    if is_crypto:
-        return f"BINANCE:{symbol.upper()}USDT"
-    return symbol.upper()
+    s = (symbol or "").upper().strip()
+    t = (typ or "").lower().strip()
+    if not s:
+        return s
+    if t == "cryptocurrency":
+        # If the symbol already looks qualified (e.g., "BINANCE:BTCUSDT"), keep it.
+        if ":" in s:
+            return s
+        return f"BINANCE:{s}USDT"
+    return s
 
+@dataclass(frozen=True)
+class Quote:
+    current_price: float
+    currency: str
+    previous_close: Optional[float] = None
+    high: Optional[float] = None
+    low: Optional[float] = None
+    open: Optional[float] = None
+    formatted_symbol: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "currentPrice": self.current_price,
+            "currency": self.currency,
+            "previousClose": self.previous_close,
+            "high": self.high,
+            "low": self.low,
+            "open": self.open,
+            "formattedSymbol": self.formatted_symbol,
+        }
 
 class FinnhubService:
     """
-    A small, framework-agnostic async service to interact with Finnhub and related endpoints.
-    You can reuse this from your routers, background tasks, or other services.
+    Framework-agnostic async service for Finnhub quotes/search/profile.
+
+    Design goals:
+      - Always return quote maps keyed by canonical_key(symbol, type)
+      - Concurrency limiting to reduce 429/rate-limit risk
     """
+
+    BASE_URL = "https://finnhub.io/api/v1"
 
     def __init__(
         self,
         api_key: Optional[str] = None,
         timeout: float = 5.0,
-        fx_ttl_sec: int = 60,   # cache USD->CAD briefly (optional)
+        max_concurrency: int = 8,
     ):
         self.api_key = api_key or os.getenv("FINNHUB_API_KEY")
         if not self.api_key:
             raise FinnhubServiceError("Missing FINNHUB_API_KEY")
 
         self.timeout = timeout
-        self._fx_ttl = fx_ttl_sec
-        self._fx_cache: Optional[Tuple[float, float]] = None  # (rate, expires_at)
+        self.max_concurrency = max(1, int(max_concurrency))
 
     @asynccontextmanager
     async def _client(self, client: Optional[httpx.AsyncClient] = None):
         if client is not None:
             yield client
-        else:
-            async with httpx.AsyncClient(timeout=self.timeout) as c:
-                yield c
+            return
+        async with httpx.AsyncClient(timeout=self.timeout) as c:
+            yield c
 
-    # ---------- FX ----------
-    async def get_usd_to_cad_rate(self, client: Optional[httpx.AsyncClient] = None) -> float:
-        now = time.time()
-        if self._fx_cache and self._fx_cache[1] > now:
-            return self._fx_cache[0]
+    def _auth_params(self, **params: Any) -> Dict[str, Any]:
+        return {**params, "token": self.api_key}
 
-        async with self._client(client) as c:
-            try:
-                r = await c.get("https://api.frankfurter.app/latest?from=USD&to=CAD")
-                data = r.json()
-                rate = data.get("rates", {}).get("CAD")
-                if rate is None:
-                    raise FinnhubServiceError("CAD rate missing from FX response")
-                rate = float(rate)
-                if self._fx_ttl:
-                    self._fx_cache = (rate, now + self._fx_ttl)
-                return rate
-            except Exception as e:
-                # If FX fails, fall back to 1.0 rather than exploding the whole request.
-                # You can choose to re-raise if you want hard failures.
-                print("⚠️ FX fetch failed, defaulting to 1.0:", e)
-                return 1.0
+    # -----------------------
+    # Quote (single)
+    # -----------------------
 
-    # ---------- Single price ----------
     async def get_price(
         self,
         symbol: str,
         typ: str = "stock",
         client: Optional[httpx.AsyncClient] = None,
     ) -> Dict[str, Any]:
-        formatted_symbol = format_finnhub_symbol(symbol, is_crypto=(typ == "cryptocurrency"))
+        """
+        Returns a normalized quote dict for ONE symbol.
+        Raises FinnhubServiceError when price is unavailable or request fails.
+        """
+        sym = (symbol or "").strip()
+        if not sym:
+            raise FinnhubServiceError("Missing symbol")
+
+        formatted_symbol = format_finnhub_symbol(sym, typ)
+
         async with self._client(client) as c:
             r = await c.get(
-                "https://finnhub.io/api/v1/quote",
-                params={"symbol": formatted_symbol, "token": self.api_key},
+                f"{self.BASE_URL}/quote",
+                params=self._auth_params(symbol=formatted_symbol),
             )
-            r.raise_for_status()
-            data = r.json()
+            try:
+                r.raise_for_status()
+            except httpx.HTTPStatusError as e:
+                raise FinnhubServiceError(f"Finnhub quote failed: {e.response.status_code}") from e
+
+            data = safe_json(r) or {}
             current_price = data.get("c")
-            if current_price is None or current_price == 0:
+
+            if current_price in (None, 0):
                 raise FinnhubServiceError("Price not available for this symbol")
 
-            return {
-                "symbol": symbol,
-                "formattedSymbol": formatted_symbol,
-                "currentPrice": current_price,
-                "high": data.get("h"),
-                "low": data.get("l"),
-                "open": data.get("o"),
-                "previousClose": data.get("pc"),
-            }
+            q = Quote(
+                current_price=float(current_price),
+                currency="USD",
+                previous_close=float(data["pc"]) if data.get("pc") not in (None,) else None,
+                high=float(data["h"]) if data.get("h") not in (None,) else None,
+                low=float(data["l"]) if data.get("l") not in (None,) else None,
+                open=float(data["o"]) if data.get("o") not in (None,) else None,
+                formatted_symbol=formatted_symbol,
+            )
+            payload = {"symbol": sym, "formattedSymbol": formatted_symbol, **q.to_dict()}
+            return payload
 
-    # ---------- Batch prices with optional CAD conversion ----------
+    # -----------------------
+    # Quote (batch)
+    # -----------------------
+
     async def get_prices(
         self,
         pairs: Iterable[Tuple[str, str]],  # (symbol, type)
         currency: str = "USD",
         client: Optional[httpx.AsyncClient] = None,
+        *,
+        max_concurrency: Optional[int] = None,
     ) -> Dict[str, Optional[Dict[str, Any]]]:
-        clean: List[Tuple[str, str]] = [(s.strip(), t) for s, t in pairs if s and s.strip()]
+        """
+        Batch quote fetch.
+        Returns:
+          {
+            "AAPL:equity": {"currentPrice":..., "currency":"USD", ...} | None,
+            "BTC:cryptocurrency": {...} | None
+          }
+        """
+        cur = (currency or "USD").upper()
+
+        clean: List[Tuple[str, str]] = []
+        for s, t in pairs:
+            sym = (s or "").strip()
+            if not sym:
+                continue
+            clean.append((sym, (t or "").strip()))
+
         if not clean:
             return {}
 
-        formatted_symbols = [format_finnhub_symbol(s, t == "cryptocurrency") for s, t in clean]
+        keys = [canonical_key(sym, typ) for sym, typ in clean]
+        formatted = [format_finnhub_symbol(sym, typ) for sym, typ in clean]
 
-        async with self._client(client) as c:
-            usd_to_cad = await self.get_usd_to_cad_rate(c) if currency.upper() == "CAD" else 1.0
-            tasks = [
-                c.get("https://finnhub.io/api/v1/quote", params={"symbol": fs, "token": self.api_key})
-                for fs in formatted_symbols
-            ]
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
+        sem = asyncio.Semaphore(max(1, int(max_concurrency or self.max_concurrency)))
 
-        result: Dict[str, Optional[Dict[str, Any]]] = {}
-        for (original_symbol, _), formatted_symbol, res in zip(clean, formatted_symbols, responses):
-            try:
-                if isinstance(res, Exception):
-                    raise res
+        async def fetch_one(c: httpx.AsyncClient, fs: str) -> Optional[Quote]:
+            async with sem:
+                r = await c.get(f"{self.BASE_URL}/quote", params=self._auth_params(symbol=fs))
+                r.raise_for_status()
+                data = safe_json(r)
+                if not data:
+                    return None
 
-                assert isinstance(res, httpx.Response)
-                data = res.json()
-                usd_price = data.get("c"); pc = data.get("pc"); h = data.get("h"); l = data.get("l")
-                if usd_price and usd_price != 0:
-                    if currency.upper() == "CAD":
-                        result[original_symbol] = {
-                            "currentPrice": round(usd_price * usd_to_cad, 2),
-                            "currency": "CAD",
-                            "previousClose": round((pc or 0) * usd_to_cad, 2),
-                            "high": round((h or 0) * usd_to_cad, 2),
-                            "low": round((l or 0) * usd_to_cad, 2),
-                            "formattedSymbol": formatted_symbol,
-                        }
-                    else:
-                        # keep USD values as-is (matching your current behavior)
-                        result[original_symbol] = {
-                            "currentPrice": usd_price,
-                            "currency": "USD",
-                            "previousClose": pc,
-                            "high": h,
-                            "low": l,
-                            "formattedSymbol": formatted_symbol,
-                        }
-                else:
-                    result[original_symbol] = None
-            except Exception:
-                result[original_symbol] = None
+                cpx = data.get("c")
+                if cpx in (None, 0):
+                    return None
 
-        return result
-
-    # ---------- Utility wrappers ----------
-    async def search_symbols(self, query: str, client: Optional[httpx.AsyncClient] = None) -> List[Dict[str, Any]]:
-        if not query:
-            return []
-        async with self._client(client) as c:
-            try:
-                r = await c.get(
-                    "https://finnhub.io/api/v1/search",
-                    params={"q": query, "token": self.api_key},
+                # Finnhub quote endpoint is effectively USD for US stocks; crypto is in USDT.
+                # We report USD (or USDT-like) as "USD" to match your current pipeline expectations.
+                # If you want strictness later, return "USDT" for crypto and convert elsewhere.
+                return Quote(
+                    current_price=float(cpx),
+                    currency="USD",
+                    previous_close=float(data["pc"]) if data.get("pc") not in (None,) else None,
+                    high=float(data["h"]) if data.get("h") not in (None,) else None,
+                    low=float(data["l"]) if data.get("l") not in (None,) else None,
+                    open=float(data["o"]) if data.get("o") not in (None,) else None,
+                    formatted_symbol=fs,
                 )
-                if r.status_code >= 400:
+
+        async with self._client(client) as c:
+            tasks = [fetch_one(c, fs) for fs in formatted]
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        out: Dict[str, Optional[Dict[str, Any]]] = {}
+        for k, fs, res in zip(keys, formatted, results):
+            if isinstance(res, Exception):
+                out[k] = None
+                continue
+            if res is None or not isinstance(res, Quote):
+                out[k] = None
+                continue
+
+            d = res.to_dict()
+            # If the caller requested a currency other than USD, conversion belongs elsewhere.
+            # We still echo requested currency via the caller layer if needed.
+            d["currency"] = "USD"  # keep stable for now
+            d["formattedSymbol"] = fs
+            out[k] = d
+
+        # If you want to enforce only USD requests here (recommended), you can:
+        # if cur != "USD": raise FinnhubServiceError("Currency conversion must be done outside FinnhubService")
+
+        return out
+
+    async def search_symbols(
+        self,
+        query: str,
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> List[Dict[str, Any]]:
+        q = (query or "").strip()
+        if not q:
+            return []
+
+        async with self._client(client) as c:
+            try:
+                r = await c.get(f"{self.BASE_URL}/search", params=self._auth_params(q=q))
+                r.raise_for_status()
+                data = safe_json(r) or {}
+                results = data.get("result", [])
+                if not isinstance(results, list):
                     return []
-                try:
-                    data = r.json()
-                except ValueError:
-                    return []
-                return [item for item in data.get("result", []) if item.get("symbol") and item.get("description")]
+                return [
+                    item
+                    for item in results
+                    if isinstance(item, dict) and item.get("symbol") and item.get("description")
+                ]
             except Exception:
                 return []
 
-    async def fetch_quote(self, symbol: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
+    async def fetch_quote(
+        self,
+        symbol: str,
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> Dict[str, Any]:
+        sym = (symbol or "").strip()
+        if not sym:
+            return {}
         async with self._client(client) as c:
-            r = await c.get("https://finnhub.io/api/v1/quote", params={"symbol": symbol, "token": self.api_key})
-            return r.json()
+            try:
+                r = await c.get(f"{self.BASE_URL}/quote", params=self._auth_params(symbol=sym))
+                r.raise_for_status()
+                return safe_json(r) or {}
+            except Exception:
+                return {}
 
-    async def fetch_profile(self, symbol: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
+    async def fetch_profile(
+        self,
+        symbol: str,
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> Dict[str, Any]:
+        sym = (symbol or "").strip()
+        if not sym:
+            return {}
         async with self._client(client) as c:
-            r = await c.get("https://finnhub.io/api/v1/stock/profile2", params={"symbol": symbol, "token": self.api_key})
-            return r.json()
+            try:
+                r = await c.get(f"{self.BASE_URL}/stock/profile2", params=self._auth_params(symbol=sym))
+                r.raise_for_status()
+                return safe_json(r) or {}
+            except Exception:
+                return {}
 
     async def fetch_prices_for_symbols(
-        self, symbols: List[str], client: Optional[httpx.AsyncClient] = None
+        self,
+        symbols: List[str],
+        client: Optional[httpx.AsyncClient] = None,
+        *,
+        max_concurrency: Optional[int] = None,
     ) -> Dict[str, float]:
+        """
+        Convenience: returns {"AAPL": 123.45, "MSFT": 0.0}
+        Keeps legacy behavior but uses the same concurrency + error handling style.
+        """
         if not symbols:
             return {}
 
+        clean = [(s or "").strip() for s in symbols if (s or "").strip()]
+        if not clean:
+            return {}
+
+        sem = asyncio.Semaphore(max(1, int(max_concurrency or self.max_concurrency)))
+
+        async def fetch_one(c: httpx.AsyncClient, sym: str) -> float:
+            async with sem:
+                r = await c.get(f"{self.BASE_URL}/quote", params=self._auth_params(symbol=sym))
+                r.raise_for_status()
+                data = safe_json(r) or {}
+                return float(data.get("c") or 0.0)
+
         async with self._client(client) as c:
-            tasks = [
-                c.get("https://finnhub.io/api/v1/quote", params={"symbol": s, "token": self.api_key})
-                for s in symbols
-            ]
-            responses = await asyncio.gather(*tasks, return_exceptions=True)
+            results = await asyncio.gather(
+                *[fetch_one(c, s) for s in clean],
+                return_exceptions=True,
+            )
 
-        prices: Dict[str, float] = {}
-        for symbol, res in zip(symbols, responses):
-            try:
-                if isinstance(res, Exception):
-                    raise res
-
-                assert isinstance(res, httpx.Response)
-                data = res.json()
-                prices[symbol] = float(data.get("c") or 0.0)
-            except Exception:
-                prices[symbol] = 0.0
-        return prices
+        out: Dict[str, float] = {}
+        for sym, res in zip(clean, results):
+            if isinstance(res, (Exception, BaseException)):
+                out[sym] = 0.0
+            else:
+                out[sym] = float(res)
+        return out

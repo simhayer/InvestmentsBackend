@@ -1,4 +1,5 @@
 # models/user.py
+from sqlalchemy import String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 from database import Base
 
@@ -18,3 +19,13 @@ class User(Base):
     holdings = relationship("Holding", back_populates="owner")
 
     currency: Mapped[str] = mapped_column(default="USD")
+
+    # how this currency was chosen
+    # "default" = system default
+    # "auto"    = inferred from holdings
+    # "manual"  = user explicitly chose
+    base_currency_source: Mapped[str] = mapped_column(
+        String(16),
+        default="default",
+        nullable=False,
+    )
