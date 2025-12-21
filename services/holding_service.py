@@ -7,6 +7,7 @@ from models.holding import Holding, HoldingOut
 from services.finnhub_service import FinnhubService
 from utils.common_helpers import to_float
 from utils.common_helpers import canonical_key
+from services.currency_service import get_usd_to_cad_rate
 
 def _compute_pl_fields(h: HoldingOut) -> None:
     qty = to_float(getattr(h, "quantity", 0.0))
@@ -128,7 +129,7 @@ async def get_holdings_with_live_prices(
             "top_items": [],
             "as_of": as_of,
             "price_status": "live",
-            "requested_currency": currency_up,
+            "currency": currency_up,
         }
 
     # request pairs
@@ -140,6 +141,27 @@ async def get_holdings_with_live_prices(
 
     quotes_raw = await finnhub.get_prices(pairs=pairs, currency=currency_up)
     quotes = quotes_raw or {}
+    if currency_up == "CAD":
+        usd_to_cad = await get_usd_to_cad_rate()
+
+        for k, q in quotes.items():
+            if not q:
+                continue
+
+            def conv(x):
+                if x is None:
+                    return None
+                try:
+                    return round(float(x) * usd_to_cad, 2)
+                except Exception:
+                    return None
+
+            q["currentPrice"] = conv(q.get("currentPrice"))
+            q["previousClose"] = conv(q.get("previousClose"))
+            q["high"] = conv(q.get("high"))
+            q["low"] = conv(q.get("low"))
+            q["open"] = conv(q.get("open"))
+            q["currency"] = "CAD"
     items = enrich_holdings(rows, quotes, currency_up)
 
     # compute position values ONCE and reuse everywhere
@@ -177,5 +199,5 @@ async def get_holdings_with_live_prices(
         "top_items": top_items,
         "as_of": as_of,
         "price_status": "live",
-        "requested_currency": currency_up,
+        "currency": currency_up,
     }

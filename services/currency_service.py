@@ -1,4 +1,4 @@
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any
 from sqlalchemy.orm import Session
 from models.user import User
 import time
@@ -60,26 +60,76 @@ def maybe_auto_set_user_base_currency(
     db.commit()
     db.refresh(user)
 
-# ---------- FX ----------
-async def get_usd_to_cad_rate(self, client: Optional[httpx.AsyncClient] = None) -> float:
-    now = time.time()
-    if self._fx_cache and self._fx_cache[1] > now:
-        return self._fx_cache[0]
+# # ---------- FX ----------
+# --- Module-level TTL cache ---
+_FX_TTL_SEC = 60
+_fx_cache: Optional[tuple[float, float]] = None  # (rate, expires_at)
+async def get_usd_to_cad_rate() -> float:
+    """
+    Fetch USD->CAD FX rate with a small in-memory TTL cache.
+    Owns its own httpx client (no external client dependency).
+    Falls back to 1.0 on any failure.
+    """
+    global _fx_cache
 
-    async with self._client(client) as c:
-        try:
+    now = time.time()
+    if _fx_cache and _fx_cache[1] > now:
+        return _fx_cache[0]
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as c:
             r = await c.get("https://api.frankfurter.app/latest?from=USD&to=CAD")
+            r.raise_for_status()
             data = r.json()
-            rate = data.get("rates", {}).get("CAD")
-            if rate is None:
-                print("⚠️ FX fetch failed, defaulting to 1.0: rate missing")
-                return 1.0
-            rate = float(rate)
-            if self._fx_ttl:
-                self._fx_cache = (rate, now + self._fx_ttl)
-            return rate
-        except Exception as e:
-            # If FX fails, fall back to 1.0 rather than exploding the whole request.
-            # You can choose to re-raise if you want hard failures.
-            print("⚠️ FX fetch failed, defaulting to 1.0:", e)
+    except Exception as e:
+        print("⚠️ FX fetch failed, defaulting to 1.0:", e)
+        return 1.0
+    try:
+        rate = data.get("rates", {}).get("CAD")
+        if rate is None:
+            print("⚠️ FX fetch failed, defaulting to 1.0: rate missing")
             return 1.0
+
+        rate_f = float(rate)
+        if rate_f <= 0:
+            print("⚠️ FX fetch failed, defaulting to 1.0: invalid rate")
+            return 1.0
+
+        _fx_cache = (rate_f, now + _FX_TTL_SEC)
+        return rate_f
+    except Exception as e:
+        print("⚠️ FX parse failed, defaulting to 1.0:", e)
+        return 1.0
+# async def get_usd_to_cad_rate(self, client: Optional[httpx.AsyncClient] = None) -> float:
+#     now = time.time()
+#     if self._fx_cache and self._fx_cache[1] > now:
+#         return self._fx_cache[0]
+
+#     async with self._client(client) as c:
+#         try:
+#             r = await c.get("https://api.frankfurter.app/latest?from=USD&to=CAD")
+#             data = r.json()
+#             rate = data.get("rates", {}).get("CAD")
+#             if rate is None:
+#                 print("⚠️ FX fetch failed, defaulting to 1.0: rate missing")
+#                 return 1.0
+#             rate = float(rate)
+#             if self._fx_ttl:
+#                 self._fx_cache = (rate, now + self._fx_ttl)
+#             return rate
+#         except Exception as e:
+#             # If FX fails, fall back to 1.0 rather than exploding the whole request.
+#             # You can choose to re-raise if you want hard failures.
+#             print("⚠️ FX fetch failed, defaulting to 1.0:", e)
+#             return 1.0
+        
+
+def resolve_currency(user: User, currency_query: str | None) -> str:
+    if currency_query and currency_query.strip():
+        return currency_query.strip().upper()
+
+    base = getattr(user, "currency", None)
+    if base and str(base).strip():
+        return str(base).strip().upper()
+
+    return "USD"

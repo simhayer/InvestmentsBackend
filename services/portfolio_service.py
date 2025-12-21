@@ -116,7 +116,7 @@ async def get_portfolio_summary(
 
     return {
         "as_of": enriched.get("as_of", int(time.time())),
-        "requested_currency": currency.upper(),
+        "currency": currency.upper(),
         "price_status": price_status,
         "positions_count": len(items),
         "market_value": round(market_value, 2),
@@ -139,7 +139,7 @@ def get_or_compute_portfolio_analysis(
     user_id: str,
     db: Session,
     *,
-    base_currency: str = "CAD",
+    base_currency: str = "USD",
     days_of_news: int = 7,
     targets: dict[str, int] | None = None,
     force: bool = False,
