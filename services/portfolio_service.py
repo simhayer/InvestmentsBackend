@@ -21,8 +21,8 @@ Number = float | int | Decimal
 def _normalize_alloc(d: Dict[str, float], total: float) -> List[Dict[str, Any]]:
     items = sorted(d.items(), key=lambda kv: -kv[1])
     if total <= 0:
-        return [{"key": k, "value": round(v, 2), "weight": None} for k, v in items]
-    return [{"key": k, "value": round(v, 2), "weight": round(v / total * 100.0, 2)} for k, v in items]
+        return [{"key": k, "value": round(v,8), "weight": None} for k, v in items]
+    return [{"key": k, "value": round(v, 8), "weight": round(v / total * 100.0, 8)} for k, v in items]
 
 async def get_portfolio_summary(
     user_id: str,
@@ -119,12 +119,12 @@ async def get_portfolio_summary(
         "currency": currency.upper(),
         "price_status": price_status,
         "positions_count": len(items),
-        "market_value": round(market_value, 2),
-        "cost_basis": round(cost_basis, 2),
-        "unrealized_pl": None if cost_basis <= 0 else round(unrealized_pl, 2),
-        "unrealized_pl_pct": None if unrealized_pl_pct is None else round(unrealized_pl_pct, 2),
-        "day_pl": None if prev_close_total <= 0 else round(day_pl, 2),
-        "day_pl_pct": None if day_pl_pct is None else round(day_pl_pct, 2),
+        "market_value": round(market_value, 8),
+        "cost_basis": round(cost_basis, 8),
+        "unrealized_pl": None if cost_basis <= 0 else round(unrealized_pl, 8),
+        "unrealized_pl_pct": None if unrealized_pl_pct is None else round(unrealized_pl_pct, 8),
+        "day_pl": None if prev_close_total <= 0 else round(day_pl, 8),
+        "day_pl_pct": None if day_pl_pct is None else round(day_pl_pct, 8),
         "allocations": {
             "by_type": _normalize_alloc(alloc_by_type, market_value),
             "by_account": _normalize_alloc(alloc_by_account, market_value),

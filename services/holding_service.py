@@ -27,19 +27,19 @@ def _compute_pl_fields(h: HoldingOut) -> None:
 
     # Day P/L
     if curr_f is not None and pc_f is not None and pc_f > 0 and qty > 0:
-        h.day_pl = round((curr_f - pc_f) * qty, 2)
+        h.day_pl = round((curr_f - pc_f) * qty, 8)
     else:
         h.day_pl = None
 
     # Unrealized P/L
     if total_cost_f is not None and total_cost_f > 0 and value_f is not None:
         pl = value_f - total_cost_f
-        h.unrealized_pl = round(pl, 2)
-        h.unrealized_pl_pct = round((value_f / total_cost_f - 1.0) * 100.0, 2)
+        h.unrealized_pl = round(pl, 8)
+        h.unrealized_pl_pct = round((value_f / total_cost_f - 1.0) * 100.0, 8)
     elif curr_f is not None and unit_cost_f is not None and unit_cost_f > 0 and qty > 0:
         pl = (curr_f - unit_cost_f) * qty
-        h.unrealized_pl = round(pl, 2)
-        h.unrealized_pl_pct = round((curr_f / unit_cost_f - 1.0) * 100.0, 2)
+        h.unrealized_pl = round(pl, 8)
+        h.unrealized_pl_pct = round((curr_f / unit_cost_f - 1.0) * 100.0, 8)
     else:
         h.unrealized_pl = None
         h.unrealized_pl_pct = None
@@ -103,7 +103,7 @@ def enrich_holdings(
 
         # set value consistently for everyone (live OR stored price)
         price = to_float(dto.current_price)
-        dto.value = round(price * qty, 2) if price > 0 and qty > 0 else max(to_float(dto.value), 0.0)
+        dto.value = round(price * qty, 8) if price > 0 and qty > 0 else max(to_float(dto.value), 0.0)
 
         enriched.append(dto)
 
@@ -152,7 +152,7 @@ async def get_holdings_with_live_prices(
                 if x is None:
                     return None
                 try:
-                    return round(float(x) * usd_to_cad, 2)
+                    return round(float(x) * usd_to_cad, 8)
                 except Exception:
                     return None
 
@@ -174,7 +174,7 @@ async def get_holdings_with_live_prices(
         # fallback if value wasn’t present for some reason
         if v <= 0:
             v = max(to_float(getattr(it, "current_price", 0.0)) * to_float(getattr(it, "quantity", 0.0)), 0.0)
-        v = round(v, 2)
+        v = round(v, 8)
         it.value = v
         it.current_value = v
 
@@ -184,7 +184,7 @@ async def get_holdings_with_live_prices(
     # derived fields (weight + P/L) using cached values
     for v, it in valued:
         if include_weights and market_value > 0 and v > 0:
-            it.weight = round(v / market_value * 100.0, 2)
+            it.weight = round(v / market_value * 100.0, 8)
         else:
             it.weight = None
 
