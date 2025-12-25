@@ -272,18 +272,18 @@ def build_metrics_from_plaid(
             "sector": p.sector or "",
             "region": p.region or "",
             "weight_pct": 0.0,  # fill later after total_value known
-            "market_value": round(mv, 2),
-            "cost_basis": round(cb, 2) if cb is not None else 0.0,
-            "unrealized_pnl_abs": round(unreal_abs, 2) if unreal_abs is not None else None,
-            "unrealized_pnl_pct": round(unreal_pct, 2) if unreal_pct is not None else None,
-            "return_1D_pct": None if r_1d is None else round(r_1d, 2),
-            "return_1W_pct": None if r_1w is None else round(r_1w, 2),
-            "return_1M_pct": None if r_1m is None else round(r_1m, 2),
-            "return_3M_pct": None if r_3m is None else round(r_3m, 2),
-            "return_1Y_pct": None if r_1y is None else round(r_1y, 2),
-            "vol_30D_pct": None if vol30 is None else round(vol30, 2),
-            "max_drawdown_1Y_pct": None if mdd1y is None else round(mdd1y, 2),
-            "beta_1Y": None if beta1y is None else round(beta1y, 2),
+            "market_value": round(mv, 8),
+            "cost_basis": round(cb, 8) if cb is not None else 0.0,
+            "unrealized_pnl_abs": round(unreal_abs, 8) if unreal_abs is not None else None,
+            "unrealized_pnl_pct": round(unreal_pct, 8) if unreal_pct is not None else None,
+            "return_1D_pct": None if r_1d is None else round(r_1d, 8),
+            "return_1W_pct": None if r_1w is None else round(r_1w, 8),
+            "return_1M_pct": None if r_1m is None else round(r_1m, 8),
+            "return_3M_pct": None if r_3m is None else round(r_3m, 8),
+            "return_1Y_pct": None if r_1y is None else round(r_1y, 8),
+            "vol_30D_pct": None if vol30 is None else round(vol30, 8),
+            "max_drawdown_1Y_pct": None if mdd1y is None else round(mdd1y, 8),
+            "beta_1Y": None if beta1y is None else round(beta1y, 8),
             "is_leveraged": bool("lever" in (p.name or "").lower() or p.symbol.endswith(("UP", "DOWN", "BULL", "BEAR"))),
             # You could refine leveraged detection by parsing t.info if needed.
         }
@@ -299,7 +299,7 @@ def build_metrics_from_plaid(
 
     # ---------- Concentration (top 5) ----------
     weights_sorted = sorted([s["weight_pct"] for s in per_symbol.values()], reverse=True)
-    concentration_top_5_pct = round(sum(weights_sorted[:5]), 2) if weights_sorted else 0.0
+    concentration_top_5_pct = round(sum(weights_sorted[:5]), 8) if weights_sorted else 0.0
 
     # ---------- Aggregations ----------
     sector_weights: Dict[str, float] = {}
@@ -321,14 +321,14 @@ def build_metrics_from_plaid(
     port_vol_30d = None
     if vols and sum(weights) > 0:
         # Weighted average of non-annualized vols (proxy)
-        port_vol_30d = round(sum(v * w for v, w in zip(vols, weights)) / sum(weights), 2)
+        port_vol_30d = round(sum(v * w for v, w in zip(vols, weights)) / sum(weights), 8)
 
     # Approx portfolio max drawdown as weighted avg of components' mdd (very rough)
     mdds = [s["max_drawdown_1Y_pct"] for s in per_symbol.values() if s["max_drawdown_1Y_pct"] is not None]
     weights_mdd = [s["weight_pct"] for s in per_symbol.values() if s["max_drawdown_1Y_pct"] is not None]
     port_mdd_1y = None
     if mdds and sum(weights_mdd) > 0:
-        port_mdd_1y = round(sum(dd * w for dd, w in zip(mdds, weights_mdd)) / sum(weights_mdd), 2)
+        port_mdd_1y = round(sum(dd * w for dd, w in zip(mdds, weights_mdd)) / sum(weights_mdd), 8)
 
     # ---------- Core/Spec/Hedge from classification_map ----------
     core_w = spec_w = hedge_w = 0.0
@@ -341,9 +341,9 @@ def build_metrics_from_plaid(
                 spec_w += s["weight_pct"]
             elif cat == "hedge":
                 hedge_w += s["weight_pct"]
-        core_w = round(core_w, 2)
-        spec_w = round(spec_w, 2)
-        hedge_w = round(hedge_w, 2)
+        core_w = round(core_w, 8)
+        spec_w = round(spec_w, 8)
+        hedge_w = round(hedge_w, 8)
 
     portfolio = {
         "total_value": round(total_value, 2),
@@ -353,9 +353,9 @@ def build_metrics_from_plaid(
         "core_weight_pct": core_w,
         "speculative_weight_pct": spec_w,
         "hedge_weight_pct": hedge_w,
-        "sector_weights_pct": {k: round(v, 2) for k, v in sector_weights.items()},
-        "asset_class_weights_pct": {k: round(v, 2) for k, v in asset_class_weights.items()},
-        "region_weights_pct": {k: round(v, 2) for k, v in region_weights.items()},
+        "sector_weights_pct": {k: round(v, 8) for k, v in sector_weights.items()},
+        "asset_class_weights_pct": {k: round(v, 8) for k, v in asset_class_weights.items()},
+        "region_weights_pct": {k: round(v, 8) for k, v in region_weights.items()},
         "vol_30D_pct": port_vol_30d,
         "max_drawdown_1Y_pct": port_mdd_1y,
     }
