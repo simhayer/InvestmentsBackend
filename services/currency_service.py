@@ -100,30 +100,7 @@ async def get_usd_to_cad_rate() -> float:
     except Exception as e:
         print("⚠️ FX parse failed, defaulting to 1.0:", e)
         return 1.0
-# async def get_usd_to_cad_rate(self, client: Optional[httpx.AsyncClient] = None) -> float:
-#     now = time.time()
-#     if self._fx_cache and self._fx_cache[1] > now:
-#         return self._fx_cache[0]
-
-#     async with self._client(client) as c:
-#         try:
-#             r = await c.get("https://api.frankfurter.app/latest?from=USD&to=CAD")
-#             data = r.json()
-#             rate = data.get("rates", {}).get("CAD")
-#             if rate is None:
-#                 print("⚠️ FX fetch failed, defaulting to 1.0: rate missing")
-#                 return 1.0
-#             rate = float(rate)
-#             if self._fx_ttl:
-#                 self._fx_cache = (rate, now + self._fx_ttl)
-#             return rate
-#         except Exception as e:
-#             # If FX fails, fall back to 1.0 rather than exploding the whole request.
-#             # You can choose to re-raise if you want hard failures.
-#             print("⚠️ FX fetch failed, defaulting to 1.0:", e)
-#             return 1.0
-        
-
+    
 def resolve_currency(user: User, currency_query: str | None) -> str:
     if currency_query and currency_query.strip():
         return currency_query.strip().upper()
@@ -133,3 +110,22 @@ def resolve_currency(user: User, currency_query: str | None) -> str:
         return str(base).strip().upper()
 
     return "USD"
+
+async def fx_pair_rate(from_cur: str, to_cur: str) -> float:
+    """
+    USD/CAD only:
+      - USD->CAD = usd_to_cad
+      - CAD->USD = 1/usd_to_cad
+      - same currency = 1
+    """
+    a = (from_cur or "").upper()
+    b = (to_cur or "").upper()
+    if a == b:
+        return 1.0
+    if a == "USD" and b == "CAD":
+        return float(await get_usd_to_cad_rate())
+    if a == "CAD" and b == "USD":
+        rate = await get_usd_to_cad_rate()
+        return float(1.0 / rate) if rate else 1.0
+    # if something unexpected shows up, don’t break math
+    return 1.0

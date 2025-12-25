@@ -135,7 +135,7 @@ async def get_portfolio_summary(
 
 TTL_HOURS = 24
 
-def get_or_compute_portfolio_analysis(
+async def get_or_compute_portfolio_analysis(
     user_id: str,
     db: Session,
     *,
@@ -143,11 +143,8 @@ def get_or_compute_portfolio_analysis(
     days_of_news: int = 7,
     targets: dict[str, int] | None = None,
     force: bool = False,
+    finnhub: FinnhubService,
 ):
-    """
-    Cached AI analysis (separate from live portfolio pricing).
-    Keeps DB access sync and uses an upsert to store one row per user.
-    """
     now = datetime.now(timezone.utc)
 
     row = db.query(PortfolioAnalysis).filter(PortfolioAnalysis.user_id == user_id).first()
@@ -162,12 +159,26 @@ def get_or_compute_portfolio_analysis(
             }
             return row.data, meta
 
-    # Compute fresh
-    holdings = get_all_holdings(user_id, db)
-    if not holdings:
+    holdings_payload = await get_holdings_with_live_prices(
+        user_id,
+        db,
+        currency=base_currency,
+        top_only=False,
+        top_n=0,
+        include_weights=False,
+        finnhub=finnhub,
+    )
+
+    items = (holdings_payload or {}).get("items") or []
+    if not items:
         return None, {"reason": "no_holdings"}
 
-    ai_layers = run_portfolio_pipeline()
+    ai_layers = await run_portfolio_pipeline(
+        holdings_items=items,
+        base_currency=base_currency,
+        benchmark_ticker="SPY",
+        days_of_news=days_of_news,
+    )
 
     data = {
         "version": "v1",
@@ -180,10 +191,7 @@ def get_or_compute_portfolio_analysis(
         "ai_layers": ai_layers,
     }
 
-    stmt = insert(PortfolioAnalysis).values(
-        user_id=user_id,
-        data=data,
-    )
+    stmt = insert(PortfolioAnalysis).values(user_id=user_id, data=data)
     upsert = stmt.on_conflict_do_update(
         index_elements=["user_id"],
         set_={"data": stmt.excluded.data, "created_at": func.now()},
@@ -191,5 +199,9 @@ def get_or_compute_portfolio_analysis(
     db.execute(upsert)
     db.commit()
 
-    meta = {"cached": False, "cached_at": now.isoformat(), "ttl_seconds_remaining": TTL_HOURS * 3600}
+    meta = {
+        "cached": False,
+        "cached_at": now.isoformat(),
+        "ttl_seconds_remaining": TTL_HOURS * 3600,
+    }
     return data, meta
