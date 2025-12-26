@@ -5,7 +5,6 @@ import os
 import asyncio
 import datetime as dt
 from typing import List, Dict, Optional, TypedDict, Any
-
 import finnhub  # pip install finnhub-python
 
 

@@ -6,12 +6,10 @@ from services.finnhub_service import FinnhubService
 from services.portfolio_service import get_portfolio_summary
 from services.supabase_auth import get_current_db_user
 from services.currency_service import resolve_currency
-
 router = APIRouter()
 
 def get_finnhub_service() -> FinnhubService:
     return FinnhubService()
-
 
 @router.get("/summary")
 async def portfolio_summary(

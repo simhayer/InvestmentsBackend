@@ -9,6 +9,26 @@ from utils.common_helpers import to_float
 from utils.common_helpers import canonical_key
 from services.currency_service import get_usd_to_cad_rate
 
+def create_holding(
+    db: Session,
+    user_id: int,
+    symbol: str,
+    quantity: float,
+    purchase_price: float,
+    type_: str
+) -> Holding:
+    holding = Holding(
+        symbol=symbol,
+        quantity=quantity,
+        purchase_price=purchase_price,
+        type=type_,
+        user_id=user_id,
+    )
+    db.add(holding)
+    db.commit()
+    db.refresh(holding)
+    return holding
+
 def _compute_pl_fields(h: HoldingOut) -> None:
     qty = to_float(getattr(h, "quantity", 0.0))
 
@@ -47,10 +67,6 @@ def _compute_pl_fields(h: HoldingOut) -> None:
 def get_all_holdings(user_id: str, db: Session) -> List[Holding]:
     return db.query(Holding).filter_by(user_id=user_id).all()
 
-# -----------------------
-# Mapping + enrichment
-# -----------------------
-
 def _base_dto_from_row(h: Holding, currency_default: str) -> HoldingOut:
     return HoldingOut(
         id=h.id,
@@ -73,7 +89,6 @@ def _base_dto_from_row(h: Holding, currency_default: str) -> HoldingOut:
         unrealized_pl_pct=getattr(h, "unrealized_pl_pct", None),
         current_value=getattr(h, "current_value", None),
     )
-
 
 def enrich_holdings(
     holdings: List[Holding],

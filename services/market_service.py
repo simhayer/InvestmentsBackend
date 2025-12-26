@@ -7,19 +7,17 @@ import math
 import hashlib
 from typing import Any, Dict, List, Tuple, cast
 from datetime import datetime, timezone, timedelta
-
 import redis
 from sqlalchemy.orm import Session
-
-from services.helpers.linkup.linkup_summary import get_linkup_market_summary
+from services.linkup.agents.market_summary_agent import get_linkup_market_summary
 from models.market_summary import MarketSummary
 from . import yahoo_service as yq
-from services.helpers.db.market_db_service import (
+from services.helpers.market_db_service import (
     db_read_latest,
     db_upsert_latest,
     db_append_history,
 )
-from utils.common_helpers import safe_float
+from utils.common_helpers import safe_float, unwrap_linkup
 
 REDIS_URL = os.getenv("REDIS_URL")
 r = redis.from_url(REDIS_URL) if REDIS_URL else None
@@ -288,7 +286,7 @@ def get_market_summary_cached(db: Session) -> Tuple[Json, datetime]:
     if latest and (datetime.now(timezone.utc) - cast(datetime, latest.created_at)) < timedelta(seconds=TTL_SEC):
         return latest.payload, cast(datetime, latest.created_at)
 
-    fresh = get_linkup_market_summary()
+    fresh = unwrap_linkup(get_linkup_market_summary())
     rec = MarketSummary(
         as_of=datetime.fromisoformat(fresh["as_of"]),
         market=fresh["market"],

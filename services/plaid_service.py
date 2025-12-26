@@ -6,7 +6,6 @@ from plaid.model.investments_holdings_get_request import InvestmentsHoldingsGetR
 from plaid_config import client
 from typing import List, Dict
 
-
 def fetch_plaid_holdings_for_user(user_id: str, db: Session) -> List[Dict]:
     access_tokens = db.query(UserAccess).filter_by(user_id=str(user_id)).all()
     all_holdings = []
@@ -32,8 +31,6 @@ def fetch_plaid_holdings_for_user(user_id: str, db: Session) -> List[Dict]:
             continue
 
     return all_holdings
-
-
 
 def get_connections(userId: str, db: Session) -> List[Dict]:
     institutions = db.query(UserAccess).filter(UserAccess.user_id == str(userId)).all()
