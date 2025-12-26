@@ -13,7 +13,7 @@ from models.portfolio_analysis import PortfolioAnalysis
 from services.finnhub_service import FinnhubService
 from services.holding_service import get_all_holdings, get_holdings_with_live_prices
 from services.plaid_service import get_connections
-from services.helpers.linkup.portfolio_summary_linkup import run_portfolio_pipeline
+from services.helpers.linkup.portfolio_pipeline import run_portfolio_pipeline
 from utils.common_helpers import to_float
 
 Number = float | int | Decimal
