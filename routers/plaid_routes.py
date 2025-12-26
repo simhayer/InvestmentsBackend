@@ -1,8 +1,6 @@
 from datetime import datetime, timezone
 import os
 from fastapi import APIRouter, HTTPException, Body
-from plaid import Configuration, ApiClient, Environment
-from plaid.api import plaid_api
 from plaid.model.link_token_create_request import LinkTokenCreateRequest
 from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
 from plaid.model.products import Products
@@ -21,17 +19,10 @@ from utils.common_helpers import safe_div, num
 from models.user import User
 from services.supabase_auth import get_current_db_user
 from services.currency_service import maybe_auto_set_user_base_currency
-
-# Plaid setup
-configuration = Configuration(
-    host=os.getenv("PLAID_ENV", "sandbox").lower() == "production" and Environment.Production or Environment.Sandbox,
-    api_key={
-        "clientId": os.getenv("PLAID_CLIENT_ID"),
-        "secret": os.getenv("PLAID_SECRET"),
-    },
-)
-client = plaid_api.PlaidApi(ApiClient(configuration))
-
+from plaid_config import client
+import logging
+logger = logging.getLogger(__name__)
+import traceback
 router = APIRouter()
 
 # ----------- LINK TOKEN ----------------
@@ -54,9 +45,6 @@ async def create_link_token(user: User = Depends(get_current_db_user)):
 
 
 # ----------- EXCHANGE TOKEN ----------------
-import logging
-logger = logging.getLogger(__name__)
-import traceback
 
 @router.post("/exchange-token")
 async def exchange_token(

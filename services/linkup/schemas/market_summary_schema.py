@@ -1,11 +1,5 @@
-from datetime import datetime, timedelta, timezone
-import json
-from .linkup_config import client
 
-to_date = datetime.now(timezone.utc)
-from_date = to_date - timedelta(days=7) 
-
-schema = {
+MARKET_SUMMARY_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "properties": {
@@ -55,23 +49,3 @@ schema = {
     },
     "required": ["as_of", "market", "sections"]
 }
-
-def get_linkup_market_summary() -> dict:
-    """Fetches and returns the LinkUp market summary response."""
-    response = client.search(
-    query=(
-        "You are a financial analyst. Summarize today's key US market developments "
-        "in a 'cause → impact' format. For each event, explain what happened, why it happened, "
-        "and how it affected financial markets. Focus on recent data and news from the past week "
-        "(S&P 500, NASDAQ, Dow Jones, yields, CPI, Fed policy, energy, etc.). "
-        "Use reliable sources like Bloomberg, Reuters, and WSJ."
-        ),
-        depth="deep",
-        output_type="structured",
-        structured_output_schema=json.dumps(schema),
-        include_images=False,
-        include_sources=False, 
-        from_date=from_date.date(),
-        to_date=to_date.date()
-    )
-    return response

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Tuple
 
-from services.helpers.linkup.position import Position
+from services.linkup.metrics.position import Position
 from services.yahoo_service import get_full_stock_data_many
 from services.currency_service import get_usd_to_cad_rate, fx_pair_rate
 

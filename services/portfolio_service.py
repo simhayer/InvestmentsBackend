@@ -11,9 +11,9 @@ from sqlalchemy.orm import Session
 from models.holding import HoldingOut
 from models.portfolio_analysis import PortfolioAnalysis
 from services.finnhub_service import FinnhubService
-from services.holding_service import get_all_holdings, get_holdings_with_live_prices
+from services.holding_service import get_holdings_with_live_prices
 from services.plaid_service import get_connections
-from services.helpers.linkup.portfolio_pipeline import run_portfolio_pipeline
+from services.linkup.portfolio_pipeline import run_portfolio_pipeline
 from utils.common_helpers import to_float
 
 Number = float | int | Decimal

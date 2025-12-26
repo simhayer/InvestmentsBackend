@@ -4,7 +4,6 @@ import time
 import httpx
 from jose import jwt, JWTError
 from fastapi import HTTPException, Request, status
-
 from fastapi import Depends, HTTPException
 from sqlalchemy.orm import Session
 from models.user import User
@@ -16,36 +15,11 @@ SUPABASE_JWT_SECRET = os.getenv("SUPABASE_JWT_SECRET")  # <-- add this
 if not SUPABASE_JWT_SECRET:
     raise RuntimeError("SUPABASE_JWT_SECRET is not set in environment variables")
 
-# Simple in-memory JWKS cache
-_JWKS_CACHE = {"keys": None, "ts": 0}
-_JWKS_TTL_SECONDS = 60 * 60  # 1 hour
-
-
 def _get_bearer_token(request: Request) -> str:
     auth = request.headers.get("Authorization")
     if not auth or not auth.lower().startswith("bearer "):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing bearer token")
     return auth.split(" ", 1)[1].strip()
-
-
-async def _get_jwks() -> dict:
-    now = int(time.time())
-    if _JWKS_CACHE["keys"] and (now - _JWKS_CACHE["ts"] < _JWKS_TTL_SECONDS):
-        return _JWKS_CACHE["keys"]
-
-    if not SUPABASE_PROJECT_URL:
-        raise RuntimeError("SUPABASE_PROJECT_URL is not set")
-
-    jwks_url = f"{SUPABASE_PROJECT_URL}/auth/v1/.well-known/jwks.json"
-    async with httpx.AsyncClient(timeout=10) as client:
-        r = await client.get(jwks_url)
-        r.raise_for_status()
-        jwks = r.json()
-
-    _JWKS_CACHE["keys"] = jwks
-    _JWKS_CACHE["ts"] = now
-    return jwks
-
 
 async def get_current_supabase_user(request: Request) -> dict:
     token = _get_bearer_token(request)

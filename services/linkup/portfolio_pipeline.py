@@ -6,14 +6,14 @@
    - scenarios_rebalance_agent
    - summary_agent  (summary)
 """
-
 from __future__ import annotations
+import asyncio
 from typing import Any, Dict, List
-from .news_sentiment_agent import call_link_up_for_news
-from .performance_agent import call_link_up_for_performance
-from .scenarios_rebalance_agent import call_link_up_for_rebalance
-from .summary_agent import call_link_up_for_summary
-from services.helpers.linkup.build_metrics_yahoo import build_metrics, holdings_to_positions
+from .agents.news_sentiment_agent import call_link_up_for_news
+from .agents.performance_predictions_agent import call_link_up_for_performance
+from .agents.scenarios_rebalance_agent import call_link_up_for_rebalance
+from .agents.summary_agent import call_link_up_for_summary
+from services.linkup.metrics.build_metrics_yahoo import build_metrics, holdings_to_positions
 
 def simple_classification_from_metrics(metrics: Dict[str, Any]) -> Dict[str, str]:
     """
@@ -36,7 +36,7 @@ def simple_classification_from_metrics(metrics: Dict[str, Any]) -> Dict[str, str
             classifications[sym] = "hedge"
         elif asset_class == "etf":
             classifications[sym] = "core"
-        elif asset_class == "crypto":
+        elif asset_class in ("crypto", "cryptocurrency"):
             classifications[sym] = "speculative"
         else:
             # crude: high max drawdown -> speculative
@@ -50,42 +50,33 @@ def simple_classification_from_metrics(metrics: Dict[str, Any]) -> Dict[str, str
 # -----------------------------------------------------------
 # 3. Orchestrator
 # -----------------------------------------------------------
+
 async def run_portfolio_pipeline(
     *,
-    holdings_items: List[Any],     # HoldingOut[]
+    holdings_items: List[Any],
     base_currency: str = "USD",
-    benchmark_ticker: str = "SPY", # unused for now (kept for future)
+    benchmark_ticker: str = "SPY",
     days_of_news: int = 7,
 ) -> Dict[str, Any]:
     positions = holdings_to_positions(holdings_items, base_currency=base_currency)
 
-    metrics = await build_metrics(
-        positions=positions,
-        base_currency=base_currency,
-    )
+    metrics = await build_metrics(positions=positions, base_currency=base_currency)
 
     symbols = list(metrics["per_symbol"].keys())
     classification = simple_classification_from_metrics(metrics)
 
-    news_sentiment_json = call_link_up_for_news(
-        base_currency=base_currency,
-        symbols=symbols,
+    # Run the 3 independent agents concurrently (they are sync -> to_thread)
+    news_task = asyncio.to_thread(call_link_up_for_news, base_currency=base_currency, symbols=symbols, days_of_news=days_of_news)
+    perf_task = asyncio.to_thread(call_link_up_for_performance, base_currency=base_currency, symbols=symbols, metrics=metrics, days_of_news=days_of_news)
+    scen_task = asyncio.to_thread(call_link_up_for_rebalance, base_currency=base_currency, symbols=symbols, metrics=metrics, classification=classification, days_of_news=days_of_news)
+
+    news_sentiment_json, performance_json, scenarios_json = await asyncio.gather(
+        news_task, perf_task, scen_task
     )
 
-    performance_json = call_link_up_for_performance(
-        base_currency=base_currency,
-        symbols=symbols,
-        metrics=metrics,
-    )
-
-    scenarios_json = call_link_up_for_rebalance(
-        base_currency=base_currency,
-        symbols=symbols,
-        metrics=metrics,
-        classification=classification,
-    )
-
-    summary_json = call_link_up_for_summary(
+    # Summary after the others complete
+    summary_json = await asyncio.to_thread(
+        call_link_up_for_summary,
         news_sentiment_json=news_sentiment_json,
         performance_predictions_json=performance_json,
         scenarios_rebalance_json=scenarios_json,
@@ -94,7 +85,7 @@ async def run_portfolio_pipeline(
     return {
         "metrics": metrics,
         "classification": classification,
-        "news_sentiment": news_sentiment_json,
+        "news_sentiment": news_sentiment_json, 
         "performance": performance_json,
         "scenarios_rebalance": scenarios_json,
         "summary": summary_json,

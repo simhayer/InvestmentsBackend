@@ -78,3 +78,23 @@ def canonical_key(symbol: Optional[str], typ: Optional[str]) -> str:
     s = (symbol or "").upper().strip()
     t = (typ or "").lower().strip()
     return f"{s}:{t}" if t else s
+
+# def _unwrap_agent(v):
+#     if isinstance(v, dict) and "ok" in v and "data" in v:
+#         return v.get("data")
+#     return v
+
+def unwrap_linkup(result: dict) -> dict:
+    if isinstance(result, dict) and result.get("ok") and isinstance(result.get("data"), dict):
+        return result["data"]
+    raise RuntimeError(result.get("error") or "Linkup call failed")
+
+def unwrap_layers_for_ui(layers: dict) -> dict:
+    if not isinstance(layers, dict):
+        return layers
+
+    out = dict(layers)
+    for k in ("news_sentiment", "performance", "scenarios_rebalance", "summary"):
+        if k in out:
+            out[k] = unwrap_linkup(out[k])
+    return out

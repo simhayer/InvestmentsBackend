@@ -1,9 +1,5 @@
 from __future__ import annotations
-
-import json
-from datetime import datetime, timedelta, timezone
-
-from .linkup_config import client
+from services.linkup.linkup_search import linkup_structured_search
 
 SUMMARY_SCHEMA = {
     "type": "object",
@@ -96,22 +92,13 @@ def build_summary_query(
 def call_link_up_for_summary(news_sentiment_json,
     performance_predictions_json,
     scenarios_rebalance_json):
-    now = datetime.now(timezone.utc)
-    to_date = now
-    from_date = to_date - timedelta(days=7)
-    try:
-        response = client.search(
-            query=json.dumps(build_summary_query(news_sentiment_json, performance_predictions_json, scenarios_rebalance_json)),
-            depth="standard",
-            output_type="structured",
-            structured_output_schema=json.dumps(SUMMARY_SCHEMA),
-            include_images=False,
-            include_sources=False,
-            from_date=from_date.date(),
-            to_date=to_date.date(),
-        )
-
-        return response
-    except Exception as e:
-        # logger.error(f"Error occurred while fetching portfolio AI layers: {e}")
-        return {"error": str(e)}
+    return linkup_structured_search(
+        query_obj=build_summary_query(
+            news_sentiment_json=news_sentiment_json,
+            performance_predictions_json=performance_predictions_json,
+            scenarios_rebalance_json=scenarios_rebalance_json,
+        ),
+        schema=SUMMARY_SCHEMA,
+        days=7,
+        include_sources=False,
+    )

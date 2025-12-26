@@ -3,7 +3,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import List
 from services.supabase_auth import get_current_db_user
-
 from services.finnhub_service import (
     FinnhubService,
     FinnhubServiceError,
@@ -90,18 +89,5 @@ async def fetch_profile(
 ):
     try:
         return await svc.fetch_profile(symbol)
-    except FinnhubServiceError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-
-# Optional helper kept for compatibility with existing callers
-@router.get("/_batch-prices")
-async def fetch_prices_for_symbols(
-    symbols: List[str],
-    user=Depends(get_current_db_user),
-    svc: FinnhubService = Depends(get_finnhub_service),
-):
-    try:
-        return await svc.fetch_prices_for_symbols(symbols)
     except FinnhubServiceError as e:
         raise HTTPException(status_code=400, detail=str(e))

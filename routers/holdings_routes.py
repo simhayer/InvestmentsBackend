@@ -5,12 +5,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 
 import schemas.general as general
-import services.crud as crud
 from database import get_db
 from models.holding import Holding
 from routers.finnhub_routes import get_finnhub_service
 from services.finnhub_service import FinnhubService
-from services.holding_service import get_all_holdings, get_holdings_with_live_prices
+from services.holding_service import get_all_holdings, get_holdings_with_live_prices, create_holding
 from services.supabase_auth import get_current_db_user
 from services.currency_service import resolve_currency
 
@@ -22,7 +21,7 @@ def save_holding(
     db: Session = Depends(get_db),
     user=Depends(get_current_db_user),
 ):
-    return crud.create_holding(
+    return create_holding(
         db,
         user.id,
         holding.symbol,
