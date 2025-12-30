@@ -6,7 +6,23 @@ import hashlib
 import json
 import os
 import time
+from copy import deepcopy
 from typing import Any, Dict, Optional
+
+from agents import (
+    Agent,
+    AgentOutputSchemaBase,
+    ItemHelpers,
+    ModelBehaviorError,
+    ModelSettings,
+    Runner,
+    WebSearchTool,
+)
+from agents.models.default_models import get_default_model_settings
+from jsonschema import ValidationError
+from jsonschema import validate as jsonschema_validate
+from openai.types.responses.web_search_tool import Filters as WebSearchToolFilters
+from services.linkup.metrics.stock_metrics import StockMetricsCalculator
 from services.linkup.schemas.single_stock_analysis_schema import SINGLE_STOCK_ANALYSIS_SCHEMA
 from services.linkup.linkup_search import linkup_structured_search
 from utils.common_helpers import unwrap_linkup
@@ -58,80 +74,302 @@ def _local_set(key: str, val: Any) -> None:
     _LOCAL_CACHE[key] = (time.time() + LOCAL_CACHE_TTL_SEC, val)
 
 # ============================================================
-# 2. Instruction builder for Linkup / LLM
+# 1. OpenAI Structured Output (single stock analysis)
 # ============================================================
 
-def build_single_stock_query(
-    symbol: str,
-    base_currency: str = "USD",
-    metrics_for_symbol: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
+SYSTEM_PROMPT = """
+You are a professional equity research analyst.
+You produce a structured, in-depth but accessible profile for a single stock.
+You MUST return ONLY valid JSON that matches the provided JSON schema.
+You are not permitted to give personalized investment advice or trading recommendations.
 
-    return {
-        "role": (
-            "You are a professional equity research analyst. "
-            "You produce a structured, in-depth but accessible profile for a single stock. "
-            "You MUST return ONLY valid JSON that matches SINGLE_STOCK_SUMMARY_SCHEMA. "
-            "You are not permitted to give personalized investment advice or trading recommendations."
+Task:
+- Explain what the company does, how it makes money, and where it sits in its industry.
+- Summarize financial and operating trends qualitatively based on recent filings and credible sources, without fabricating exact numbers.
+- Describe recent material events (earnings, guidance changes, major product launches, regulatory actions, large deals) and likely relevance for investors.
+- Summarize current sentiment and typical investment thesis (bull, base, bear).
+- Outline key risks, structural tailwinds/headwinds, and provide qualitative valuation context.
+
+References:
+- Use credible sources (filings, investor materials, major financial news outlets, reliable market data).
+- Whenever you rely on an external source, include inline citations in the form 【source†L#-L#】 inside the relevant text field.
+- If you cannot find solid support for a detail, speak qualitatively or omit it. Do NOT guess.
+
+Constraints:
+- STRICTLY conform to the provided JSON schema.
+- Return ONLY JSON (no markdown).
+- Do NOT use direct recommendation language like: "you should buy/sell/hold", "add", "trim".
+- If information is limited, explicitly say so in limitations and lower confidence scores.
+- If information is insufficient, return empty arrays/objects and explain the limitation.
+
+Output quality:
+- Prefer simple explanations; define jargon briefly if used.
+- If uncertain, reflect that in section_confidence and confidence_overall.
+""".strip()
+
+NEWS_PROMPT = """
+You are a financial news researcher.
+Find recent material news and events for the specified company (last 30-90 days where possible).
+Use web search and cite sources inline using 【source†L#-L#】.
+Focus on earnings, guidance, product launches, regulatory actions, major deals, and leadership changes.
+Avoid investment recommendations or personalized advice.
+Return plain text only.
+""".strip()
+
+FILINGS_PROMPT = """
+You are a filings and investor materials analyst.
+Use recent filings, investor presentations, and reputable sources to summarize:
+- Business model and revenue drivers
+- Qualitative financial/operating trends (no fabricated numbers)
+- Competitive positioning and notable structural tailwinds/headwinds
+Include inline citations as 【source†L#-L#】.
+Avoid investment recommendations or personalized advice.
+Return plain text only.
+""".strip()
+
+
+def _get_openai_model() -> str:
+    # Set OPENAI_MODEL to gpt-5.2-mini if available in your org; default is gpt-5-mini.
+    return os.getenv("OPENAI_MODEL", "gpt-5-mini")
+
+
+def _get_allowed_domains(allowed_domains: Optional[list[str]]) -> Optional[list[str]]:
+    if allowed_domains:
+        return allowed_domains
+    raw = os.getenv("OPENAI_WEB_ALLOWED_DOMAINS", "").strip()
+    if not raw:
+        return None
+    domains = [domain.strip() for domain in raw.split(",") if domain.strip()]
+    return domains or None
+
+
+def _apply_strict_required(schema: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Structured Outputs with strict=True require 'required' to list all properties
+    for object schemas. Ensure that across the schema tree.
+    """
+    def _walk(node: Any) -> None:
+        if isinstance(node, dict):
+            if node.get("type") == "object" and isinstance(node.get("properties"), dict):
+                props = node["properties"]
+                node["required"] = list(props.keys())
+                for val in props.values():
+                    _walk(val)
+            elif node.get("type") == "array" and isinstance(node.get("items"), dict):
+                _walk(node["items"])
+            else:
+                for val in node.values():
+                    _walk(val)
+        elif isinstance(node, list):
+            for val in node:
+                _walk(val)
+
+    schema_copy = deepcopy(schema)
+    _walk(schema_copy)
+    return schema_copy
+
+
+class SingleStockAnalysisOutputSchema(AgentOutputSchemaBase):
+    def __init__(self, schema: Dict[str, Any]) -> None:
+        self._schema = schema
+        self._strict_schema = _apply_strict_required(schema)
+
+    def is_plain_text(self) -> bool:
+        return False
+
+    def name(self) -> str:
+        return "single_stock_analysis"
+
+    def json_schema(self) -> Dict[str, Any]:
+        return self._strict_schema
+
+    def is_strict_json_schema(self) -> bool:
+        return True
+
+    def validate_json(self, json_str: str) -> Any:
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError as exc:
+            raise ModelBehaviorError(f"Invalid JSON: {exc}") from exc
+
+
+def _build_model_settings(model: str) -> ModelSettings:
+    base_settings = get_default_model_settings(model)
+    return base_settings.resolve(
+        ModelSettings(
+            tool_choice="auto",
+            response_include=["web_search_call.action.sources"],
+        )
+    )
+
+
+def _build_web_search_tool(allowed_domains: Optional[list[str]]) -> WebSearchTool:
+    filters = WebSearchToolFilters(allowed_domains=allowed_domains) if allowed_domains else None
+    return WebSearchTool(filters=filters)
+
+
+def _extract_raw_output_text(exc: ModelBehaviorError) -> Optional[str]:
+    run_data = getattr(exc, "run_data", None)
+    if not run_data or not run_data.raw_responses:
+        return None
+    last_response = run_data.raw_responses[-1]
+    for item in reversed(last_response.output):
+        text = ItemHelpers.extract_last_text(item)
+        if text:
+            return text
+    return None
+
+
+def _run_text_agent(agent: Agent[Any], input_text: str) -> str:
+    try:
+        result = Runner.run_sync(agent, input=input_text, max_turns=2)
+        output = result.final_output
+        return output if isinstance(output, str) else json.dumps(output, default=str)
+    except Exception:
+        return ""
+
+
+def _repair_json(
+    *,
+    raw_json: str,
+    model: str,
+    model_settings: ModelSettings,
+    output_schema: AgentOutputSchemaBase,
+) -> Dict[str, Any]:
+    repair_agent = Agent(
+        name="Single stock JSON repair",
+        instructions=(
+            "You fix JSON to match a schema. Output ONLY valid JSON. "
+            "Do not add new analysis or facts."
         ),
-        "step_1_task": [
-            "Explain what this company does, how it makes money, and where it sits in its industry.",
-            "Summarize financial and operating trends (revenue, profitability, leverage, cash flows) "
-            "based on recent filings and credible sources, without fabricating exact numbers.",
-            "Describe recent material events (earnings, guidance changes, major product launches, "
-            "regulatory actions, large deals) and their likely relevance for investors.",
-            "Summarize current sentiment and typical investment thesis (bull, base, bear).",
-            "Outline key risks, structural tailwinds/headwinds, and provide a qualitative valuation context.",
-        ],
-        "step_2_context": [
-            f"Focus on the stock identified by ticker symbol: {symbol}.",
-            f"Assume the user's base currency is {base_currency}. Currency matters only for narrative context; "
-            "do not compute portfolio-level P&L here.",
-            "Treat deterministic metrics in metrics_for_symbol as read-only facts if provided. "
-            "You may reference them qualitatively (e.g. 'The stock has been volatile recently'), "
-            "but do NOT override or recompute them.",
-            "Assume a sophisticated but non-professional audience: avoid jargon where possible, "
-            "explain it briefly when unavoidable.",
-        ],
-        "step_3_references": [
-            "Use credible sources: company filings, investor presentations, major financial news outlets, "
-            "and reliable market data providers.",
-            "Whenever you rely on an external source, include inline citations in the form 【source†L#-L#】 "
-            "inside the relevant text field.",
-            "If you cannot find solid support for a specific detail (e.g., an exact margin or revenue number), "
-            "either speak qualitatively (e.g. 'high', 'moderate', 'declining') or omit the detail. Do NOT guess.",
-        ],
-        "step_4_evaluate": [
-            "Check that your narrative is internally consistent and grounded in cited sources.",
-            "Avoid unsupported strong claims such as 'this stock is cheap/expensive' unless backed by clear context; "
-            "prefer 'often discussed as richly valued vs peers' with citations.",
-            "Ensure you do NOT use words that can be interpreted as direct investment advice: "
-            "avoid 'you should buy', 'you should sell', 'this is a buy/hold/sell', 'add', 'trim', or "
-            "specific allocation instructions.",
-            "If you are uncertain or the data is limited (e.g., for a very small or illiquid name), "
-            "lower the relevant section_confidence and mention these limitations explicitly.",
-        ],
-        "step_5_iterate": [
-            "After drafting the full JSON, perform one pass to simplify wording where possible, "
-            "and to remove any implied recommendation or prescriptive language.",
-            "Make sure the disclaimer clearly states that this is general, informational analysis only, "
-            "not personalized advice.",
-        ],
-        "constraints": [
-            "STRICTLY conform to SINGLE_STOCK_SUMMARY_SCHEMA.",
-            "Return ONLY JSON, no markdown, no prose outside the JSON.",
-            "Do NOT make up detailed numeric fundamentals (revenue, EPS, margins, price targets) "
-            "if they are not clearly supported by sources.",
-            "It is always acceptable to say 'information not clearly available from public sources' "
-            "rather than hallucinate.",
-            "All content is informational and educational, not investment, tax, or legal advice.",
-        ],
-    "stock_context": {
-            "symbol": symbol,
-            "base_currency": base_currency,
-            "metrics_for_symbol": metrics_for_symbol or {},
-        },
+        model=model,
+        model_settings=model_settings,
+        output_type=output_schema,
+    )
+    repair_input = (
+        "Fix this JSON to match the schema strictly. Do not add new analysis.\n"
+        f"JSON:\n{raw_json}"
+    )
+    repair_result = Runner.run_sync(repair_agent, input=repair_input, max_turns=1)
+    repaired = repair_result.final_output
+    if not isinstance(repaired, dict):
+        raise ModelBehaviorError("Repair output was not a JSON object.")
+    return repaired
+
+
+def analyze_stock(
+    symbol: str,
+    base_currency: str,
+    metrics_for_symbol: Optional[Dict[str, Any]] = None,
+    holdings: Optional[list[Any]] = None,
+    *,
+    allowed_domains: Optional[list[str]] = None,
+) -> Dict[str, Any]:
+    """
+    Returns a dict that conforms to SINGLE_STOCK_ANALYSIS_SCHEMA.
+    """
+    normalized_base_currency = (base_currency or "USD").upper()
+    metrics_payload = dict(metrics_for_symbol or {})
+    if holdings:
+        calculator = StockMetricsCalculator(base_currency=normalized_base_currency)
+        computed = calculator.build_for_symbol_sync(symbol, holdings)
+        if computed and "computed_metrics" not in metrics_payload:
+            metrics_payload["computed_metrics"] = computed
+
+    cache_key = _build_cache_key(
+        symbol=symbol,
+        base_currency=normalized_base_currency,
+        metrics_for_symbol=metrics_payload,
+        prefix="openai:single_stock",
+    )
+
+    cached = _cache_get(cache_key)
+    if cached:
+        return cached
+
+    model = _get_openai_model()
+    model_settings = _build_model_settings(model)
+
+    domains = _get_allowed_domains(allowed_domains)
+    web_tool = _build_web_search_tool(domains)
+    tools = [web_tool]
+
+    user_payload = {
+        "symbol": symbol,
+        "base_currency": normalized_base_currency,
+        "metrics_for_symbol": metrics_payload,
     }
+
+    news_agent = Agent(
+        name="Stock news researcher",
+        instructions=NEWS_PROMPT,
+        model=model,
+        model_settings=model_settings,
+        tools=tools,
+    )
+    filings_agent = Agent(
+        name="Stock filings researcher",
+        instructions=FILINGS_PROMPT,
+        model=model,
+        model_settings=model_settings,
+        tools=tools,
+    )
+    news_context = _run_text_agent(
+        news_agent,
+        f"Find recent material news and events for {symbol}.",
+    )
+    filings_context = _run_text_agent(
+        filings_agent,
+        f"Summarize recent filings and investor materials for {symbol}.",
+    )
+
+    output_schema = SingleStockAnalysisOutputSchema(SINGLE_STOCK_ANALYSIS_SCHEMA)
+    analysis_agent = Agent(
+        name="Single stock analyst",
+        instructions=SYSTEM_PROMPT,
+        model=model,
+        model_settings=model_settings,
+        tools=tools,
+        output_type=output_schema,
+    )
+    analysis_input = (
+        "Analyze the stock using the provided schema and constraints.\n"
+        f"Stock context (JSON): {json.dumps(user_payload, default=str)}\n"
+        f"News context (text): {news_context}\n"
+        f"Filings context (text): {filings_context}\n"
+        "Return ONLY JSON that matches the schema."
+    )
+
+    try:
+        result = Runner.run_sync(analysis_agent, input=analysis_input, max_turns=3)
+        data = result.final_output
+        if not isinstance(data, dict):
+            raise ModelBehaviorError("Analysis output was not a JSON object.")
+    except ModelBehaviorError as exc:
+        raw = _extract_raw_output_text(exc)
+        if not raw:
+            raise
+        data = _repair_json(
+            raw_json=raw,
+            model=model,
+            model_settings=model_settings,
+            output_schema=output_schema,
+        )
+
+    try:
+        jsonschema_validate(instance=data, schema=SINGLE_STOCK_ANALYSIS_SCHEMA)
+    except ValidationError:
+        raw = json.dumps(data, ensure_ascii=False)
+        data = _repair_json(
+            raw_json=raw,
+            model=model,
+            model_settings=model_settings,
+            output_schema=output_schema,
+        )
+        jsonschema_validate(instance=data, schema=SINGLE_STOCK_ANALYSIS_SCHEMA)
+
+    _cache_set(cache_key, data)
+    return data
 
 
 # ============================================================
@@ -142,6 +380,7 @@ def _build_cache_key(
     symbol: str,
     base_currency: str,
     metrics_for_symbol: Optional[Dict[str, Any]],
+    prefix: str = "linkup:single_stock",
 ) -> str:
     """
     Build a deterministic key so cached analyses are reused across users.
@@ -155,7 +394,7 @@ def _build_cache_key(
             blob = repr(metrics_for_symbol)
         metrics_hash = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
 
-    return f"linkup:single_stock:{symbol.upper()}:{base_currency.upper()}:{metrics_hash}"
+    return f"{prefix}:{symbol.upper()}:{base_currency.upper()}:{metrics_hash}"
 
 
 def _cache_get(key: str) -> Optional[Dict[str, Any]]:
@@ -192,48 +431,3 @@ def _cache_set(key: str, payload: Dict[str, Any]) -> None:
         # Fail soft if Redis is unavailable
         pass
 
-
-# ============================================================
-# 4. Convenience function to call Linkup
-# ============================================================
-
-def call_link_up_for_single_stock(
-    symbol: str,
-    base_currency: Optional[str] = None,
-    metrics_for_symbol: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    normalized_base_currency = (base_currency or "USD").upper()
-    cache_key = _build_cache_key(
-        symbol=symbol,
-        base_currency=normalized_base_currency,
-        metrics_for_symbol=metrics_for_symbol,
-    )
-
-    cached = _cache_get(cache_key)
-    if cached:
-        return cached
-
-    instruction = build_single_stock_query(
-        symbol=symbol,
-        base_currency=normalized_base_currency,
-        metrics_for_symbol=metrics_for_symbol,
-    )
-
-    try:    
-        response = unwrap_linkup(linkup_structured_search(
-            query_obj=instruction,
-            schema=SINGLE_STOCK_ANALYSIS_SCHEMA,
-            days=30,
-            include_sources=False,
-            depth="standard",
-            max_retries=2,
-        )
-    )
-    except Exception as e:
-        # logger.error(f"Error occurred while fetching portfolio AI layers: {e}")
-        return {"error": str(e)}
-
-    # Assuming Linkup client already returns Python dict. If it's a string, json.loads it here.
-    if isinstance(response, dict) and not response.get("error"):
-        _cache_set(cache_key, response)
-    return response
