@@ -1,7 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
-from fastapi.concurrency import run_in_threadpool
 from typing import Any, Dict, Optional
-from services.linkup.agents.single_stock_analysis_agent import analyze_stock
+from services.linkup.agents.single_stock_analysis_agent import analyze_stock_async
 from sqlalchemy.orm import Session
 from database import get_db
 from pydantic import BaseModel
@@ -59,8 +58,7 @@ async def analyze_symbol_endpoint(
     base_currency = req.base_currency or getattr(user, "currency", None) or "USD"
     holdings_rows = get_all_holdings(str(user.id), db)
     holdings = [to_dto(h) for h in holdings_rows] if holdings_rows else []
-    return await run_in_threadpool(
-        analyze_stock,
+    return await analyze_stock_async(
         req.symbol,
         base_currency,
         req.metrics_for_symbol,
