@@ -18,6 +18,7 @@ from routers.portfolio_routes import router as portfolio_router
 from routers.news_routes import router as news_router
 from routers.marktet_routes import router as market_router
 from routers.onboarding_routes import router as onboarding_router
+from routers.billing_routes import router as billing_router
 
 
 app = FastAPI()
@@ -44,7 +45,6 @@ app.add_middleware(
 # Include routers
 app.include_router(user_router)
 app.include_router(holdings_router)
-app.include_router(onboarding_router, prefix="/api/onboarding")
 app.include_router(finnhub_router, prefix="/api/finnhub")
 app.include_router(plaid_routers, prefix="/api/plaid")
 app.include_router(ai_router, prefix="/api/ai")
@@ -52,6 +52,8 @@ app.include_router(investment_router, prefix="/api/investment")
 app.include_router(portfolio_router, prefix="/api/portfolio")
 app.include_router(news_router, prefix="/api/news")
 app.include_router(market_router, prefix="/api/market")
+app.include_router(billing_router, prefix="/api/billing", tags=["billing"])
+app.include_router(onboarding_router, prefix="/api/onboarding")
 
 # db startup
 from database import Base, engine

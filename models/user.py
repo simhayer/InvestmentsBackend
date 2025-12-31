@@ -36,3 +36,5 @@ class User(Base):
         uselist=False,
         cascade="all, delete-orphan",
     )
+
+    subscription = relationship("UserSubscription", back_populates="user", uselist=False)
