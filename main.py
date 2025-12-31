@@ -17,6 +17,7 @@ from routers.investment_routes import router as investment_router
 from routers.portfolio_routes import router as portfolio_router
 from routers.news_routes import router as news_router
 from routers.marktet_routes import router as market_router
+from routers.onboarding_routes import router as onboarding_router
 
 
 app = FastAPI()
@@ -35,7 +36,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=False,
-    allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allow_methods=["*"],
     allow_headers=["*"],
     allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?$",
 )
@@ -43,6 +44,7 @@ app.add_middleware(
 # Include routers
 app.include_router(user_router)
 app.include_router(holdings_router)
+app.include_router(onboarding_router, prefix="/api/onboarding")
 app.include_router(finnhub_router, prefix="/api/finnhub")
 app.include_router(plaid_routers, prefix="/api/plaid")
 app.include_router(ai_router, prefix="/api/ai")
