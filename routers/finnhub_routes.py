@@ -7,6 +7,7 @@ from services.finnhub_service import (
     FinnhubService,
     FinnhubServiceError,
 )
+from cache.crypto_catalog import crypto_catalog
 
 router = APIRouter()
 
@@ -61,13 +62,51 @@ async def search_symbols(
     query: str,
     svc: FinnhubService = Depends(get_finnhub_service),
 ):
-    try:
-        results = await svc.search_symbols(query)
-        limit = 5
-        return results[:limit]
-    except FinnhubServiceError as e:
-        raise HTTPException(status_code=400, detail=str(e))
+    q = (query or "").strip()
+    if not q:
+        return []
 
+    limit = 5
+    merged = []
+
+    # 1) Crypto first (optional)
+    crypto_hits = crypto_catalog.search(q, limit=limit)
+    for c in crypto_hits:
+        merged.append({
+            "symbol": c.symbol,
+            "description": f"{c.name} ({c.symbol}) • Crypto" if c.name else f"{c.symbol} • Crypto",
+            "type": "crypto",
+            "quote_symbol": f"{c.symbol}-USD",
+        })
+
+    # 2) Stocks from Finnhub
+    try:
+        stock_hits = await svc.search_symbols(q)
+        for item in stock_hits:
+            if isinstance(item, dict) and item.get("symbol") and item.get("description"):
+                merged.append({
+                    **item,
+                    "asset_type": "stock",
+                    "quote_symbol": item.get("symbol"),
+                })
+                if len(merged) >= limit * 3:  # allow room before dedupe
+                    break
+    except Exception:
+        pass
+
+    # 3) De-dupe by SYMBOL (so frontend key={symbol} is safe)
+    seen_symbols = set()
+    final = []
+    for item in merged:
+        sym = item.get("symbol")
+        if not sym or sym in seen_symbols:
+            continue
+        seen_symbols.add(sym)
+        final.append(item)
+        if len(final) >= limit:
+            break
+
+    return final
 
 @router.get("/quote")
 async def fetch_quote(

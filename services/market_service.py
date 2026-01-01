@@ -272,7 +272,6 @@ def refresh_market_overview(db: Session) -> Json:
     _MEM[MEM_KEY] = (datetime.now(timezone.utc), clean)
     return clean
 
-
 # ---------------------------
 # Linkup market summary cache (unchanged logic)
 # ---------------------------

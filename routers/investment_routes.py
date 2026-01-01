@@ -13,11 +13,11 @@ from services.yahoo_service import (
 router = APIRouter()
 
 @router.get("/quote/{symbol}")
-async def get_quote(symbol: str):
-    sym = (symbol or "").upper().strip()
-    if not sym:
+async def get_quote(symbol: str, q: str | None = Query(default=None)):
+    yahoo_symbol = (q or symbol or "").upper().strip()
+    if not yahoo_symbol:
         raise HTTPException(status_code=400, detail="Symbol is required")
-    data = await run_in_threadpool(get_full_stock_data, sym)
+    data = await run_in_threadpool(get_full_stock_data, yahoo_symbol)
     if not isinstance(data, dict):
         raise HTTPException(status_code=502, detail="Upstream returned non-JSON")
     if data.get("status") != "ok":
@@ -29,10 +29,14 @@ async def get_quote(symbol: str):
 @router.get("/history/{symbol}")
 async def get_history(
     symbol: str,
+    q: str | None = Query(default=None),
     period: str = Query("1y", description="1d,5d,1mo,3mo,6mo,1y,2y,5y,10y,ytd,max"),
     interval: str = Query("1d", description="1m,2m,5m,15m,30m,60m,90m,1h,1d,5d,1wk,1mo,3mo"),
 ):
-    data = await run_in_threadpool(get_price_history, symbol, period, interval)
+    yahoo_symbol = (q or symbol or "").upper().strip()
+    if not yahoo_symbol:
+        raise HTTPException(status_code=400, detail="Symbol is required")
+    data = await run_in_threadpool(get_price_history, yahoo_symbol, period, interval)
     if data.get("status") != "ok":
         raise HTTPException(status_code=502, detail=data.get("message", "Fetch failed"))
     return data
