@@ -19,9 +19,32 @@ from routers.news_routes import router as news_router
 from routers.marktet_routes import router as market_router
 from routers.onboarding_routes import router as onboarding_router
 from routers.billing_routes import router as billing_router
+from routers.crypto_routes import router as crypto_router
 
+# load crypto catalog on startup
+from contextlib import asynccontextmanager
+from database import SessionLocal
+from services.binance_service import refresh_crypto_catalog, load_crypto_catalog
 
-app = FastAPI()
+@asynccontextmanager
+async def lifespan(app):
+    db = SessionLocal()
+    print("[startup] refreshing crypto catalog")
+    try:
+        # Commenting because we dont need to fetch from binance currently, will have load mechanism in prod
+        # try:
+        #     await refresh_crypto_catalog(db, provider="binance")
+        # except Exception as e:
+        #     print(f"[startup] Binance refresh failed: {e}")
+
+        # Always load from DB into memory
+        load_crypto_catalog(db, provider="binance")
+
+        yield
+    finally:
+        db.close()
+
+app = FastAPI(lifespan=lifespan)
 
 origins = [
     "http://localhost:3000",
@@ -54,6 +77,7 @@ app.include_router(news_router, prefix="/api/news")
 app.include_router(market_router, prefix="/api/market")
 app.include_router(billing_router, prefix="/api/billing", tags=["billing"])
 app.include_router(onboarding_router, prefix="/api/onboarding")
+app.include_router(crypto_router, prefix="/api/crypto", tags=["crypto"])
 
 # db startup
 from database import Base, engine
