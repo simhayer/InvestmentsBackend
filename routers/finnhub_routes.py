@@ -75,7 +75,7 @@ async def search_symbols(
         merged.append({
             "symbol": c.symbol,
             "description": f"{c.name} ({c.symbol}) • Crypto" if c.name else f"{c.symbol} • Crypto",
-            "type": "crypto",
+            "asset_type": "crypto",
             "quote_symbol": f"{c.symbol}-USD",
         })
 
