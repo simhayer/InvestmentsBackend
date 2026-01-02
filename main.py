@@ -26,23 +26,31 @@ from contextlib import asynccontextmanager
 from database import SessionLocal
 from services.binance_service import refresh_crypto_catalog, load_crypto_catalog
 
+# db startup
+from database import Base, engine
+import models  # this triggers models/__init__.py which imports all tables
+
+Base.metadata.create_all(bind=engine)
+
 @asynccontextmanager
-async def lifespan(app):
+async def lifespan(app: FastAPI):
+    print("[startup] loading crypto catalog")
     db = SessionLocal()
-    print("[startup] refreshing crypto catalog")
     try:
-        # Commenting because we dont need to fetch from binance currently, will have load mechanism in prod
-        # try:
-        #     await refresh_crypto_catalog(db, provider="binance")
-        # except Exception as e:
-        #     print(f"[startup] Binance refresh failed: {e}")
+        # (optional) refresh on startup
+        # await refresh_crypto_catalog(db, provider="binance")
 
-        # Always load from DB into memory
         load_crypto_catalog(db, provider="binance")
-
-        yield
+    except Exception as e:
+        print(f"[startup] crypto catalog load failed: {e}")
     finally:
-        db.close()
+        # close BEFORE yield so shutdown doesn't touch DB
+        try:
+            db.close()
+        except Exception:
+            pass
+
+    yield
 
 app = FastAPI(lifespan=lifespan)
 
@@ -79,8 +87,3 @@ app.include_router(billing_router, prefix="/api/billing", tags=["billing"])
 app.include_router(onboarding_router, prefix="/api/onboarding")
 app.include_router(crypto_router, prefix="/api/crypto", tags=["crypto"])
 
-# db startup
-from database import Base, engine
-import models  # this triggers models/__init__.py which imports all tables
-
-Base.metadata.create_all(bind=engine)
