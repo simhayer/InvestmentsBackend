@@ -4,6 +4,8 @@ from typing import Any, Optional
 import json
 from typing import Any, Dict
 import httpx
+import time
+from typing import Callable, Tuple, Type
 
 def to_float(x: Any) -> float:
     if x is None:
@@ -79,11 +81,6 @@ def canonical_key(symbol: Optional[str], typ: Optional[str]) -> str:
     t = (typ or "").lower().strip()
     return f"{s}:{t}" if t else s
 
-# def _unwrap_agent(v):
-#     if isinstance(v, dict) and "ok" in v and "data" in v:
-#         return v.get("data")
-#     return v
-
 def unwrap_linkup(result: dict) -> dict:
     if isinstance(result, dict) and result.get("ok") and isinstance(result.get("data"), dict):
         return result["data"]
@@ -98,3 +95,30 @@ def unwrap_layers_for_ui(layers: dict) -> dict:
         if k in out:
             out[k] = unwrap_linkup(out[k])
     return out
+
+def retry(
+    fn: Callable[[], Any],
+    *,
+    attempts: int = 3,
+    delay: float = 0.4,
+    backoff: float = 2.0,
+    exceptions: Tuple[Type[BaseException], ...] = (Exception,),
+) -> Any:
+    """
+    Retry a function up to `attempts` times with exponential backoff.
+    Raises RuntimeError (chained) if all attempts fail.
+    """
+    attempts = max(1, attempts)
+    err: BaseException | None = None
+
+    for i in range(attempts):
+        try:
+            return fn()
+        except exceptions as e:   # <-- exceptions is a tuple of classes
+            err = e
+            if i < attempts - 1:
+                time.sleep(delay * (backoff ** i))
+            else:
+                break
+
+    raise RuntimeError(f"retry failed after {attempts} attempts") from err
