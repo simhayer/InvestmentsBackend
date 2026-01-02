@@ -1,5 +1,6 @@
 # services/portfolio_service.py
 from __future__ import annotations
+import heapq
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -45,8 +46,6 @@ async def get_portfolio_summary(
     )
 
     items: List[HoldingOut] = enriched.get("items", [])
-    top_positions: List[HoldingOut] = enriched.get("top_items", [])
-
     # Route-level price status (live/mixed/unavailable)
     live_count = sum(1 for it in items if getattr(it, "price_status", None) == "live")
     if not items or live_count == 0:
@@ -59,6 +58,7 @@ async def get_portfolio_summary(
     # Totals: rely on computed holding values
     values = [to_float(getattr(h, "value", 0.0)) for h in items]
     market_value = fsum(values)
+    top_positions = enriched.get("top_items", [])
 
     # Cost basis: prefer purchase_amount_total if present, else unit * qty
     cost_terms: List[float] = []

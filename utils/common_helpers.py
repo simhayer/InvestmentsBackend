@@ -7,6 +7,20 @@ import httpx
 import time
 from typing import Callable, Tuple, Type
 
+def normalize_asset_type(typ: str | None) -> str | None:
+    t = (typ or "").strip().lower()
+    if not t:
+        return None
+
+    # unify all stock-like values
+    if t in {"stock", "equity", "etf", "common stock", "adr"}:
+        return "equity"
+
+    if t in {"crypto", "cryptocurrency"}:
+        return "cryptocurrency"
+
+    return t
+
 def to_float(x: Any) -> float:
     if x is None:
         return 0.0
@@ -73,12 +87,8 @@ def safe_json(resp: httpx.Response) -> Optional[Dict[str, Any]]:
     return data if isinstance(data, dict) else None
 
 def canonical_key(symbol: Optional[str], typ: Optional[str]) -> str:
-    """
-    Canonical key used across the app to avoid collisions and mismatch.
-    Matches your holdings layer _key(symbol, type): "AAPL:equity" or "AAPL".
-    """
     s = (symbol or "").upper().strip()
-    t = (typ or "").lower().strip()
+    t = normalize_asset_type(typ)
     return f"{s}:{t}" if t else s
 
 def unwrap_linkup(result: dict) -> dict:

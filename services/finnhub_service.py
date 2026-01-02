@@ -5,7 +5,13 @@ import os
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
-from utils.common_helpers import canonical_key, safe_json
+from utils.common_helpers import canonical_key, safe_json, normalize_asset_type
+from services.cache.cache_backend import cache_get_many, cache_set_many
+
+TTL_FINNHUB_QUOTE_SEC = 60
+
+def _ck_quote(formatted_symbol: str) -> str:
+    return f"FINNHUB:QUOTE:{(formatted_symbol or '').strip().upper()}"
 
 import httpx
 from dotenv import load_dotenv
@@ -162,7 +168,7 @@ class FinnhubService:
             sym = (s or "").strip()
             if not sym:
                 continue
-            clean.append((sym, (t or "").strip()))
+            clean.append((sym, normalize_asset_type(t) or "stock"))
 
         if not clean:
             return {}
@@ -219,6 +225,90 @@ class FinnhubService:
 
         # If you want to enforce only USD requests here (recommended), you can:
         # if cur != "USD": raise FinnhubServiceError("Currency conversion must be done outside FinnhubService")
+
+        return out
+    
+    async def get_prices_cached(
+    self,
+    pairs: Iterable[Tuple[str, str]],  # (symbol, type)
+    currency: str = "USD",
+    client: Optional[httpx.AsyncClient] = None,
+    *,
+    max_concurrency: Optional[int] = None,
+    ttl_seconds: int = TTL_FINNHUB_QUOTE_SEC,
+    ) -> Dict[str, Optional[Dict[str, Any]]]:
+
+        def normalize_asset_type(typ: str | None) -> str:
+            t = (typ or "").strip().lower()
+            if not t:
+                return "equity"
+            if t in {"stock", "equity", "etf", "common stock", "adr"}:
+                return "equity"
+            if t in {"crypto", "cryptocurrency"}:
+                return "cryptocurrency"
+            return t
+
+        # 1) normalize input, and precompute EVERYTHING once
+        items: List[Dict[str, str]] = []
+        for s, t in pairs:
+            sym = (s or "").strip()
+            if not sym:
+                continue
+
+            typ_n = normalize_asset_type(t)
+            fs = format_finnhub_symbol(sym, typ_n)
+
+            items.append({
+                "sym": sym,
+                "typ": typ_n,  # ✅ normalized
+                "fs": fs,
+                "out_key": canonical_key(sym, typ_n),  # ✅ matches get_prices()
+                "cache_key": _ck_quote(fs),            # ok to key by formatted symbol
+            })
+
+        if not items:
+            return {}
+
+        # 2) bulk cache read (by cache_key)
+        cache_keys = [it["cache_key"] for it in items]
+        cached_map = cache_get_many(cache_keys)
+
+        out: Dict[str, Optional[Dict[str, Any]]] = {}
+        misses: List[Tuple[str, str]] = []
+        miss_items: List[Dict[str, str]] = []
+
+        for it in items:
+            hit = cached_map.get(it["cache_key"])
+            if isinstance(hit, dict):
+                out[it["out_key"]] = hit
+            else:
+                out[it["out_key"]] = None
+                misses.append((it["sym"], it["typ"]))  # ✅ normalized type
+                miss_items.append(it)
+
+        if not misses:
+            return out
+
+        # 3) fetch only misses from Finnhub (returns dict keyed by canonical_key(sym, typ))
+        fresh = await self.get_prices(
+            pairs=misses,
+            currency=currency,
+            client=client,
+            max_concurrency=max_concurrency,
+        )
+
+        # 4) merge fresh into out + write-through cache per formattedSymbol
+        write_back: Dict[str, Any] = {}
+        for it in miss_items:
+            payload = fresh.get(it["out_key"])
+            out[it["out_key"]] = payload
+
+            # optional: don’t cache None (avoid sticky missing)
+            if isinstance(payload, dict):
+                write_back[it["cache_key"]] = payload
+
+        if write_back:
+            cache_set_many(write_back, ttl_seconds=ttl_seconds)
 
         return out
 

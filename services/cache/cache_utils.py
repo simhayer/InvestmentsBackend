@@ -1,21 +1,32 @@
 # services/helpers/cache_utils.py
 from __future__ import annotations
 
+import inspect
 from functools import wraps
-from typing import Any, Callable, Dict, TypeVar, cast
+from typing import Any, Awaitable, Callable, Dict, List, Optional, TypeVar, Union, cast
 
 from services.cache.cache_backend import cache_get, cache_set
 
-Json = Dict[str, Any]
+# Same shape as cache_backend
+JsonValue = Union[Dict[str, Any], List[Any], str, int, float, bool, None]
+
 T = TypeVar("T")
 
 
 def should_cache_ok_json(val: Any) -> bool:
     """
     Default policy: cache only successful JSON payloads.
-    Avoid caching transient upstream errors.
+    Good for quote/financial endpoints where you return {"status":"ok"}.
     """
     return isinstance(val, dict) and val.get("status") == "ok"
+
+
+def should_cache_any_json(val: Any) -> bool:
+    """
+    Cache any JSON value (dict/list/primitive).
+    Useful for search endpoints returning a list, etc.
+    """
+    return isinstance(val, (dict, list, str, int, float, bool)) or val is None
 
 
 def cacheable(
@@ -26,18 +37,36 @@ def cacheable(
 ) -> Callable[[Callable[..., T]], Callable[..., T]]:
     """
     Decorator for read-only functions.
+    Works for BOTH sync and async functions.
 
-    Example:
-      @cacheable(ttl=60, key_fn=lambda symbol: f"QUOTE:{symbol}")
-      def get_quote(symbol: str) -> Json: ...
-
-    - key_fn(*args, **kwargs) must return a stable cache key string
-    - ttl is shared cache TTL (Redis); local warm-cache TTL handled by cache_backend
-    - should_cache decides what values get cached (default: {"status":"ok"})
+    - ttl: Redis/shared TTL (local TTL handled by backend)
+    - key_fn: key_fn(*args, **kwargs) -> str
+    - should_cache: decide what values get cached
     """
     def deco(fn: Callable[..., T]) -> Callable[..., T]:
+        if inspect.iscoroutinefunction(fn):
+            @wraps(fn)
+            async def awrapper(*args: Any, **kwargs: Any) -> T:
+                key = (key_fn(*args, **kwargs) or "").strip()
+                if key:
+                    hit = cache_get(key)
+                    if hit is not None:
+                        return cast(T, hit)
+
+                val = await cast(Callable[..., Awaitable[Any]], fn)(*args, **kwargs)
+
+                if key and should_cache(val):
+                    try:
+                        cache_set(key, cast(JsonValue, val), ttl_seconds=ttl)
+                    except Exception:
+                        pass
+
+                return cast(T, val)
+
+            return cast(Callable[..., T], awrapper)
+
         @wraps(fn)
-        def wrapper(*args: Any, **kwargs: Any) -> T:
+        def swrapper(*args: Any, **kwargs: Any) -> T:
             key = (key_fn(*args, **kwargs) or "").strip()
             if key:
                 hit = cache_get(key)
@@ -48,10 +77,12 @@ def cacheable(
 
             if key and should_cache(val):
                 try:
-                    cache_set(key, cast(Json, val), ttl_seconds=ttl)
+                    cache_set(key, cast(JsonValue, val), ttl_seconds=ttl)
                 except Exception:
                     pass
 
             return val
-        return wrapper
+
+        return swrapper
+
     return deco
