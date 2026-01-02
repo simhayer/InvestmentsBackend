@@ -3,47 +3,13 @@ from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Iterable, List, Optional
-
-import pandas as pd
 from yahooquery import Ticker
-
+import pandas as pd
 from utils.common_helpers import safe_float as _fnum, retry
-from services.helpers.yahoo_helpers import (
-    pct,
-    dist_pct,
-    iso_utc_from_ts,
-    to_epoch_utc,
-    date_iso,
-    parse_weird_cal_dt,
-    quarter_label,
-)
-
-from services.cache.cache_backend import (
-    cache_get_many,
-    cache_set_many,
-)
-from services.cache.cache_utils import cacheable
+from services.helpers.yahoo_helpers import pct, dist_pct, iso_utc_from_ts, to_epoch_utc, date_iso, parse_weird_cal_dt, quarter_label
 
 Number = Optional[float]
 Json = Dict[str, Any]
-
-# -------------------------
-# TTL policy
-# -------------------------
-TTL_QUOTES_SEC = 60
-TTL_EARNINGS_SEC = 12 * 60 * 60        # 12h (6–24h)
-TTL_FINANCIALS_SEC = 48 * 60 * 60      # 48h (24–72h)
-TTL_PROFILE_SEC = 24 * 60 * 60         # 24h
-TTL_HISTORY_SEC = 15 * 60              # 15m
-TTL_ANALYST_SEC = 24 * 60 * 60         # daily-ish
-
-def _sym(symbol: str) -> str:
-    return (symbol or "").upper().strip()
-
-def _ck(sym: str, kind: str) -> str:
-    """Cache key helper to avoid collisions across endpoints."""
-    s = _sym(sym)
-    return f"{kind}:{s}"
 
 def _extract_stock_payload(sym: str, price: dict, sd: dict, fd: dict, ks: dict) -> Json:
     short_name = price.get("shortName") or price.get("longName")
@@ -73,6 +39,7 @@ def _extract_stock_payload(sym: str, price: dict, sd: dict, fd: dict, ks: dict) 
     recommendation_key = fd.get("recommendationKey")
     target_price = _fnum(fd.get("targetMeanPrice"))
 
+    # Quote time
     quote_ts = (
         price.get("regularMarketTime")
         or price.get("postMarketTime")
@@ -80,27 +47,21 @@ def _extract_stock_payload(sym: str, price: dict, sd: dict, fd: dict, ks: dict) 
     )
     quote_time_utc = iso_utc_from_ts(quote_ts)
 
+    # Computed deltas
     day_change = (current - previous) if (current is not None and previous is not None) else None
     day_change_pct = pct(current, previous)
     dist_high_pct = dist_pct(current, high_52)
     dist_low_pct = dist_pct(current, low_52)
 
+    # Quality check
     is_stale = False
     if quote_time_utc:
         try:
             qt = datetime.fromisoformat(quote_time_utc.replace("Z", "+00:00"))
             is_stale = (datetime.now(timezone.utc) - qt) > timedelta(days=2)
-        except Exception:
-            pass
+        except Exception: pass
 
-    missing = [
-        k for k, v in {
-            "current_price": current,
-            "currency": currency,
-            "previous_close": previous,
-        }.items()
-        if v is None
-    ]
+    missing = [k for k, v in {"price": current, "currency": currency}.items() if v is None]
 
     return {
         "status": "ok",
@@ -138,132 +99,97 @@ def _extract_stock_payload(sym: str, price: dict, sd: dict, fd: dict, ks: dict) 
         },
     }
 
-# -------------------------
-# Quotes / fundamentals
-# -------------------------
-@cacheable(
-    ttl=TTL_QUOTES_SEC,
-    key_fn=lambda symbol: _ck(_sym(symbol), "quote"),
-)
 def get_full_stock_data(symbol: str) -> Json:
-    sym = _sym(symbol)
+    sym = (symbol or "").upper().strip()
     if not sym:
         return {"status": "error", "error_code": "EMPTY_SYMBOL", "message": "Symbol required"}
 
     try:
         tq = Ticker(sym, asynchronous=False, formatted=False)
-        raw = retry(lambda: tq.get_modules(["price", "summaryDetail", "financialData", "defaultKeyStatistics"])) or {}
+        raw = retry(lambda: tq.get_modules(["price", "summaryDetail", "financialData", "defaultKeyStatistics"]))
         node = _get_symbol_node(raw, sym)
 
         if not node or "price" not in node:
             raise ValueError(f"No data found for {sym}")
 
-        return _extract_stock_payload(
+        payload = _extract_stock_payload(
             sym,
-            node.get("price", {}) or {},
-            node.get("summaryDetail", {}) or {},
-            node.get("financialData", {}) or {},
-            node.get("defaultKeyStatistics", {}) or {},
+            node.get("price", {}),
+            node.get("summaryDetail", {}),
+            node.get("financialData", {}),
+            node.get("defaultKeyStatistics", {})
         )
+
+        return payload
+
     except Exception as e:
         return {"status": "error", "error_code": "YAHOO_FETCH_ERROR", "message": str(e)}
 
-# -------------------------
-# Price history (optional cached)
-# -------------------------
-@cacheable(
-    ttl=TTL_HISTORY_SEC,
-    key_fn=lambda symbol, period="1y", interval="1d": _ck(_sym(symbol), f"history:{period}:{interval}"),
-)
-def get_price_history(symbol: str, period: str = "1y", interval: str = "1d") -> Json:
-    sym = _sym(symbol)
-    if not sym:
-        return {"status": "error", "error_code": "EMPTY_SYMBOL", "message": "Symbol required"}
 
+def get_price_history(symbol: str, period: str = "1y", interval: str = "1d") -> Json:
+    sym = (symbol or "").upper().strip()
     try:
         tq = Ticker(sym, asynchronous=False, formatted=False)
         df = tq.history(period=period, interval=interval)
 
         if df is None or (hasattr(df, "empty") and df.empty):
-            return {"status": "ok", "symbol": sym, "period": period, "interval": interval, "points": []}
+            return {"status": "ok", "symbol": sym, "points": []}
 
+        # Handle MultiIndex and flatten
         df = df.reset_index()
-
         if "symbol" in df.columns:
-            df = df[df["symbol"].astype(str).str.upper() == sym]
-
+            df = df[df["symbol"].str.upper() == sym]
+        
+        # Rename 'index' or 'asOfDate' to 'date' if necessary
         date_col = next((c for c in df.columns if c in ["date", "index", "asOfDate"]), None)
         if date_col and date_col != "date":
             df = df.rename(columns={date_col: "date"})
 
-        if "date" not in df.columns:
-            return {"status": "ok", "symbol": sym, "period": period, "interval": interval, "points": []}
-
         df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
         df = df.dropna(subset=["date"]).sort_values("date")
 
-        has_adj = "adjclose" in df.columns
-
-        points: List[Dict[str, Any]] = []
-        for row in df.itertuples(index=False):
-            d = getattr(row, "date", None)
-            t = int(d.timestamp()) if isinstance(d, pd.Timestamp) else to_epoch_utc(d)
-            if t is None:
-                continue
-
+        points = []
+        for row in df.itertuples():
             points.append({
-                "t": t,
+                "t": int(row.date.timestamp()) if isinstance(row.date, pd.Timestamp) else to_epoch_utc(row.date),
                 "o": _fnum(getattr(row, "open", None)),
                 "h": _fnum(getattr(row, "high", None)),
                 "l": _fnum(getattr(row, "low", None)),
                 "c": _fnum(getattr(row, "close", None)),
                 "v": _fnum(getattr(row, "volume", None)),
-                "adjclose": _fnum(getattr(row, "adjclose", None)) if has_adj else None,
+                "adjclose": _fnum(getattr(row, "adjclose", None)),
             })
-
-        return {"status": "ok", "symbol": sym, "period": period, "interval": interval, "points": points}
-
+        return {"status": "ok", "symbol": sym, "points": points}
     except Exception as e:
-        return {"status": "error", "error_code": "YQ_HISTORY_FAILED", "message": str(e)}
+        return {"status": "error", "message": str(e)}  
 
-# -------------------------
-# Financials (cached 48h)
-# -------------------------
-@cacheable(
-    ttl=TTL_FINANCIALS_SEC,
-    key_fn=lambda symbol, period="annual": _ck(_sym(symbol), f"financials:{'quarterly' if period=='quarterly' else 'annual'}"),
-)
 def get_financials(symbol: str, period: str = "annual") -> Json:
-    sym = _sym(symbol)
-    if not sym:
-        return {"status": "error", "error_code": "EMPTY_SYMBOL", "message": "Symbol required"}
-
+    """Uses all_financial_data for high-density statement building."""
+    sym = (symbol or "").upper().strip()
     want_q = (period == "quarterly")
+    # Yahoo uses different labels for periods
     acceptable = {"3M"} if want_q else {"12M", "FY"}
 
     try:
         tq = Ticker(sym, asynchronous=False, formatted=False)
         afd = tq.all_financial_data()
-
+        
+        
         if (
             afd is None
             or not isinstance(afd, pd.DataFrame)
             or afd.empty
             or not any(c in afd.columns for c in ("TotalRevenue", "OperatingRevenue"))
-        ):
+            ):
             return _financials_df_fallback(sym, period)
 
         df = pd.DataFrame(afd).reset_index()
         if "symbol" in df.columns:
-            df = df[df["symbol"].astype(str).str.upper() == sym]
-
+            df = df[df["symbol"].str.upper() == sym]
+        
         date_col = "asOfDate" if "asOfDate" in df.columns else "endDate"
-        if date_col not in df.columns:
-            return _financials_df_fallback(sym, period)
-
-        df[date_col] = pd.to_datetime(df[date_col], utc=True, errors="coerce")
-        df = df.dropna(subset=[date_col])
-
+        df[date_col] = pd.to_datetime(df[date_col], utc=True)
+        
         if "periodType" in df.columns:
             df = df[df["periodType"].isin(acceptable)]
 
@@ -271,26 +197,26 @@ def get_financials(symbol: str, period: str = "annual") -> Json:
 
         def _get(r, *keys):
             for k in keys:
-                if k in r and pd.notna(r[k]):
-                    return _fnum(r[k])
+                if k in r and pd.notna(r[k]): return _fnum(r[k])
             return None
 
-        income: List[Dict[str, Any]] = []
-        balance: List[Dict[str, Any]] = []
-        cash: List[Dict[str, Any]] = []
+        income, balance, cash = [], [], []
 
         for _, r in df.iterrows():
             iso = r[date_col].date().isoformat()
 
+            # --- Income statement ---
             income.append({
                 "date": iso,
                 "revenue": _get(r, "TotalRevenue", "OperatingRevenue", "Revenue"),
+                # this is what you meant by gross_income
                 "gross_profit": _get(r, "GrossProfit"),
                 "operating_income": _get(r, "OperatingIncome", "TotalOperatingIncomeAsReported"),
                 "net_income": _get(r, "NetIncome", "NetIncomeCommonStockholders", "NetIncomeIncludingNoncontrollingInterests"),
                 "eps": _get(r, "DilutedEPS", "BasicEPS", "EPS"),
             })
 
+            # --- Balance sheet ---
             balance.append({
                 "date": iso,
                 "total_assets": _get(r, "TotalAssets"),
@@ -301,14 +227,17 @@ def get_financials(symbol: str, period: str = "annual") -> Json:
                 "long_term_debt": _get(r, "LongTermDebt", "LongTermDebtAndCapitalLeaseObligation"),
             })
 
+            # --- Cash flow ---
             ocf = _get(r, "OperatingCashFlow")
             icf = _get(r, "InvestingCashFlow")
             fcf = _get(r, "FreeCashFlow")
 
+            # compute FCF if missing: OCF - capex (capex often negative)
             if fcf is None:
                 capex = _get(r, "CapitalExpenditure", "CapitalExpenditures")
                 if ocf is not None and capex is not None:
-                    fcf = ocf - capex
+                    fcf = ocf - capex  # if capex is negative, subtracting it adds its magnitude
+                    # if you find capex is positive in your data, use: fcf = ocf - abs(capex)
 
             cash.append({
                 "date": iso,
@@ -318,20 +247,23 @@ def get_financials(symbol: str, period: str = "annual") -> Json:
                 "free_cash_flow": fcf,
             })
 
-        return {
-            "status": "ok",
-            "symbol": sym,
-            "period": "quarterly" if want_q else "annual",
-            "income_statement": income,
-            "balance_sheet": balance,
-            "cash_flow": cash,
-        }
 
+        return {
+            "status": "ok", 
+            "symbol": sym, 
+            "income_statement": income, 
+            "balance_sheet": balance, 
+            "cash_flow": cash
+        }
     except Exception as e:
-        return {"status": "error", "error_code": "YQ_FINANCIALS_FAILED", "message": str(e)}
+        return {"status": "error", "message": str(e)}
 
 def _financials_df_fallback(sym: str, period: str) -> Json:
-    """Fallback using statement-specific DFs."""
+    """
+    Previous DF-based implementation; called if all_financial_data()
+    is unavailable or too sparse. Uses .income_statement/.balance_sheet/.cash_flow
+    and returns the same normalized shape.
+    """
     try:
         freq = "q" if period == "quarterly" else "a"
         tq = Ticker(sym, asynchronous=False, formatted=False, validate=False)
@@ -358,7 +290,7 @@ def _financials_df_fallback(sym: str, period: str) -> Json:
 
         def _val(row: pd.Series, *keys: str) -> Optional[float]:
             for k in keys:
-                if k in row and pd.notna(row[k]):
+                if k in row:
                     return _fnum(row[k])
             return None
 
@@ -366,45 +298,44 @@ def _financials_df_fallback(sym: str, period: str) -> Json:
         bal_df = _prep_df(tq.balance_sheet(frequency=freq))
         cfs_df = _prep_df(tq.cash_flow(frequency=freq))
 
-        income: List[Dict[str, Any]] = []
+        income = []
         for _, r in inc_df.iterrows():
             income.append({
                 "date": r["date"].date().isoformat(),
-                "revenue": _val(r, "totalRevenue", "revenue"),
-                "gross_profit": _val(r, "grossProfit"),
-                "operating_income": _val(r, "operatingIncome"),
-                "net_income": _val(r, "netIncome"),
-                "eps": _val(r, "dilutedEps", "dilutedEPS", "eps"),
+                "revenue":           _val(r, "totalRevenue", "revenue"),
+                "gross_profit":      _val(r, "grossProfit"),
+                "operating_income":  _val(r, "operatingIncome"),
+                "net_income":        _val(r, "netIncome"),
+                "eps":               _val(r, "dilutedEps", "dilutedEPS", "eps"),
             })
 
-        balance: List[Dict[str, Any]] = []
+        balance = []
         for _, r in bal_df.iterrows():
             balance.append({
                 "date": r["date"].date().isoformat(),
-                "total_assets": _val(r, "totalAssets"),
+                "total_assets":      _val(r, "totalAssets"),
                 "total_liabilities": _val(r, "totalLiab", "totalLiabilities"),
-                "total_equity": _val(r, "totalStockholderEquity", "totalShareholderEquity"),
-                "cash": _val(r, "cash", "cashAndCashEquivalentsAtCarryingValue", "cashAndCashEquivalents"),
-                "inventory": _val(r, "inventory"),
-                "long_term_debt": _val(r, "longTermDebt"),
+                "total_equity":      _val(r, "totalStockholderEquity", "totalShareholderEquity"),
+                "cash":              _val(r, "cash", "cashAndCashEquivalentsAtCarryingValue", "cashAndCashEquivalents"),
+                "inventory":         _val(r, "inventory"),
+                "long_term_debt":    _val(r, "longTermDebt"),
             })
 
-        cash_flow: List[Dict[str, Any]] = []
+        cash_flow = []
         for _, r in cfs_df.iterrows():
             ocf = _val(r, "totalCashFromOperatingActivities", "operatingCashFlow")
             icf = _val(r, "totalCashflowsFromInvestingActivities", "investingCashFlow")
             fcf = _val(r, "freeCashflow", "freeCashFlow")
             if fcf is None:
-                capex = _val(r, "capitalExpenditures", "CapitalExpenditure", "capitalExpenditure")
+                capex = _val(r, "capitalExpenditures")
                 if ocf is not None and capex is not None:
                     fcf = ocf - capex
-
             cash_flow.append({
                 "date": r["date"].date().isoformat(),
-                "operating_cash_flow": ocf,
-                "investing_cash_flow": icf,
-                "financing_cash_flow": _val(r, "totalCashFromFinancingActivities", "financingCashFlow"),
-                "free_cash_flow": fcf,
+                "operating_cash_flow":  ocf,
+                "investing_cash_flow":  icf,
+                "financing_cash_flow":  _val(r, "totalCashFromFinancingActivities", "financingCashFlow"),
+                "free_cash_flow":       fcf,
             })
 
         return {
@@ -417,86 +348,78 @@ def _financials_df_fallback(sym: str, period: str) -> Json:
         }
 
     except Exception as e:
+        print("Error in _financials_df_fallback:", str(e))
         return {"status": "error", "error_code": "YQ_FINANCIALS_FALLBACK_FAILED", "message": str(e)}
 
-# -------------------------
-# Earnings (cached 12h)
-# -------------------------
-@cacheable(
-    ttl=TTL_EARNINGS_SEC,
-    key_fn=lambda symbol: _ck(_sym(symbol), "earnings"),
-)
+# ---------- NEW: earnings ----------
 def get_earnings(symbol: str) -> Json:
-    sym = _sym(symbol)
-    if not sym:
-        return {"status": "error", "error_code": "EMPTY_SYMBOL", "message": "Symbol required"}
-
+    sym = (symbol or "").upper().strip()
     try:
         tq = Ticker(sym, asynchronous=False, formatted=False)
-        res = tq.get_modules(["calendarEvents", "earningsHistory"]) or {}
+        res = tq.get_modules(["calendarEvents", "earningsHistory"])
         node = _get_symbol_node(res, sym)
 
-        cal = (node.get("calendarEvents") or {}).get("earnings") or {}
+        cal = node.get("calendarEvents", {}).get("earnings", {})
         nxt_date = parse_weird_cal_dt(cal.get("earningsDate"))
 
-        history: List[Dict[str, Any]] = []
-        hist_raw = (node.get("earningsHistory") or {}).get("history") or []
+        history = []
+        hist_raw = node.get("earningsHistory", {}).get("history", [])
         for r in hist_raw:
-            d = date_iso(r.get("reportDate") or r.get("quarter") or r.get("date"))
-            if not d:
-                continue
-            history.append({
-                "date": d,
-                "period": quarter_label(d),
-                "actual": _fnum(r.get("epsActual")),
-                "estimate": _fnum(r.get("epsEstimate")),
-                "surprisePct": _fnum(r.get("surprisePercent")),
-            })
-
+            d = date_iso(r.get("reportDate") or r.get("quarter"))
+            if d:
+                history.append({
+                    "date": d,
+                    "period": quarter_label(d),
+                    "actual": _fnum(r.get("epsActual")),
+                    "estimate": _fnum(r.get("epsEstimate")),
+                    "surprisePct": _fnum(r.get("surprisePercent"))
+                })
+        
         return {
             "status": "ok",
             "symbol": sym,
             "next_earnings_date": nxt_date,
-            "history": sorted(history, key=lambda x: x["date"], reverse=True),
+            "history": sorted(history, key=lambda x: x["date"], reverse=True)
         }
-
     except Exception as e:
-        return {"status": "error", "error_code": "YQ_EARNINGS_FAILED", "message": str(e)}
-
-# -------------------------
-# Analyst (cached daily)
-# -------------------------
-@cacheable(
-    ttl=TTL_ANALYST_SEC,
-    key_fn=lambda symbol: _ck(_sym(symbol), "analyst"),
-)
+        return {"status": "error", "message": str(e)}
+    
+# ---------- NEW: analyst ----------
 def get_analyst(symbol: str) -> Json:
-    sym = _sym(symbol)
+    """
+    Normalize to:
+    {
+      status, symbol,
+      recommendation_key, recommendation,
+      price_target_low, price_target_mean, price_target_high,
+      trend: [{period, strongBuy, buy, hold, sell, strongSell}]
+    }
+    """
+    sym = (symbol or "").upper().strip()
     if not sym:
         return {"status": "error", "error_code": "EMPTY_SYMBOL", "message": "Symbol is required"}
 
     try:
         tq = Ticker(sym, asynchronous=False, formatted=False, validate=False)
-        res = tq.get_modules(["financialData", "recommendationTrend"]) or {}
+        res = tq.get_modules(["financialData", "recommendationTrend"])
         node = _get_symbol_node(res, sym)
 
         fin = node.get("financialData") or {}
         rec = node.get("recommendationTrend") or {}
 
+        # recommendation score/key
         recommendation = _fnum(fin.get("recommendationMean"))
-
-        recommendation_key = None
-        t = rec.get("trend")
-        if isinstance(t, list) and t:
-            recommendation_key = t[0].get("recommendationKey")
+        recommendation_key = rec.get("trend", [{}])[0].get("recommendationKey") if isinstance(rec.get("trend"), list) and rec.get("trend") else fin.get("recommendationKey")
         if not recommendation_key:
             recommendation_key = fin.get("recommendationKey")
 
+        # price targets
         price_target_low = _fnum(fin.get("targetLowPrice") or fin.get("priceTargetLow"))
         price_target_mean = _fnum(fin.get("targetMeanPrice") or fin.get("priceTargetMean"))
         price_target_high = _fnum(fin.get("targetHighPrice") or fin.get("priceTargetHigh"))
 
-        trend_list: List[Dict[str, Any]] = []
+        trend_list = []
+        t = rec.get("trend")
         if isinstance(t, list):
             for r in t:
                 trend_list.append({
@@ -522,23 +445,19 @@ def get_analyst(symbol: str) -> Json:
     except Exception as e:
         return {"status": "error", "error_code": "YQ_ANALYST_FAILED", "message": str(e)}
 
-# -------------------------
-# Company profile / overview (cached 24h)
-# -------------------------
-@cacheable(
-    ttl=TTL_PROFILE_SEC,
-    key_fn=lambda symbol: _ck(_sym(symbol), "profile"),
-)
+# ---------- NEW: company profile/overview ----------
 def get_overview(symbol: str) -> Json:
-    sym = _sym(symbol)
+    sym = (symbol or "").upper().strip()
     if not sym:
         return {"status": "error", "error_code": "EMPTY_SYMBOL", "message": "Symbol is required"}
 
     try:
         tq = Ticker(sym, asynchronous=False, formatted=False, validate=False)
-        res = tq.get_modules(["summaryProfile"]) or {}
-        node = _get_symbol_node(res, sym)
 
+        res = tq.get_modules(["summaryProfile"]) or {}
+        node = _get_symbol_node(res, sym)  # always dict from our helper
+
+        # Some tickers return {summaryProfile: {...}}, others return the profile dict directly.
         if isinstance(node, dict) and isinstance(node.get("summaryProfile"), dict):
             prof = node["summaryProfile"]
         elif isinstance(node, dict):
@@ -573,9 +492,6 @@ def get_overview(symbol: str) -> Json:
     except Exception as e:
         return {"status": "error", "error_code": "YQ_PROFILE_FAILED", "message": str(e)}
 
-# -------------------------
-# Helpers
-# -------------------------
 def _first_list(obj: Any) -> List[dict]:
     if isinstance(obj, list):
         return obj
@@ -589,54 +505,37 @@ def _first_list(obj: Any) -> List[dict]:
                     return lst
     return []
 
+
 def _get_symbol_node(res: Any, sym: str) -> Dict[str, Any]:
-    """Normalize yahooquery get_modules response to the dict for `sym`."""
-    if not isinstance(res, dict):
-        return {}
+    if isinstance(res, dict):
+        # preferred: nested by symbol
+        sub = res.get(sym)
+        if isinstance(sub, dict):
+            return sub
+        # sometimes it's already the node (modules at top level)
+        return res if any(isinstance(v, (dict, list)) for v in res.values()) else {}
+    return {}
 
-    if sym in res and isinstance(res[sym], dict):
-        return res[sym]
-
-    for k, v in res.items():
-        if isinstance(k, str) and k.upper() == sym and isinstance(v, dict):
-            return v
-
-    return res if any(isinstance(v, (dict, list)) for v in res.values()) else {}
-
-# -------------------------
-# Bulk quotes (manual caching is best here)
-# -------------------------
 def get_full_stock_data_many(symbols: Iterable[str]) -> Dict[str, Json]:
-    syms = sorted({_sym(s) for s in symbols if s and str(s).strip()})
+    syms = sorted({s.upper().strip() for s in symbols if s and s.strip()})
     if not syms:
         return {}
 
-    # cache keys are quote:<SYM>
-    key_pairs = [(_ck(sym, "quote"), sym) for sym in syms]
-    cached_map = cache_get_many([k for k, _ in key_pairs])
-
     out: Dict[str, Json] = {}
-    fresh_needed: List[str] = []
-
-    for cache_key, sym in key_pairs:
-        hit = cached_map.get(cache_key)
-        if hit is not None:
-            out[sym] = hit
-        else:
-            fresh_needed.append(sym)
-
-    if not fresh_needed:
-        return out
 
     try:
-        tq = Ticker(fresh_needed, asynchronous=False, formatted=False)
-        raw = retry(lambda: tq.get_modules(["price", "summaryDetail", "financialData", "defaultKeyStatistics"])) or {}
+        tq = Ticker(syms, asynchronous=False, formatted=False)
+
+        raw = retry(lambda: tq.get_modules([
+            "price", "summaryDetail", "financialData", "defaultKeyStatistics"
+        ])) or {}
 
         write_back: Dict[str, Json] = {}
 
-        for sym in fresh_needed:
+        for sym in syms:
             try:
                 node = _get_symbol_node(raw, sym)
+
                 payload = _extract_stock_payload(
                     sym,
                     (node.get("price") or {}),
@@ -644,8 +543,10 @@ def get_full_stock_data_many(symbols: Iterable[str]) -> Dict[str, Json]:
                     (node.get("financialData") or {}),
                     (node.get("defaultKeyStatistics") or {}),
                 )
+
                 out[sym] = payload
-                write_back[_ck(sym, "quote")] = payload
+                write_back[sym] = payload
+
             except Exception as e:
                 out[sym] = {
                     "status": "error",
@@ -654,13 +555,7 @@ def get_full_stock_data_many(symbols: Iterable[str]) -> Dict[str, Json]:
                     "message": str(e),
                 }
 
-        if write_back:
-            cache_set_many(write_back, ttl_seconds=TTL_QUOTES_SEC)
-
         return out
 
     except Exception as e:
-        return {
-            s: {"status": "error", "symbol": s, "error_code": "YQ_MANY_FETCH_FAILED", "message": str(e)}
-            for s in fresh_needed
-        }
+        return {s: {"status": "error", "symbol": s, "error_code": "YQ_MANY_FETCH_FAILED", "message": str(e)} for s in syms}
