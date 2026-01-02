@@ -34,21 +34,21 @@ Base.metadata.create_all(bind=engine)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    print("[startup] loading crypto catalog")
-    db = SessionLocal()
     try:
-        # (optional) refresh on startup
-        # await refresh_crypto_catalog(db, provider="binance")
-
-        load_crypto_catalog(db, provider="binance")
+        Base.metadata.create_all(bind=engine)
     except Exception as e:
-        print(f"[startup] crypto catalog load failed: {e}")
-    finally:
-        # close BEFORE yield so shutdown doesn't touch DB
+        print("[startup] create_all failed:", repr(e))
+
+    try:
+        print("[startup] loading crypto catalog")
+        db = SessionLocal()
         try:
+            # await refresh_crypto_catalog(db, provider="binance")
+            load_crypto_catalog(db, provider="binance")
+        finally:
             db.close()
-        except Exception:
-            pass
+    except Exception as e:
+        print("[startup] crypto catalog load failed:", repr(e))
 
     yield
 
