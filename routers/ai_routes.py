@@ -47,6 +47,9 @@ class SymbolReq(BaseModel):
     symbol: str
     base_currency: Optional[str] = None
     metrics_for_symbol: Optional[Dict[str, Any]] = None
+    user_request: Optional[str] = None
+    needs_filings: Optional[bool] = False
+    cik: Optional[str] = None
 
 @router.post("/analyze-symbol")
 async def analyze_symbol_endpoint(
@@ -63,4 +66,7 @@ async def analyze_symbol_endpoint(
         base_currency,
         req.metrics_for_symbol,
         holdings,
+        user_request=req.user_request,
+        needs_filings=bool(req.needs_filings),
+        cik=req.cik,
     )

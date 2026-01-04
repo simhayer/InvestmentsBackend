@@ -279,6 +279,47 @@ class FinnhubService:
             except Exception:
                 return {}
 
+    async def fetch_basic_financials(
+        self,
+        symbol: str,
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> Dict[str, Any]:
+        sym = (symbol or "").strip()
+        if not sym:
+            return {}
+        async with self._client(client) as c:
+            try:
+                r = await c.get(
+                    f"{self.BASE_URL}/stock/metric",
+                    params=self._auth_params(symbol=sym, metric="all"),
+                )
+                r.raise_for_status()
+                return safe_json(r) or {}
+            except Exception:
+                return {}
+
+    async def fetch_earnings(
+        self,
+        symbol: str,
+        client: Optional[httpx.AsyncClient] = None,
+        *,
+        limit: int = 4,
+    ) -> List[Dict[str, Any]]:
+        sym = (symbol or "").strip()
+        if not sym:
+            return []
+        async with self._client(client) as c:
+            try:
+                r = await c.get(
+                    f"{self.BASE_URL}/stock/earnings",
+                    params=self._auth_params(symbol=sym, limit=limit),
+                )
+                r.raise_for_status()
+                data = safe_json(r)
+                return data if isinstance(data, list) else []
+            except Exception:
+                return []
+
     async def fetch_prices_for_symbols(
         self,
         symbols: List[str],
