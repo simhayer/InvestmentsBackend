@@ -1,26 +1,53 @@
-# services/linkup/agents/single_stock_agent.py
+"""Async single-stock analysis pipeline using Tavily + Finnhub + OpenAI."""
 
 from __future__ import annotations
 
-import hashlib
+import asyncio
 import json
+import logging
 import os
 import time
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
-from services.linkup.schemas.single_stock_analysis_schema import SINGLE_STOCK_ANALYSIS_SCHEMA
-from services.linkup.linkup_search import linkup_structured_search
-from utils.common_helpers import unwrap_linkup
+
+from schemas.stock_report import Citation, StockReport
+from services.filings.tavily_filings import fetch_filings, needs_filings_for_request
+from services.fundamentals.finnhub_fundamentals import FundamentalsResult, fetch_fundamentals
+from services.news.tavily_news import NEWS_RECENCY_DAYS, NewsFetchResult, fetch_news
+from services.synthesis.stock_report_synthesizer import synthesize_stock_report
+
 try:
     import redis as redis_sync  # redis-py for direct Redis/Upstash (redis:// / rediss://)
 except Exception:
     redis_sync = None
 
-SINGLE_STOCK_CACHE_TTL_SEC = int(os.getenv("SINGLE_STOCK_CACHE_TTL_SEC", "86400"))  # default 24h
-LOCAL_CACHE_TTL_SEC = int(os.getenv("SINGLE_STOCK_LOCAL_CACHE_TTL_SEC", "60"))  # reduce Redis reads
+SINGLE_STOCK_CACHE_TTL_SEC = int(os.getenv("SINGLE_STOCK_CACHE_TTL_SEC", "86400"))
+LOCAL_CACHE_TTL_SEC = int(os.getenv("SINGLE_STOCK_LOCAL_CACHE_TTL_SEC", "60"))
+SINGLE_STOCK_SCHEMA_VERSION = os.getenv("SINGLE_STOCK_SCHEMA_VERSION", "3")
 
-_redis_client = None
+NEWS_TIMEOUT_SEC = float(os.getenv("NEWS_TIMEOUT_SEC", "10"))
+FILINGS_TIMEOUT_SEC = float(os.getenv("FILINGS_TIMEOUT_SEC", "10"))
+FUNDAMENTALS_TIMEOUT_SEC = float(os.getenv("FUNDAMENTALS_TIMEOUT_SEC", "5"))
+LLM_TIMEOUT_SEC = float(os.getenv("LLM_TIMEOUT_SEC", "100"))
+GLOBAL_TIMEOUT_SEC = float(os.getenv("GLOBAL_TIMEOUT", os.getenv("GLOBAL_TIMEOUT_SEC", "1000")))
 
-def _get_redis_client():
+_redis_client: Optional[Any] = None
+_LOCAL_CACHE: dict[str, tuple[float, Any]] = {}
+_MISS = object()
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class TimeBudget:
+    total_sec: float
+    start: float = field(default_factory=time.perf_counter)
+
+    def remaining(self) -> float:
+        return max(0.0, self.total_sec - (time.perf_counter() - self.start))
+
+
+def _get_redis_client() -> Optional[Any]:
     global _redis_client
     if _redis_client is not None:
         return _redis_client
@@ -35,9 +62,6 @@ def _get_redis_client():
         _redis_client = None
     return _redis_client
 
-# small in-process cache to avoid repeated Redis GETs on the same key within a short window
-_LOCAL_CACHE: dict[str, tuple[float, Any]] = {}
-_MISS = object()
 
 def _local_get(key: str) -> Optional[Any]:
     if LOCAL_CACHE_TTL_SEC <= 0:
@@ -56,106 +80,6 @@ def _local_set(key: str, val: Any) -> None:
     if LOCAL_CACHE_TTL_SEC <= 0:
         return
     _LOCAL_CACHE[key] = (time.time() + LOCAL_CACHE_TTL_SEC, val)
-
-# ============================================================
-# 2. Instruction builder for Linkup / LLM
-# ============================================================
-
-def build_single_stock_query(
-    symbol: str,
-    base_currency: str = "USD",
-    metrics_for_symbol: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-
-    return {
-        "role": (
-            "You are a professional equity research analyst. "
-            "You produce a structured, in-depth but accessible profile for a single stock. "
-            "You MUST return ONLY valid JSON that matches SINGLE_STOCK_SUMMARY_SCHEMA. "
-            "You are not permitted to give personalized investment advice or trading recommendations."
-        ),
-        "step_1_task": [
-            "Explain what this company does, how it makes money, and where it sits in its industry.",
-            "Summarize financial and operating trends (revenue, profitability, leverage, cash flows) "
-            "based on recent filings and credible sources, without fabricating exact numbers.",
-            "Describe recent material events (earnings, guidance changes, major product launches, "
-            "regulatory actions, large deals) and their likely relevance for investors.",
-            "Summarize current sentiment and typical investment thesis (bull, base, bear).",
-            "Outline key risks, structural tailwinds/headwinds, and provide a qualitative valuation context.",
-        ],
-        "step_2_context": [
-            f"Focus on the stock identified by ticker symbol: {symbol}.",
-            f"Assume the user's base currency is {base_currency}. Currency matters only for narrative context; "
-            "do not compute portfolio-level P&L here.",
-            "Treat deterministic metrics in metrics_for_symbol as read-only facts if provided. "
-            "You may reference them qualitatively (e.g. 'The stock has been volatile recently'), "
-            "but do NOT override or recompute them.",
-            "Assume a sophisticated but non-professional audience: avoid jargon where possible, "
-            "explain it briefly when unavoidable.",
-        ],
-        "step_3_references": [
-            "Use credible sources: company filings, investor presentations, major financial news outlets, "
-            "and reliable market data providers.",
-            "Whenever you rely on an external source, include inline citations in the form 【source†L#-L#】 "
-            "inside the relevant text field.",
-            "If you cannot find solid support for a specific detail (e.g., an exact margin or revenue number), "
-            "either speak qualitatively (e.g. 'high', 'moderate', 'declining') or omit the detail. Do NOT guess.",
-        ],
-        "step_4_evaluate": [
-            "Check that your narrative is internally consistent and grounded in cited sources.",
-            "Avoid unsupported strong claims such as 'this stock is cheap/expensive' unless backed by clear context; "
-            "prefer 'often discussed as richly valued vs peers' with citations.",
-            "Ensure you do NOT use words that can be interpreted as direct investment advice: "
-            "avoid 'you should buy', 'you should sell', 'this is a buy/hold/sell', 'add', 'trim', or "
-            "specific allocation instructions.",
-            "If you are uncertain or the data is limited (e.g., for a very small or illiquid name), "
-            "lower the relevant section_confidence and mention these limitations explicitly.",
-        ],
-        "step_5_iterate": [
-            "After drafting the full JSON, perform one pass to simplify wording where possible, "
-            "and to remove any implied recommendation or prescriptive language.",
-            "Make sure the disclaimer clearly states that this is general, informational analysis only, "
-            "not personalized advice.",
-        ],
-        "constraints": [
-            "STRICTLY conform to SINGLE_STOCK_SUMMARY_SCHEMA.",
-            "Return ONLY JSON, no markdown, no prose outside the JSON.",
-            "Do NOT make up detailed numeric fundamentals (revenue, EPS, margins, price targets) "
-            "if they are not clearly supported by sources.",
-            "It is always acceptable to say 'information not clearly available from public sources' "
-            "rather than hallucinate.",
-            "All content is informational and educational, not investment, tax, or legal advice.",
-        ],
-    "stock_context": {
-            "symbol": symbol,
-            "base_currency": base_currency,
-            "metrics_for_symbol": metrics_for_symbol or {},
-        },
-    }
-
-
-# ============================================================
-# 3. Cache helpers (shared across users)
-# ============================================================
-
-def _build_cache_key(
-    symbol: str,
-    base_currency: str,
-    metrics_for_symbol: Optional[Dict[str, Any]],
-) -> str:
-    """
-    Build a deterministic key so cached analyses are reused across users.
-    Metrics are hashed to keep the key small.
-    """
-    metrics_hash = "nometrics"
-    if metrics_for_symbol:
-        try:
-            blob = json.dumps(metrics_for_symbol, sort_keys=True, default=str)
-        except Exception:
-            blob = repr(metrics_for_symbol)
-        metrics_hash = hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]
-
-    return f"linkup:single_stock:{symbol.upper()}:{base_currency.upper()}:{metrics_hash}"
 
 
 def _cache_get(key: str) -> Optional[Dict[str, Any]]:
@@ -189,51 +113,322 @@ def _cache_set(key: str, payload: Dict[str, Any]) -> None:
         client.set(key, json.dumps(payload), ex=SINGLE_STOCK_CACHE_TTL_SEC)
         _local_set(key, payload)
     except Exception:
-        # Fail soft if Redis is unavailable
         pass
 
 
-# ============================================================
-# 4. Convenience function to call Linkup
-# ============================================================
-
-def call_link_up_for_single_stock(
+def _build_cache_key(
     symbol: str,
-    base_currency: Optional[str] = None,
-    metrics_for_symbol: Optional[Dict[str, Any]] = None,
-) -> Dict[str, Any]:
-    normalized_base_currency = (base_currency or "USD").upper()
-    cache_key = _build_cache_key(
-        symbol=symbol,
-        base_currency=normalized_base_currency,
-        metrics_for_symbol=metrics_for_symbol,
+    base_currency: str,
+    needs_filings: bool,
+    prefix: str = "openai:stock_report",
+) -> str:
+    asof_bucket = time.strftime("%Y-%m-%d", time.gmtime())
+    return (
+        f"{prefix}:{symbol.upper()}:{base_currency.upper()}:{int(needs_filings)}:"
+        f"{asof_bucket}:{SINGLE_STOCK_SCHEMA_VERSION}"
     )
 
+
+def _cap_timeout(requested: float, budget: TimeBudget) -> float:
+    remaining = budget.remaining()
+    if remaining <= 0:
+        return 0.0
+    return min(requested, remaining)
+
+
+async def _timed_call(
+    name: str,
+    timeout_s: float,
+    coro: Any,
+    default: Any,
+    data_gaps: list[str],
+) -> Any:
+    if timeout_s <= 0:
+        data_gaps.append(f"{name} skipped due to global timeout budget")
+        return default
+
+    start = time.perf_counter()
+    try:
+        return await asyncio.wait_for(coro, timeout=timeout_s)
+    except asyncio.TimeoutError:
+        data_gaps.append(f"{name} timed out after {timeout_s:.1f}s")
+        return default
+    except Exception as exc:
+        data_gaps.append(f"{name} failed: {exc}")
+        return default
+    finally:
+        duration_ms = int((time.perf_counter() - start) * 1000)
+        print("[single_stock_analysis] %s duration_ms=%s", name, duration_ms)
+
+
+def _build_citations(news_items: list[dict[str, Any]], filing_items: list[dict[str, Any]]) -> list[Citation]:
+    citations: list[Citation] = []
+    for item in news_items:
+        citations.append(
+            Citation.model_validate(
+                {
+                    "id": item.get("id"),
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                    "source": item.get("source_domain") or item.get("source"),
+                    "published_at": item.get("published_at"),
+                }
+            )
+        )
+    for item in filing_items:
+        citations.append(
+            Citation.model_validate(
+                {
+                    "id": item.get("id"),
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                    "source": item.get("source"),
+                    "published_at": item.get("published_at"),
+                }
+            )
+        )
+    return citations
+
+
+def _build_fallback_report(
+    *,
+    symbol: str,
+    as_of: str,
+    data_gaps: list[str],
+    citations: list[Citation],
+    fundamentals: Optional[dict[str, Any]] = None,
+) -> StockReport:
+    normalized = (fundamentals or {}).get("normalized") if isinstance(fundamentals, dict) else {}
+    snapshot = {
+        "market_cap": normalized.get("market_cap"),
+        "pe_ttm": normalized.get("pe_ttm"),
+        "revenue_growth_yoy": normalized.get("revenue_growth_yoy"),
+        "gross_margin": normalized.get("gross_margin"),
+        "operating_margin": normalized.get("operating_margin"),
+        "free_cash_flow": normalized.get("free_cash_flow"),
+        "debt_to_equity": normalized.get("debt_to_equity"),
+        "summary": "Fundamentals are limited or unavailable in this run.",
+    }
+    payload = {
+        "symbol": symbol,
+        "as_of": as_of,
+        "quick_take": "Full synthesis unavailable due to data limits.",
+        "what_changed_recently": [],
+        "fundamentals_snapshot": snapshot,
+        "catalysts_next_30_90d": [],
+        "risks": [],
+        "sentiment": {
+            "overall": "neutral",
+            "drivers": [],
+            "sources": [],
+        },
+        "scenarios": {
+            "bull": {
+                "thesis": "Insufficient data to outline a bull case.",
+                "key_assumptions": [],
+                "watch_items": [],
+                "sources": [],
+            },
+            "base": {
+                "thesis": "Insufficient data to outline a base case.",
+                "key_assumptions": [],
+                "watch_items": [],
+                "sources": [],
+            },
+            "bear": {
+                "thesis": "Insufficient data to outline a bear case.",
+                "key_assumptions": [],
+                "watch_items": [],
+                "sources": [],
+            },
+        },
+        "confidence": {
+            "score_0_100": 20,
+            "rationale": "Report generated with limited data and/or timeouts.",
+        },
+        "citations": citations,
+        "data_gaps": data_gaps,
+    }
+    return StockReport.model_validate(payload)
+
+
+async def analyze_stock_async(
+    symbol: str,
+    base_currency: str,
+    metrics_for_symbol: Optional[Dict[str, Any]] = None,
+    holdings: Optional[list[Any]] = None,
+    *,
+    allowed_domains: Optional[list[str]] = None,
+    user_request: Optional[str] = None,
+    needs_filings: bool = False,
+    cik: Optional[str] = None,
+) -> Dict[str, Any]:
+    del holdings
+    del allowed_domains
+
+    pipeline_start = time.perf_counter()
+    normalized_base_currency = (base_currency or "USD").upper()
+    clean_symbol = (symbol or "").strip().upper()
+    if not clean_symbol:
+        raise ValueError("Missing symbol")
+
+    needs_filings_flag = needs_filings_for_request(user_request, needs_filings)
+    cache_key = _build_cache_key(
+        symbol=clean_symbol,
+        base_currency=normalized_base_currency,
+        needs_filings=needs_filings_flag,
+    )
     cached = _cache_get(cache_key)
     if cached:
+        duration_ms = int((time.perf_counter() - pipeline_start) * 1000)
+        print("[single_stock_analysis] cache_hit duration_ms=%s", duration_ms)
         return cached
 
-    instruction = build_single_stock_query(
-        symbol=symbol,
-        base_currency=normalized_base_currency,
-        metrics_for_symbol=metrics_for_symbol,
-    )
+    data_gaps: list[str] = []
+    budget = TimeBudget(total_sec=GLOBAL_TIMEOUT_SEC)
+    as_of = datetime.now(timezone.utc).isoformat()
 
-    try:    
-        response = unwrap_linkup(linkup_structured_search(
-            query_obj=instruction,
-            schema=SINGLE_STOCK_ANALYSIS_SCHEMA,
-            days=30,
-            include_sources=False,
-            depth="standard",
-            max_retries=2,
+    company_name = None
+    if isinstance(metrics_for_symbol, dict):
+        company_name = metrics_for_symbol.get("company_name") or metrics_for_symbol.get("name")
+
+    tasks: list[tuple[str, Any]] = []
+    news_timeout = _cap_timeout(NEWS_TIMEOUT_SEC, budget)
+    if news_timeout > 0:
+        tasks.append(
+            (
+                "news",
+                _timed_call(
+                    "news",
+                    news_timeout,
+                    fetch_news(clean_symbol, company_name=company_name),
+                    NewsFetchResult(
+                        items=[],
+                        data_gaps=["News fetch unavailable"],
+                        recency_days_used=NEWS_RECENCY_DAYS,
+                    ),
+                    data_gaps,
+                ),
+            )
         )
-    )
-    except Exception as e:
-        # logger.error(f"Error occurred while fetching portfolio AI layers: {e}")
-        return {"error": str(e)}
+    else:
+        data_gaps.append("news skipped due to global timeout budget")
 
-    # Assuming Linkup client already returns Python dict. If it's a string, json.loads it here.
-    if isinstance(response, dict) and not response.get("error"):
-        _cache_set(cache_key, response)
-    return response
+    fundamentals_timeout = _cap_timeout(FUNDAMENTALS_TIMEOUT_SEC, budget)
+    if fundamentals_timeout > 0:
+        tasks.append(
+            (
+                "fundamentals",
+                _timed_call(
+                    "fundamentals",
+                    fundamentals_timeout,
+                    fetch_fundamentals(clean_symbol, timeout_s=fundamentals_timeout),
+                    FundamentalsResult({}, ["Fundamentals unavailable"]),
+                    data_gaps,
+                ),
+            )
+        )
+    else:
+        data_gaps.append("fundamentals skipped due to global timeout budget")
+
+    if needs_filings_flag:
+        filings_timeout = _cap_timeout(FILINGS_TIMEOUT_SEC, budget)
+        if filings_timeout > 0:
+            tasks.append(
+                (
+                    "filings",
+                    _timed_call(
+                        "filings",
+                        filings_timeout,
+                        fetch_filings(clean_symbol, needs_filings=True, cik=cik),
+                        [],
+                        data_gaps,
+                    ),
+                )
+            )
+        else:
+            data_gaps.append("filings skipped due to global timeout budget")
+    else:
+        data_gaps.append("filings skipped (not requested)")
+
+    results = await asyncio.gather(*[task for _, task in tasks])
+    result_map = {name: result for (name, _), result in zip(tasks, results)}
+
+    news_result = result_map.get("news")
+    recency_days_used = None
+    if isinstance(news_result, NewsFetchResult):
+        news_items = news_result.items
+        recency_days_used = news_result.recency_days_used
+        data_gaps.extend(news_result.data_gaps)
+    else:
+        news_items = news_result or []
+    fundamentals_result = result_map.get("fundamentals")
+    if not isinstance(fundamentals_result, FundamentalsResult):
+        fundamentals_result = FundamentalsResult({}, ["Fundamentals unavailable"])
+    filing_items = result_map.get("filings") or []
+
+    data_gaps.extend(fundamentals_result.gaps)
+    if not news_items:
+        data_gaps.append("No recent news found")
+    if needs_filings_flag and not filing_items:
+        data_gaps.append("No recent filings found")
+
+    citations = _build_citations(news_items, filing_items)
+    inputs = {
+        "symbol": clean_symbol,
+        "as_of": as_of,
+        "fundamentals": fundamentals_result.data,
+        "news": news_items,
+        "filings": filing_items,
+        "data_gaps": data_gaps,
+        "news_recency_days": recency_days_used,
+    }
+
+    remaining_for_llm = _cap_timeout(LLM_TIMEOUT_SEC, budget)
+    if remaining_for_llm <= 0:
+        data_gaps.append("LLM synthesis skipped due to global timeout budget")
+        report = _build_fallback_report(
+            symbol=clean_symbol,
+            as_of=as_of,
+            data_gaps=data_gaps,
+            citations=citations,
+            fundamentals=fundamentals_result.data,
+        )
+        payload = report.model_dump()
+        _cache_set(cache_key, payload)
+        duration_ms = int((time.perf_counter() - pipeline_start) * 1000)
+        print("[single_stock_analysis] completed_fallback duration_ms=%s", duration_ms)
+        return payload
+
+    try:
+        llm_start = time.perf_counter()
+        report = await synthesize_stock_report(
+            inputs,
+            model="gpt-5-mini",
+            timeout_s=remaining_for_llm,
+        )
+        llm_ms = int((time.perf_counter() - llm_start) * 1000)
+        print("[single_stock_analysis] llm duration_ms=%s", llm_ms)
+    except Exception as exc:
+        data_gaps.append(f"LLM synthesis failed: {exc}")
+        report = _build_fallback_report(
+            symbol=clean_symbol,
+            as_of=as_of,
+            data_gaps=data_gaps,
+            citations=citations,
+            fundamentals=fundamentals_result.data,
+        )
+
+    report = report.model_copy(
+        update={
+            "symbol": clean_symbol,
+            "as_of": as_of,
+            "data_gaps": data_gaps,
+            "citations": citations,
+        }
+    )
+    payload = report.model_dump()
+    _cache_set(cache_key, payload)
+    duration_ms = int((time.perf_counter() - pipeline_start) * 1000)
+    print("[single_stock_analysis] completed duration_ms=%s", duration_ms)
+    return payload
