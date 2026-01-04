@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from models.holding import Holding, HoldingOut
 from services.finnhub_service import FinnhubService
 from utils.common_helpers import to_float
-from utils.common_helpers import canonical_key
+from utils.common_helpers import canonical_key, normalize_asset_type
 from services.currency_service import get_usd_to_cad_rate
 
 def create_holding(
@@ -100,10 +100,9 @@ def enrich_holdings(
 
     for h in holdings:
         dto = _base_dto_from_row(h, currency_default)
-
-        k_full = canonical_key(h.symbol, h.type)
-        k_sym = canonical_key(h.symbol, None)
-        q = quotes.get(k_full) or quotes.get(k_sym)
+        typ_n = normalize_asset_type(h.type)
+        k_full = canonical_key(h.symbol, typ_n)
+        q = quotes.get(k_full)
 
         qty = to_float(h.quantity)
 
@@ -134,85 +133,75 @@ async def get_holdings_with_live_prices(
     top_n: int = 5,
     include_weights: bool = True,
 ) -> Dict[str, Any]:
+    # 1. Fetch rows (Holding objects with .currency attribute)
     rows = get_all_holdings(user_id, db)
     as_of = int(time.time())
-    currency_up = currency.upper()
+    target_curr = currency.upper()
 
     if not rows:
-        return {
-            "items": [],
-            "top_items": [],
-            "as_of": as_of,
-            "price_status": "live",
-            "currency": currency_up,
-        }
+        return {"items": [], "top_items": [], "as_of": as_of, "currency": target_curr}
 
-    # request pairs
-    pairs: List[Tuple[str, str]] = [
-        ((h.symbol or "").strip(), (h.type or "").strip())
-        for h in rows
-        if (h.symbol or "").strip()
-    ]
-
-    quotes_raw = await finnhub.get_prices(pairs=pairs, currency=currency_up)
-    quotes = quotes_raw or {}
-    if currency_up == "CAD":
-        usd_to_cad = await get_usd_to_cad_rate()
-
-        for k, q in quotes.items():
-            if not q:
-                continue
-
-            def conv(x):
-                if x is None:
-                    return None
-                try:
-                    return round(float(x) * usd_to_cad, 8)
-                except Exception:
-                    return None
-
-            q["currentPrice"] = conv(q.get("currentPrice"))
-            q["previousClose"] = conv(q.get("previousClose"))
-            q["high"] = conv(q.get("high"))
-            q["low"] = conv(q.get("low"))
-            q["open"] = conv(q.get("open"))
-            q["currency"] = "CAD"
-    items = enrich_holdings(rows, quotes, currency_up)
-
-    # compute position values ONCE and reuse everywhere
-    valued: List[Tuple[float, HoldingOut]] = []
+    # 2. Map rows for easy lookup during enrichment
+    rows_map = {h.id: h for h in rows}
+    
+    # 3. Fetch raw prices (Finnhub typically returns USD for US stocks/crypto)
+    pairs = [((h.symbol or "").strip(), normalize_asset_type(h.type) or "equity") for h in rows]
+    quotes = await finnhub.get_prices_cached(pairs=pairs, currency="USD")
+    
+    usd_to_cad_rate = await get_usd_to_cad_rate()
+    enriched_items = enrich_holdings(rows, quotes, "USD")
+    
     market_value = 0.0
+    valued: List[Tuple[float, HoldingOut]] = []
 
-    for it in items:
-        v = max(to_float(getattr(it, "value", 0.0) or getattr(it, "current_value", 0.0)), 0.0)
+    for it in enriched_items:
+        # Get the original database row to check its specific currency
+        original_row = rows_map.get(it.id)
+        db_currency = (getattr(original_row, "currency", "USD") or "USD").upper()
+        qty = to_float(it.quantity)
 
-        # fallback if value wasn’t present for some reason
-        if v <= 0:
-            v = max(to_float(getattr(it, "current_price", 0.0)) * to_float(getattr(it, "quantity", 0.0)), 0.0)
-        v = round(v, 8)
-        it.value = v
-        it.current_value = v
+        # --- STEP 1: Handle Live Price (Finnhub USD -> Target) ---
+        # Finnhub results are in USD. If target is CAD, convert.
+        if target_curr == "CAD":
+            it.current_price = round(to_float(it.current_price) * usd_to_cad_rate, 8)
+            if it.previous_close:
+                it.previous_close = round(it.previous_close * usd_to_cad_rate, 8)
+        elif target_curr == "USD":
+            # Already in USD from Finnhub, no conversion needed
+            pass
 
-        market_value += v
-        valued.append((v, it))
+        # --- STEP 2: Handle Cost Basis (DB Currency -> Target) ---
+        # If the DB stores CAD but we want USD portfolio view
+        if db_currency == "CAD" and target_curr == "USD":
+            it.purchase_unit_price = round(to_float(it.purchase_unit_price) / usd_to_cad_rate, 8)
+            it.purchase_amount_total = round(to_float(it.purchase_amount_total) / usd_to_cad_rate, 8)
+        
+        # If the DB stores USD but we want CAD portfolio view
+        elif db_currency == "USD" and target_curr == "CAD":
+            it.purchase_unit_price = round(to_float(it.purchase_unit_price) * usd_to_cad_rate, 8)
+            it.purchase_amount_total = round(to_float(it.purchase_amount_total) * usd_to_cad_rate, 8)
 
-    # derived fields (weight + P/L) using cached values
+        # --- STEP 3: Finalize Values ---
+        it.currency = target_curr
+        calc_val = round(to_float(it.current_price) * qty, 8)
+        
+        it.value = calc_val
+        it.current_value = calc_val
+        
+        market_value += calc_val
+        valued.append((calc_val, it))
+
+    # 4. Weights and P/L
     for v, it in valued:
-        if include_weights and market_value > 0 and v > 0:
-            it.weight = round(v / market_value * 100.0, 8)
-        else:
-            it.weight = None
-
+        it.weight = round(v / market_value * 100.0, 8) if market_value > 0 else 0.0
         _compute_pl_fields(it)
 
-    # top items WITHOUT sorting the full list
-    n = max(1, top_n)
-    top_items = [it for _, it in heapq.nlargest(n, valued, key=lambda t: t[0])]
+    top_items = [it for _, it in heapq.nlargest(top_n, valued, key=lambda t: t[0])]
 
     return {
-        "items": top_items if top_only else items,
+        "items": top_items if top_only else enriched_items,
         "top_items": top_items,
+        "market_value": market_value,
         "as_of": as_of,
-        "price_status": "live",
-        "currency": currency_up,
+        "currency": target_curr,
     }

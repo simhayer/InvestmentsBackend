@@ -29,3 +29,12 @@ class User(Base):
         default="default",
         nullable=False,
     )
+
+    onboarding_profile = relationship(
+        "UserOnboardingProfile",
+        back_populates="user",
+        uselist=False,
+        cascade="all, delete-orphan",
+    )
+
+    subscription = relationship("UserSubscription", back_populates="user", uselist=False)

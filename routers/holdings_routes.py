@@ -52,7 +52,7 @@ async def get_holdings(
     )
 
 @router.delete("/holdings/{holding_id}")
-def delete_holding(
+def delete_holding( 
     holding_id: int,
     db: Session = Depends(get_db),
     user=Depends(get_current_db_user),
