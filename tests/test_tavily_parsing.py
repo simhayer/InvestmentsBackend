@@ -26,7 +26,8 @@ class TavilyParsingTests(unittest.TestCase):
                 "published_date": "2024-01-05",
             },
         ]
-        items = normalize_news_results(results, max_items=2)
+        result = normalize_news_results(results, max_items=2, recency_days=3650, min_recent_items=0)
+        items = result.items
         self.assertEqual(len(items), 2)
         self.assertEqual(items[0]["url"], "https://example.com/b")
         self.assertEqual(items[0]["id"], "news_1")

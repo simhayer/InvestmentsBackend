@@ -14,7 +14,7 @@ from typing import Any, Dict, Optional
 from schemas.stock_report import Citation, StockReport
 from services.filings.tavily_filings import fetch_filings, needs_filings_for_request
 from services.fundamentals.finnhub_fundamentals import FundamentalsResult, fetch_fundamentals
-from services.news.tavily_news import fetch_news
+from services.news.tavily_news import NEWS_RECENCY_DAYS, NewsFetchResult, fetch_news
 from services.synthesis.stock_report_synthesizer import synthesize_stock_report
 
 try:
@@ -170,7 +170,7 @@ def _build_citations(news_items: list[dict[str, Any]], filing_items: list[dict[s
                     "id": item.get("id"),
                     "title": item.get("title"),
                     "url": item.get("url"),
-                    "source": item.get("source"),
+                    "source": item.get("source_domain") or item.get("source"),
                     "published_at": item.get("published_at"),
                 }
             )
@@ -302,7 +302,11 @@ async def analyze_stock_async(
                     "news",
                     news_timeout,
                     fetch_news(clean_symbol, company_name=company_name),
-                    [],
+                    NewsFetchResult(
+                        items=[],
+                        data_gaps=["News fetch unavailable"],
+                        recency_days_used=NEWS_RECENCY_DAYS,
+                    ),
                     data_gaps,
                 ),
             )
@@ -350,7 +354,14 @@ async def analyze_stock_async(
     results = await asyncio.gather(*[task for _, task in tasks])
     result_map = {name: result for (name, _), result in zip(tasks, results)}
 
-    news_items = result_map.get("news") or []
+    news_result = result_map.get("news")
+    recency_days_used = None
+    if isinstance(news_result, NewsFetchResult):
+        news_items = news_result.items
+        recency_days_used = news_result.recency_days_used
+        data_gaps.extend(news_result.data_gaps)
+    else:
+        news_items = news_result or []
     fundamentals_result = result_map.get("fundamentals")
     if not isinstance(fundamentals_result, FundamentalsResult):
         fundamentals_result = FundamentalsResult({}, ["Fundamentals unavailable"])
@@ -370,6 +381,7 @@ async def analyze_stock_async(
         "news": news_items,
         "filings": filing_items,
         "data_gaps": data_gaps,
+        "news_recency_days": recency_days_used,
     }
 
     remaining_for_llm = _cap_timeout(LLM_TIMEOUT_SEC, budget)

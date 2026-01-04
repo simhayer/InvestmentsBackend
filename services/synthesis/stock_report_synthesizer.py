@@ -22,6 +22,10 @@ Rules:
 - Every claim about current events must cite source IDs in the "sources" fields.
 - Use the provided source IDs exactly (e.g., "news_2", "filing_1").
 - Populate "citations" from the provided items; do not add new IDs.
+- For what_changed_recently, only use news items with published_at within the recency window (see input) or filings/press releases.
+- Do not treat quote pages or price pages as news events.
+- If there are not enough recent items, say so explicitly and reflect the data gap.
+- Any event bullet must include at least one source id whose published_at is not null or is from a filing/press release.
 - If information is insufficient, keep sections short and note the limitation.
 """.strip()
 
@@ -31,7 +35,7 @@ def _build_model_settings(model: str) -> ModelSettings:
     return base_settings.resolve(
         ModelSettings(
             tool_choice="none",
-            reasoning=Reasoning(effort="low"),
+            reasoning=Reasoning(effort="medium"),
         )
     )
 
@@ -42,6 +46,7 @@ def _build_prompt(inputs: Dict[str, Any]) -> str:
         "Use the following JSON inputs to produce a StockReport.\n"
         "INPUT_JSON:\n"
         f"{payload}\n"
+        "Use news_recency_days for what_changed_recently recency filtering.\n"
         "Make sure every current event claim includes a source id in sources arrays.\n"
         "Return ONLY JSON that matches the StockReport schema."
     )
