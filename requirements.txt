@@ -16,3 +16,4 @@ yahooquery==2.4.1
 stripe==14.1.0
 openai-agents==0.6.4
 psycopg2-binary==2.9.10
+python-jose==3.11.0
