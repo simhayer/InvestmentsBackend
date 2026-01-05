@@ -56,14 +56,14 @@ def sanitize_json(obj: Any) -> Any:
     and make arrays JSON-safe. This ensures Postgres JSONB accepts the payload.
     """
     # Optional: numpy support without hard dependency
-    try:
-        import numpy as np  # type: ignore
-        if isinstance(obj, (np.floating, np.integer)):
-            obj = float(obj)
-        if isinstance(obj, np.ndarray):
-            obj = obj.tolist()
-    except Exception:
-        pass
+    # try:
+    #     import numpy as np  # type: ignore
+    #     if isinstance(obj, (np.floating, np.integer)):
+    #         obj = float(obj)
+    #     if isinstance(obj, np.ndarray):
+    #         obj = obj.tolist()
+    # except Exception:
+    #     pass
 
     # Optional: pandas NA/NaT handling without hard dependency
     try:
