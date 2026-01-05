@@ -186,9 +186,10 @@ async def fetch_filings(
     for resp in responses:
         if isinstance(resp, Exception):
             continue
-        results = resp.get("results")
-        if isinstance(results, list):
-            combined.extend(results)
+        if isinstance(resp, dict):
+            results = resp.get("results")
+            if isinstance(results, list):
+                combined.extend(results)
 
     try:
         return normalize_filing_results(combined, max_items=FILINGS_MAX_ITEMS)

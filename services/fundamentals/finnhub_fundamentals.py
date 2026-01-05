@@ -67,7 +67,7 @@ async def fetch_fundamentals(symbol: str, *, timeout_s: float = 5.0) -> Fundamen
     if isinstance(metrics_raw, Exception) or not isinstance(metrics_raw, dict) or not metrics_raw:
         gaps.append("Key metrics unavailable")
     else:
-        metrics = metrics_raw.get("metric") if isinstance(metrics_raw.get("metric"), dict) else metrics_raw
+        metrics = metrics_raw.get("metric") or {} if isinstance(metrics_raw.get("metric"), dict) else metrics_raw or {}
 
     earnings: List[Dict[str, Any]] = []
     if isinstance(earnings_raw, Exception) or not isinstance(earnings_raw, list):
