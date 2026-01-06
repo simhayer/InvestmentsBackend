@@ -7,6 +7,12 @@ from typing import Any, Dict, List, Optional
 import httpx
 
 from services.finnhub_service import FinnhubService, FinnhubServiceError
+from services.cache.cache_backend import cache_get, cache_set
+
+TTL_FUNDAMENTALS_SEC = 600
+
+def _ck_fund(symbol: str) -> str:
+    return f"FUNDAMENTALS:{(symbol or '').strip().upper()}"
 
 
 @dataclass(frozen=True)
@@ -96,3 +102,25 @@ async def fetch_fundamentals(symbol: str, *, timeout_s: float = 5.0) -> Fundamen
     }
 
     return FundamentalsResult(data=data, gaps=gaps)
+
+
+
+async def fetch_fundamentals_cached(symbol: str, *, timeout_s: float = 5.0, ttl_seconds: int = TTL_FUNDAMENTALS_SEC) -> FundamentalsResult:
+    """
+    Optional cached wrapper you can call from anywhere.
+    """
+    clean_symbol = (symbol or "").strip().upper()
+    if not clean_symbol:
+        return FundamentalsResult({}, ["Missing symbol for fundamentals"])
+
+    key = _ck_fund(clean_symbol)
+    cached = cache_get(key)
+    if isinstance(cached, dict) and "data" in cached and "gaps" in cached:
+        data = cached.get("data") or {}
+        gaps = cached.get("gaps") or []
+        if isinstance(data, dict) and isinstance(gaps, list):
+            return FundamentalsResult(data=data, gaps=gaps)
+
+    res = await fetch_fundamentals(clean_symbol, timeout_s=timeout_s)
+    cache_set(key, {"data": res.data, "gaps": res.gaps}, ttl_seconds=ttl_seconds)
+    return res
