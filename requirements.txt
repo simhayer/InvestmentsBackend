@@ -17,3 +17,6 @@ stripe==14.1.0
 openai-agents==0.6.4
 psycopg2-binary==2.9.11
 python-jose==3.5.0
+python-jose==3.5.0
+pgvector==0.4.2
+sec-parser==0.58.1
