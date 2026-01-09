@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from utils.common_helpers import canonical_key, safe_json, normalize_asset_type
 from services.cache.cache_backend import cache_get_many, cache_set_many
+import finnhub
 
 TTL_FINNHUB_QUOTE_SEC = 60
 
@@ -92,6 +93,12 @@ class FinnhubService:
 
     def _auth_params(self, **params: Any) -> Dict[str, Any]:
         return {**params, "token": self.api_key}
+    
+    def get_finnhub_client(self) -> finnhub.Client:
+        """Returns a synchronous Finnhub client using the stored API key."""
+        if not self.api_key:
+            raise FinnhubServiceError("Missing FINNHUB_API_KEY")
+        return finnhub.Client(api_key=self.api_key)
 
     # -----------------------
     # Quote (single)

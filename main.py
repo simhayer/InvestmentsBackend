@@ -21,6 +21,7 @@ from routers.onboarding_routes import router as onboarding_router
 from routers.billing_routes import router as billing_router
 from routers.crypto_routes import router as crypto_router
 from routers.v2.analyse_symbol_routes import router as analyse_symbol_router
+from routers.filing_routes import router as filing_router 
 
 # load crypto catalog on startup
 from contextlib import asynccontextmanager
@@ -87,5 +88,5 @@ app.include_router(market_router, prefix="/api/market")
 app.include_router(billing_router, prefix="/api/billing", tags=["billing"])
 app.include_router(onboarding_router, prefix="/api/onboarding")
 app.include_router(crypto_router, prefix="/api/crypto", tags=["crypto"])
-app.include_router(analyse_symbol_router, prefix="/api/v2/analyze-symbol", tags=["v2-analyze-symbol"])
-
+app.include_router(analyse_symbol_router, prefix="/api/v2/ai", tags=["v2-ai"])
+app.include_router(filing_router, prefix="/api/filings", tags=["filings"])

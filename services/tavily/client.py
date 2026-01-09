@@ -3,8 +3,7 @@ from __future__ import annotations
 import asyncio
 import os
 import random
-from typing import Any, Dict
-
+from typing import Any, Dict, List
 import httpx
 
 TAVILY_API_URL = os.getenv("TAVILY_API_URL", "https://api.tavily.com/search")
@@ -29,7 +28,7 @@ async def search(
     max_results: int,
     include_answer: bool = False,
     include_raw_content: bool = False,
-    search_depth: str = "advanced",
+    search_depth: str = "advanced"
 ) -> Dict[str, Any]:
     if not TAVILY_API_KEY:
         raise TavilyClientError("Missing TAVILY_API_KEY")
@@ -41,6 +40,7 @@ async def search(
         "include_answer": bool(include_answer),
         "include_raw_content": bool(include_raw_content),
         "search_depth": search_depth if search_depth in {"basic", "advanced"} else "advanced",
+        "topic": "finance",
     }
 
     timeout = httpx.Timeout(TAVILY_TIMEOUT_SEC)
@@ -62,7 +62,9 @@ async def search(
                 last_exc = exc
             except httpx.HTTPError as exc:
                 last_exc = exc
-                status = getattr(exc.response, "status_code", None)
+                status = None
+                if isinstance(exc, httpx.HTTPStatusError):
+                    status = exc.response.status_code
                 if status in RETRY_STATUS_CODES and attempt < MAX_RETRIES:
                     await _backoff_sleep(attempt)
                     continue
@@ -72,3 +74,38 @@ async def search(
                 await _backoff_sleep(attempt)
 
     raise TavilyClientError(f"Tavily request failed: {last_exc}")
+
+# ----------------------------
+# 6) Tavily compaction (smaller context for LLM)
+# ----------------------------
+def compact_results(results: Any, limit: int = 6) -> str:
+    """
+    Tavily returns a dict-like structure. We keep only the top items (title/url/snippet).
+    If it's already a string, return as-is (but truncated).
+    """
+    if results is None:
+        return ""
+
+    if isinstance(results, str):
+        return results[:8000]
+
+    if isinstance(results, dict):
+        items = results.get("results") or results.get("data") or []
+        if not isinstance(items, list):
+            return str(results)[:8000]
+
+        out_lines: List[str] = []
+        for r in items[: max(1, limit)]:
+            if not isinstance(r, dict):
+                continue
+            title = (r.get("title") or "").strip()
+            url = (r.get("url") or "").strip()
+            content = (r.get("content") or r.get("snippet") or "").strip()
+            if content:
+                content = content.replace("\n", " ").strip()
+            line = f"- {title}\n  {url}\n  {content}"
+            out_lines.append(line)
+
+        return "\n".join(out_lines)[:8000]
+
+    return str(results)[:8000]
