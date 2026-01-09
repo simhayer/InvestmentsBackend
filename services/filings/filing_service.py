@@ -3,7 +3,7 @@ import warnings
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 import sec_parser as sp
-from services.finnhub_service import FinnhubService
+from services.finnhub.finnhub_service import FinnhubService
 from services.vector.vector_store_service import VectorStoreService
 from sqlalchemy.orm import Session
 

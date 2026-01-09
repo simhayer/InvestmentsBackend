@@ -8,7 +8,7 @@ import schemas.general as general
 from database import get_db
 from models.holding import Holding
 from routers.finnhub_routes import get_finnhub_service
-from services.finnhub_service import FinnhubService
+from services.finnhub.finnhub_service import FinnhubService
 from services.holding_service import get_all_holdings, get_holdings_with_live_prices, create_holding
 from services.supabase_auth import get_current_db_user
 from services.currency_service import resolve_currency

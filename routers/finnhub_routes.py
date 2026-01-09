@@ -2,7 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Any, Tuple
-from services.finnhub_service import FinnhubService, FinnhubServiceError, format_finnhub_symbol
+from services.finnhub.finnhub_service import FinnhubService, FinnhubServiceError, format_finnhub_symbol
 from cache.crypto_catalog import crypto_catalog
 from services.cache.cache_backend import cache_get, cache_set, cache_get_many, cache_set_many
 from services.cache.cache_utils import cacheable, should_cache_any_json

@@ -4,7 +4,7 @@ import heapq
 from typing import Any, Dict, List, Tuple
 from sqlalchemy.orm import Session
 from models.holding import Holding, HoldingOut
-from services.finnhub_service import FinnhubService
+from services.finnhub.finnhub_service import FinnhubService
 from utils.common_helpers import to_float
 from utils.common_helpers import canonical_key, normalize_asset_type
 from services.currency_service import get_usd_to_cad_rate

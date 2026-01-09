@@ -6,7 +6,7 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 
-from services.finnhub_service import FinnhubService, FinnhubServiceError
+from services.finnhub.finnhub_service import FinnhubService, FinnhubServiceError
 from services.cache.cache_backend import cache_get, cache_set
 
 TTL_FUNDAMENTALS_SEC = 600

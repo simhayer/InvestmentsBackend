@@ -10,7 +10,7 @@ from database import get_db
 from services.vector.vector_store_service import VectorStoreService
 from utils.common_helpers import timed
 from services.tavily.client import search as tavily_search, compact_results as compact_tavily
-from services.fundamentals.finnhub_fundamentals import fetch_fundamentals_cached
+from services.finnhub.finnhub_fundamentals import fetch_fundamentals_cached
 from services.cache.cache_backend import cache_get, cache_set
 from .types import AnalysisReport, AgentState
 
