@@ -6,6 +6,8 @@ from typing import Any, Dict
 import httpx
 import time
 from typing import Callable, Tuple, Type
+import logging
+from services.ai.analyze_symbol.types import AgentState
 
 def normalize_asset_type(typ: str | None) -> str | None:
     t = (typ or "").strip().lower()
@@ -132,3 +134,22 @@ def retry(
                 break
 
     raise RuntimeError(f"retry failed after {attempts} attempts") from err
+
+# ----------------------------
+# 4) Timing helper
+# ----------------------------
+def timed(name: str, state: AgentState, logger: logging.Logger):
+    symbol = state.get("symbol", "NA")
+    task_id = state.get("task_id", "no_task")
+
+    class _T:
+        def __enter__(self):
+            self.t0 = time.perf_counter()
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            dt = time.perf_counter() - self.t0
+            logger.info("[%s] %s: %s=%.2fs", task_id, symbol, name, dt)
+            return False
+
+    return _T()

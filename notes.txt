@@ -1,0 +1,3 @@
+Monthly cleanup job(for old filings)
+DELETE FROM company_insights 
+WHERE (metadata_info->>'fiscal_year')::int < 2021;

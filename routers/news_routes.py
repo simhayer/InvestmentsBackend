@@ -1,5 +1,5 @@
 from fastapi import APIRouter
-from services.finnhub_news_service import get_company_news_for_symbols
+from services.finnhub.finnhub_news_service import get_company_news_for_symbols
 
 router = APIRouter()
 

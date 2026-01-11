@@ -8,7 +8,7 @@ from fastapi import APIRouter, Query
 from models.user import User
 from services.portfolio_service import get_or_compute_portfolio_analysis
 from services.supabase_auth import get_current_db_user
-from services.finnhub_service import FinnhubService
+from services.finnhub.finnhub_service import FinnhubService
 from routers.finnhub_routes import get_finnhub_service
 from utils.common_helpers import unwrap_layers_for_ui
 
