@@ -3,9 +3,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
-
 import httpx
-
 from services.finnhub.finnhub_service import FinnhubService, FinnhubServiceError
 from services.cache.cache_backend import cache_get, cache_set
 
@@ -14,12 +12,10 @@ TTL_FUNDAMENTALS_SEC = 600
 def _ck_fund(symbol: str) -> str:
     return f"FUNDAMENTALS:{(symbol or '').strip().upper()}"
 
-
 @dataclass(frozen=True)
 class FundamentalsResult:
     data: Dict[str, Any]
     gaps: List[str]
-
 
 def _coerce_float(value: Any) -> Optional[float]:
     try:
@@ -29,7 +25,6 @@ def _coerce_float(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
-
 def _pick_metric(metrics: Dict[str, Any], *keys: str) -> Optional[float]:
     for key in keys:
         if key in metrics:
@@ -37,7 +32,6 @@ def _pick_metric(metrics: Dict[str, Any], *keys: str) -> Optional[float]:
             if val is not None:
                 return val
     return None
-
 
 async def fetch_fundamentals(symbol: str, *, timeout_s: float = 5.0) -> FundamentalsResult:
     clean_symbol = (symbol or "").strip().upper()

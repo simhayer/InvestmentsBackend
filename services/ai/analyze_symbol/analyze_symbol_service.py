@@ -5,20 +5,21 @@ import logging
 import asyncio
 from typing import Dict, Any
 from langgraph.graph import StateGraph, END
-from langchain_openai import ChatOpenAI
+from services.openai.client import llm
 from database import get_db
 from services.vector.vector_store_service import VectorStoreService
 from utils.common_helpers import timed
 from services.tavily.client import search as tavily_search, compact_results as compact_tavily
 from services.finnhub.finnhub_fundamentals import fetch_fundamentals_cached
 from services.cache.cache_backend import cache_get, cache_set
+from services.yahoo_service import get_price_history
+from services.ai.technicals_pack import build_technical_pack, compact_tech_pack
+from services.finnhub.finnhub_news_service import get_company_news_cached, shrink_news_items
 from .types import AnalysisReport, AgentState
 
 logger = logging.getLogger("analysis_timing")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
-
-llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o"), temperature=0)
 
 def _preview(s: str, n: int = 220) -> str:
     s = (s or "").strip().replace("\n", " ")
@@ -37,12 +38,21 @@ def _ck_tav(symbol: str) -> str:
 def _ck_task(task_id: str) -> str:
     return f"ANALYZE:TASK:{(task_id or '').strip()}"
 
+async def _fetch_history_points(symbol: str, period="1y", interval="1d"):
+    res = await asyncio.to_thread(get_price_history, symbol, period, interval)
+    if isinstance(res, dict) and res.get("status") == "ok":
+        return res.get("points") or []
+    return []
+
 # ----------------------------
 # Graph Nodes
 # ----------------------------
 async def research_node(state: AgentState):
     symbol = state.get("symbol") or ""
 
+    # ----------------------------
+    # 1) Fundamentals (same)
+    # ----------------------------
     fin_key = _ck_fund(symbol)
     cached_f = cache_get(fin_key)
     if isinstance(cached_f, dict) and "data" in cached_f and "gaps" in cached_f:
@@ -53,36 +63,72 @@ async def research_node(state: AgentState):
             finres = await fetch_fundamentals_cached(symbol, timeout_s=5.0)
         finnhub_data = finres.data
         finnhub_gaps = finres.gaps
-        cache_set(fin_key, {"data": finnhub_data, "gaps": finnhub_gaps}, ttl_seconds=TTL_FUNDAMENTALS_SEC)
+        cache_set(
+            fin_key,
+            {"data": finnhub_data, "gaps": finnhub_gaps},
+            ttl_seconds=TTL_FUNDAMENTALS_SEC,
+        )
 
-    raw_str = ""
-    tav_key = _ck_tav(symbol)
-    cached_t = cache_get(tav_key)
-    if isinstance(cached_t, str):
-        raw_str = cached_t
-    elif isinstance(cached_t, dict) and "raw" in cached_t and isinstance(cached_t["raw"], str):
-        raw_str = cached_t["raw"]
-    else:
-        if tavily_search is None:
-            raw_str = ""
+    # ----------------------------
+    # 2) News (Finnhub cached) + optional Tavily fallback
+    # ----------------------------
+    news_items = []
+    news_compact = ""
+
+    used_tavily = False
+
+    try:
+        with timed("finnhub_news", state, logger):
+            news_payload = await get_company_news_cached(symbol, days_back=10, limit=8)
+            print(f"DEBUG: Found {len(news_payload.get('items', []))} items for {symbol}")
+        news_items = news_payload.get("items") or []
+        news_compact = news_payload.get("compact") or ""
+        logger.info("[%s] %s: finnhub_news_items=%d compact_chars=%d",
+            state.get("task_id","no_task"),
+            symbol,
+            len(news_items),
+            len(news_compact or "")
+        )
+    except Exception:
+        news_items = []
+        news_compact = ""
+
+    # Keep your existing "raw_data" contract for now:
+    raw_str = news_compact
+
+    if (len(news_items) < 3) and tavily_search is not None:
+        tav_key = _ck_tav(symbol)
+        cached_t = cache_get(tav_key)
+
+        if isinstance(cached_t, str):
+            raw_str = cached_t
+            used_tavily = True
+        elif isinstance(cached_t, dict) and isinstance(cached_t.get("raw"), str):
+            raw_str = cached_t["raw"]
+            used_tavily = True
         else:
             try:
                 with timed("tavily_search", state, logger):
                     results = await tavily_search(
                         query=f"latest news, catalysts, and bear case for {symbol}",
-                        max_results=8,
+                        max_results=6,
                         include_answer=False,
                         include_raw_content=False,
                         search_depth="advanced",
                     )
                 raw_str = compact_tavily(results)
                 cache_set(tav_key, {"raw": raw_str}, ttl_seconds=TTL_TAVILY_SEC)
+                used_tavily = True
             except Exception:
-                # do not fail the whole analysis if tavily fails
-                raw_str = ""
+                # keep Finnhub news compact if Tavily fails
+                raw_str = news_compact
 
+    # ----------------------------
+    # 3) SEC vector context (same)
+    # ----------------------------
     sec_context = ""
     sec_debug: Dict[str, Any] = {"count": 0, "chunks": []}
+
     try:
         db_gen = get_db()
         db = next(db_gen)
@@ -109,7 +155,8 @@ async def research_node(state: AgentState):
 
         if sec_chunks:
             sec_context = "\n".join(
-                f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')} | {c.get('metadata', {}).get('filing_id','?')}) {c['content']}"
+                f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')} | "
+                f"{c.get('metadata', {}).get('filing_id','?')}) {c['content']}"
                 for c in sec_chunks
             )[:8000]
         else:
@@ -123,24 +170,42 @@ async def research_node(state: AgentState):
         except Exception:
             pass
 
+    # ----------------------------
+    # 4) Debug + return state
+    # ----------------------------
     debug = {
         "symbol": symbol,
         "finnhub": {
             "gaps": finnhub_gaps,
             "top_keys": sorted(list(finnhub_data.keys()))[:40],
         },
+        "news": {
+            "count": len(news_items),
+            "compact_chars": len(news_compact or ""),
+            "used_finnhub": bool(news_items),
+            "used_tavily": used_tavily,
+        },
         "tavily": {
             "chars": len(raw_str or ""),
             "preview": _preview(raw_str, 280),
-            "used": bool(raw_str),
+            "used": used_tavily,
         },
         "sec": {
             "chars": len(sec_context or ""),
             **sec_debug,
         },
     }
-    return {"raw_data": raw_str, "finnhub_data": finnhub_data, "finnhub_gaps": finnhub_gaps, "sec_context": sec_context, "debug": debug}
 
+    return {
+        "raw_data": raw_str,          # keeps your current prompts working
+        "news_items": news_items,     # NEW: structured news for higher-quality prompting
+        "finnhub_data": finnhub_data,
+        "finnhub_gaps": finnhub_gaps,
+        "sec_context": sec_context,
+        "debug": debug,
+    }
+
+import json
 
 async def drafts_node(state: AgentState):
     """
@@ -151,9 +216,28 @@ async def drafts_node(state: AgentState):
 
     finnhub_data = state.get("finnhub_data", {})
     finnhub_gaps = state.get("finnhub_gaps", [])
-    raw_data = state.get("raw_data", "")
+    news_items = state.get("news_items", [])
+    news_items_small = shrink_news_items(news_items, 8, 220)
+    news_json = json.dumps(news_items_small, ensure_ascii=False)
     sec_context = state.get("sec_context", "")
 
+    price_points, bench_points = await asyncio.gather(
+        _fetch_history_points(symbol, "2y", "1d"),
+        _fetch_history_points("SPY", "2y", "1d"),
+    )
+    tech_pack = build_technical_pack(
+        symbol=symbol,
+        points=price_points,
+        benchmark_symbol="SPY",
+        benchmark_points=bench_points,
+    )
+
+    tech_quality_note = ""
+    if tech_pack.get("is_empty") or tech_pack.get("data_quality", {}).get("warning"):
+        tech_quality_note = f"\nTECHNICAL DATA WARNING: {tech_pack.get('data_quality')}\n"
+
+    tech_pack = compact_tech_pack(tech_pack)
+    
     async def do_fundamentals():
         with timed("llm_fundamentals", state, logger):
             prompt = f"""
@@ -168,8 +252,8 @@ async def drafts_node(state: AgentState):
                 FINNHUB GAPS:
                 {finnhub_gaps}
 
-                WEB/NEWS CONTEXT (may be empty):
-                {raw_data}
+                COMPANY NEWS (Finnhub, dated, contextual): 
+                {news_json}
 
                 Task:
                 Write 3-6 Key Insights as short bullets.
@@ -183,24 +267,19 @@ async def drafts_node(state: AgentState):
     async def do_technicals():
         with timed("llm_technicals", state, logger):
             prompt = f"""
-                Write the Current Performance for {symbol}.
+            Write a short "Market Performance" section for {symbol} using ONLY the data below.
 
-                SEC FILING CONTEXT (authoritative, may be empty):
-                {sec_context}
+            DATA (do not invent anything):
+            {tech_pack}
+            {tech_quality_note}
 
-                FINNHUB SNAPSHOT:
-                {finnhub_data}
-
-                WEB/NEWS CONTEXT (may be empty):
-                {raw_data}
-
-                Task:
-                Write a short paragraph on current performance:
-                - recent trend / sentiment
-                - earnings reaction (if present)
-                - volatility / momentum qualitatively
-                Do NOT invent RSI or indicator values if not present in the data.
-                """
+            Rules:
+            - Mention returns over common timeframes if available (1D, 1W/5D, 1M, 3M, 6M, 1Y)
+            - Mention trend vs moving averages (20/50/200) if present
+            - Mention volatility and drawdowns if present
+            - If relative vs SPY exists, say outperform/underperform with timeframe
+            - If missing, say "Not available"
+            """
             res = await llm.ainvoke(prompt)
         return res.content or ""
 
@@ -215,8 +294,7 @@ async def drafts_node(state: AgentState):
                 FINNHUB DATA:
                 {finnhub_data}
 
-                WEB/NEWS CONTEXT (may be empty):
-                {raw_data}
+                COMPANY NEWS (Finnhub, dated, contextual): {news_json}:
 
                 Task:
                 List 4-8 risks as short bullets. Avoid generic one-word risks.
@@ -245,7 +323,9 @@ async def analyst_structured_node(state: AgentState):
 
     finnhub_data = state.get("finnhub_data", {})
     finnhub_gaps = state.get("finnhub_gaps", [])
-    raw_data = state.get("raw_data", "")
+    news_items = state.get("news_items", [])
+    news_items_small = shrink_news_items(news_items, 8, 220)
+    news_json = json.dumps(news_items_small, ensure_ascii=False)
     sec_context = state.get("sec_context", "")
 
     with timed("llm_analyst_structured", state, logger):
@@ -293,8 +373,8 @@ async def analyst_structured_node(state: AgentState):
             FINNHUB GAPS:
             {finnhub_gaps}
 
-            WEB/NEWS CONTEXT:
-            {raw_data}
+            COMPANY NEWS (Finnhub, dated, contextual): 
+            {news_json}
 
             DRAFT INSIGHTS:
             {state.get('fundamentals', '')}
