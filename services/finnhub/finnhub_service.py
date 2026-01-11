@@ -457,3 +457,39 @@ class FinnhubService:
             else:
                 out[sym] = float(res)
         return out
+    
+    async def fetch_earnings_calendar(
+        self,
+        *,
+        from_date: str,
+        to_date: str,
+        symbol: Optional[str] = None,
+        international: bool = False,
+        client: Optional[httpx.AsyncClient] = None,
+    ) -> Dict[str, Any]:
+        """
+        /calendar/earnings?from=YYYY-MM-DD&to=YYYY-MM-DD&symbol=AAPL
+        """
+        fd = (from_date or "").strip()
+        td = (to_date or "").strip()
+        sym = (symbol or "").strip().upper()
+
+        if not fd or not td:
+            return {}
+
+        params = {
+            "from": fd,
+            "to": td,
+            "international": "true" if international else "false",
+            "token": self.api_key,
+        }
+        if sym:
+            params["symbol"] = sym
+
+        async with self._client(client) as c:
+            try:
+                r = await c.get(f"{self.BASE_URL}/calendar/earnings", params=params)
+                r.raise_for_status()
+                return safe_json(r) or {}
+            except Exception:
+                return {}
