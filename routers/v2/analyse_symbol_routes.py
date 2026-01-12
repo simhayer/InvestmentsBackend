@@ -2,8 +2,10 @@
 import os
 from fastapi import BackgroundTasks, HTTPException, APIRouter, Query
 from services.cache.cache_backend import cache_get, cache_set
-from services.ai.analyze_symbol.analyze_symbol_service import run_analysis_task, TTL_TASK_RESULT_SEC, _ck_task
+from services.ai.analyze_symbol.analyze_symbol_service import run_analysis_task, TTL_TASK_RESULT_SEC
 router = APIRouter()
+
+def _ck_task(task_id: str) -> str: return f"ANALYZE:TASK:{(task_id or '').strip()}"
 
 # ----------------------------
 # 10) Routes

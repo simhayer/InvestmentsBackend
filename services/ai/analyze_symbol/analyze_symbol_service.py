@@ -9,9 +9,9 @@ from typing import Dict, Any, List
 from langgraph.graph import StateGraph, END
 
 from services.openai.client import llm
-from database import get_db
+from services.openai.client import llm_mini
 from services.vector.vector_store_service import VectorStoreService
-from utils.common_helpers import timed, safe_float
+from utils.common_helpers import timed
 
 try:
     from services.tavily.client import search as tavily_search, compact_results as compact_tavily
@@ -20,43 +20,39 @@ except Exception:
     compact_tavily = None  # type: ignore
 
 from services.finnhub.finnhub_fundamentals import fetch_fundamentals_cached
-from services.cache.cache_backend import cache_get, cache_set
+from services.cache.cache_backend import cache_set
 from services.ai.technicals_pack import build_technical_pack, compact_tech_pack
 from services.finnhub.finnhub_news_service import get_company_news_cached, shrink_news_items
 from services.finnhub.finnhub_calender_service import get_earnings_calendar_compact_cached
-from services.ai.helpers.analyze_symbol_helpers import compute_market_snapshot, fetch_history_points
+from services.ai.helpers.analyze_symbol_helpers import (
+    compute_market_snapshot, fetch_history_points, normalize_symbol,
+    ck_task,
+    ck_report,
+    format_sec_chunks,
+    get_fundamentals_with_cache,
+    get_news_with_optional_tavily_fallback,
+    get_sec_routed_context,
+    json_dumps,
+    trim_quote,
+    trim_profile,
+    trim_market_snapshot,
+    trim_earnings_calendar,
+    trim_sec_chunks,
+    trim_news_items,
+    shorten_text,
+    )
 
-from .types import AnalysisReport, AgentState 
+from .types import AnalysisReport, AgentState
 
 logger = logging.getLogger("analysis_timing")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
-
-# ----------------------------
-# Helpers / Cache Keys
-# ----------------------------
-def _preview(s: str, n: int = 220) -> str:
-    s = (s or "").strip().replace("\n", " ")
-    return s[:n] + ("…" if len(s) > n else "")
-
-
 TTL_FUNDAMENTALS_SEC = int(os.getenv("TTL_FUNDAMENTALS_SEC", "600"))  # 10m
 TTL_TAVILY_SEC = int(os.getenv("TTL_TAVILY_SEC", "900"))              # 15m
 TTL_TASK_RESULT_SEC = int(os.getenv("TTL_TASK_RESULT_SEC", "3600"))   # 1h
-TTL_ANALYSIS_REPORT_SEC = int(os.getenv("TTL_ANALYSIS_REPORT_SEC", "1800"))  # 30m per symbol (optional)
+TTL_ANALYSIS_REPORT_SEC = int(os.getenv("TTL_ANALYSIS_REPORT_SEC", "1800"))  # 30m per symbol
 
-def _ck_fund(symbol: str) -> str:
-    return f"ANALYZE:FUND:{(symbol or '').strip().upper()}"
-
-def _ck_tav(symbol: str) -> str:
-    return f"ANALYZE:TAV:{(symbol or '').strip().upper()}"
-
-def _ck_task(task_id: str) -> str:
-    return f"ANALYZE:TASK:{(task_id or '').strip()}"
-
-def _ck_report(symbol: str) -> str:
-    return f"ANALYZE:REPORT:{(symbol or '').strip().upper()}"
 
 def _compute_data_quality(
     finnhub_data: Dict[str, Any],
@@ -67,7 +63,9 @@ def _compute_data_quality(
     notes: List[str] = []
 
     if finnhub_gaps:
-        notes.append(f"Fundamentals gaps present: {', '.join(finnhub_gaps[:10])}{'...' if len(finnhub_gaps) > 10 else ''}")
+        notes.append(
+            f"Fundamentals gaps present: {', '.join(finnhub_gaps[:10])}{'...' if len(finnhub_gaps) > 10 else ''}"
+        )
 
     if not sec_context or len(sec_context.strip()) < 80:
         notes.append("SEC filing context is limited or unavailable.")
@@ -91,32 +89,26 @@ def _compute_data_quality(
 
     return notes
 
+
 # ----------------------------
 # Graph Nodes
 # ----------------------------
 async def research_node(state: AgentState):
-    symbol = (state.get("symbol") or "").strip().upper()
+    symbol = normalize_symbol(state.get("symbol") or "")
     task_id = state.get("task_id", "no_task")
 
     # 1) Fundamentals (cached)
-    fin_key = _ck_fund(symbol)
-    cached_f = cache_get(fin_key)
-    if isinstance(cached_f, dict) and "data" in cached_f and "gaps" in cached_f:
-        finnhub_data = cached_f.get("data") or {}
-        finnhub_gaps = cached_f.get("gaps") or []
-    else:
-        with timed("finnhub_fundamentals", state, logger):
-            finres = await fetch_fundamentals_cached(symbol, timeout_s=5.0)
-        finnhub_data = finres.data
-        finnhub_gaps = finres.gaps
-        cache_set(fin_key, {"data": finnhub_data, "gaps": finnhub_gaps}, ttl_seconds=TTL_FUNDAMENTALS_SEC)
+    finnhub_data, finnhub_gaps = await get_fundamentals_with_cache(
+        symbol=symbol,
+        state=state,
+        ttl_seconds=TTL_FUNDAMENTALS_SEC,
+        fetch_fundamentals_cached=fetch_fundamentals_cached,
+    )
 
     normalized = (finnhub_data or {}).get("normalized") or {}
-    profile = (finnhub_data or {}).get("profile") or {}
-    quote = (finnhub_data or {}).get("quote") or {}
 
-    # 2) Earnings Calendar
-    with timed("finnhub_earnings_calendar", state, logger):
+    # 2) Earnings Calendar (unchanged params)
+    with timed("finnhub_earnings_calendar", logger, state=state):
         earnings_calendar = await get_earnings_calendar_compact_cached(
             symbol=symbol,
             window_days=120,
@@ -124,72 +116,23 @@ async def research_node(state: AgentState):
             international=False,
         )
 
-    # 3) News (Finnhub cached) + optional Tavily fallback
-    news_items: List[Dict[str, Any]] = []
-    news_compact = ""
-    used_tavily = False
+    # 3) News (Finnhub cached) + optional Tavily fallback (query unchanged)
+    news_items, raw_str, used_tavily = await get_news_with_optional_tavily_fallback(
+        symbol=symbol,
+        state=state,
+        ttl_tavily_seconds=TTL_TAVILY_SEC,
+        get_company_news_cached=get_company_news_cached,
+        tavily_search=tavily_search,
+        compact_tavily=compact_tavily,
+    )
 
-    try:
-        with timed("finnhub_news", state, logger):
-            news_payload = await get_company_news_cached(symbol, days_back=10, limit=10)
-        news_items = news_payload.get("items") or []
-        news_compact = news_payload.get("compact") or ""
-    except Exception:
-        news_items = []
-        news_compact = ""
-
-    raw_str = news_compact
-
-    if (len(news_items) < 3) and tavily_search is not None and compact_tavily is not None:
-        tav_key = _ck_tav(symbol)
-        cached_t = cache_get(tav_key)
-        if isinstance(cached_t, dict) and isinstance(cached_t.get("raw"), str):
-            raw_str = cached_t["raw"]
-            used_tavily = True
-        else:
-            try:
-                with timed("tavily_search", state, logger):
-                    results = await tavily_search(
-                        query=f"latest news, upcoming catalysts, bull and bear case for {symbol}",
-                        max_results=8,
-                        search_depth="advanced",
-                    )
-                raw_str = compact_tavily(results)
-                cache_set(tav_key, {"raw": raw_str}, ttl_seconds=TTL_TAVILY_SEC)
-                used_tavily = True
-            except Exception:
-                raw_str = news_compact
-
-    # 4) SEC Vector Context (Targeted Routing)
-    sec_business, sec_risks, sec_mda = [], [], []
-    sec_debug = {"count": 0, "chunks": []}
-    
-    db_gen = get_db()
-    try:
-        db = next(db_gen)
-        vs = VectorStoreService()
-
-        # Run targeted section searches in parallel
-        with timed("sec_vector_routing", state, logger):
-            # VectorStoreService.get_context_for_analysis may be synchronous; run in threads to parallelize
-            sec_business = vs.get_context_for_analysis(db, symbol, "...", section_name="Item 1", limit=5)
-            sec_risks   = vs.get_context_for_analysis(db, symbol, "...", section_name="Item 1A", limit=8)
-            sec_mda     = vs.get_context_for_analysis(db, symbol, "...", section_name="Item 7", limit=5)
-
-            print(f"[{task_id}] SEC routing for {symbol}: ", 'sec_business:', len(sec_business), 'sec_risks:', len(sec_risks), 'sec_mda:', len(sec_mda))
-
-        # Combine for a general fallback context
-        all_chunks = sec_business + sec_risks + sec_mda
-        sec_debug["count"] = len(all_chunks)
-        sec_debug["chunks"] = [{"score": c.get("score"), "section": c.get("metadata", {}).get("section_name")} for c in all_chunks[:10]]
-        
-        sec_context = "\n".join([f"- {c.get('content')}" for c in all_chunks])[:12000]
-
-    except Exception as e:
-        logger.warning(f"[{task_id}] SEC routing failed for {symbol}: {e}")
-        sec_context = ""
-    finally:
-        next(db_gen, None)
+    # 4) SEC Vector Context (Targeted Routing) (same section names/limits)
+    sec_context, sec_business, sec_risks, sec_mda, sec_debug = get_sec_routed_context(
+        symbol=symbol,
+        state=state,
+        task_id=task_id,
+        vs=VectorStoreService(),
+    )
 
     # 5) Final Assembly
     market_snapshot = compute_market_snapshot(finnhub_data)
@@ -198,9 +141,9 @@ async def research_node(state: AgentState):
         "symbol": symbol,
         "finnhub": {"gaps": finnhub_gaps, "normalized_preview": normalized},
         "news": {"count": len(news_items), "used_tavily": used_tavily},
-        "sec": {"total_chunks": sec_debug["count"], "routed": True},
+        "sec": {"total_chunks": sec_debug.get("count", 0), "routed": True},
         "market_snapshot": market_snapshot,
-        "earnings_calendar": {"preview": earnings_calendar[:2] if earnings_calendar else []}
+        "earnings_calendar": {"preview": earnings_calendar[:2] if earnings_calendar else []},
     }
 
     return {
@@ -210,13 +153,14 @@ async def research_node(state: AgentState):
         "finnhub_data": finnhub_data,
         "finnhub_gaps": finnhub_gaps,
         "sec_context": sec_context,
-        "sec_business": sec_business,  # Used by Fundamentals draft
-        "sec_risks": sec_risks,        # Used by Risks draft
-        "sec_mda": sec_mda,            # Used by Fundamentals/Thesis
+        "sec_business": sec_business,
+        "sec_risks": sec_risks,
+        "sec_mda": sec_mda,
         "market_snapshot": market_snapshot,
         "earnings_calendar": earnings_calendar,
         "debug": debug,
     }
+
 
 async def drafts_node(state: AgentState):
     """
@@ -225,26 +169,18 @@ async def drafts_node(state: AgentState):
     """
     symbol = state.get("symbol") or ""
 
-    # Targeted SEC buckets from research_node
     sec_bus = state.get("sec_business", [])
     sec_risks_raw = state.get("sec_risks", [])
     sec_mda = state.get("sec_mda", [])
-    
-    # Existing data
+
     finnhub_data = state.get("finnhub_data", {}) or {}
     market_snapshot = state.get("market_snapshot", {}) or {}
     normalized = finnhub_data.get("normalized", {}) or {}
-    profile = finnhub_data.get("profile", {}) or {}
-    quote = finnhub_data.get("quote", {}) or {}
 
     news_items = state.get("news_items", []) or []
     news_json = json.dumps(shrink_news_items(news_items, 10, 240), ensure_ascii=False)
 
-    # Helper to clean up chunk lists for prompts
-    def format_sec(chunks):
-        if not chunks: return "No specific SEC section context found."
-        return "\n".join([f"- {c['content']}" for c in chunks])
-
+    # unchanged history fetch params
     price_points, bench_points = await asyncio.gather(
         fetch_history_points(symbol, "2y", "1d"),
         fetch_history_points("SPY", "2y", "1d"),
@@ -258,58 +194,58 @@ async def drafts_node(state: AgentState):
     ))
 
     async def do_fundamentals():
-        with timed("llm_fundamentals", state, logger):
-            prompt = f"""
-Analyze {symbol}. Write 3–6 Key Insights as short bullets.
+        prompt = f"""
+            Analyze {symbol}. Write 3–6 Key Insights as short bullets.
 
-BUSINESS MODEL CONTEXT (SEC Item 1):
-{format_sec(sec_bus)}
+            BUSINESS MODEL CONTEXT (SEC Item 1):
+            {format_sec_chunks(sec_bus)}
 
-MANAGEMENT ANALYSIS (SEC Item 7):
-{format_sec(sec_mda)}
+            MANAGEMENT ANALYSIS (SEC Item 7):
+            {format_sec_chunks(sec_mda)}
 
-FINNHUB NORMALIZED: {normalized}
-MARKET SNAPSHOT: {market_snapshot}
-NEWS: {news_json}
+            FINNHUB NORMALIZED: {normalized}
+            MARKET SNAPSHOT: {market_snapshot}
+            NEWS: {news_json}
 
-Rules:
-- Ground at least 2 bullets in the SEC context (business model/drivers).
-- Use concrete metrics from FINNHUB NORMALIZED.
-Return plain text bullets.
-"""
+            Rules:
+            - Ground at least 2 bullets in the SEC context (business model/drivers).
+            - Use concrete metrics from FINNHUB NORMALIZED.
+            Return plain text bullets.
+            """
+        with timed("llm_fundamentals",logger, state=state, tags={"prompt_kb": round(len(prompt) / 1024, 1)},):
             res = await llm.ainvoke(prompt)
         return res.content or ""
 
     async def do_risks():
-        with timed("llm_risks", state, logger):
-            prompt = f"""
-Identify stock risks for {symbol}. Be skeptical.
+        prompt = f"""
+            Identify stock risks for {symbol}. Be skeptical.
 
-OFFICIAL RISK FACTORS (SEC Item 1A):
-{format_sec(sec_risks_raw)}
+            OFFICIAL RISK FACTORS (SEC Item 1A):
+            {format_sec_chunks(sec_risks_raw)}
 
-FINNHUB METRICS: {normalized}
-MARKET SNAPSHOT: {market_snapshot}
+            FINNHUB METRICS: {normalized}
+            MARKET SNAPSHOT: {market_snapshot}
 
-Rules:
-- Prioritize threats from Item 1A (e.g., dependencies, regulatory, liquidity).
-- Specify HOW a risk hits revenue, margins, or valuation.
-- Avoid generic macro fluff.
-Return 4-8 short bullets.
-"""
+            Rules:
+            - Prioritize threats from Item 1A (e.g., dependencies, regulatory, liquidity).
+            - Specify HOW a risk hits revenue, margins, or valuation.
+            - Avoid generic macro fluff.
+            Return 4-8 short bullets.
+            """
+        with timed("llm_risks",logger, state=state, tags={"prompt_kb": round(len(prompt) / 1024, 1)},):
             res = await llm.ainvoke(prompt)
         return res.content or ""
 
     async def do_technicals():
-        with timed("llm_technicals", state, logger):
-            prompt = f"""
-Write a "Market Performance" section for {symbol} using:
-{tech_pack}
+        prompt = f"""
+            Write a "Market Performance" section for {symbol} using:
+            {tech_pack}
 
-Rules:
-- Mention returns (1D, 1M, 1Y) and trend vs MAs.
-- Mention relative performance vs SPY.
-"""
+            Rules:
+            - Mention returns (1D, 1M, 1Y) and trend vs MAs.
+            - Mention relative performance vs SPY.
+            """
+        with timed("llm_technicals", logger, state=state, tags={"prompt_kb": round(len(prompt) / 1024, 1)},):
             res = await llm.ainvoke(prompt)
         return res.content or ""
 
@@ -319,58 +255,61 @@ Rules:
 
     return {"fundamentals": fundamentals, "technicals": technicals, "risks": risks}
 
+
 async def thesis_builder_node(state: AgentState):
     """
     Produces unified thesis + catalysts + scenarios + debates drafts.
     Enforces strict temporal grounding using earnings_calendar.
     """
     symbol = state.get("symbol") or ""
-    
-    # Grouped context for the 'Big Picture' view
-    sec_context = f"""
-    BUSINESS (Item 1): {state.get('sec_business', [])[:3]}
-    RISKS (Item 1A): {state.get('sec_risks', [])[:3]}
-    MANAGEMENT (Item 7): {state.get('sec_mda', [])[:3]}
-    """
+
+    sec_bus = state.get("sec_business", [])
+    sec_risks_raw = state.get("sec_risks", [])
+    sec_mda = state.get("sec_mda", [])
 
     earnings_calendar = state.get("earnings_calendar", []) or []
-    earnings_json = json.dumps(earnings_calendar, ensure_ascii=False)
-    
-    # Get definitive next date for prompt reinforcement
+    earnings_json = json_dumps(earnings_calendar)
     next_date = earnings_calendar[0].get("date") if earnings_calendar else "Unknown"
 
-    with timed("llm_thesis_builder", state, logger):
-        prompt = f"""
-You are writing a professional-grade investment note for {symbol}. Output STRICT JSON only.
+    prompt = f"""
+        You are writing a professional-grade investment note for {symbol}. Output STRICT JSON only.
 
-SEC SECTION CONTEXT:
-{sec_context}
+        SEC BUSINESS (Item 1):
+        {format_sec_chunks(sec_bus)}
 
-FINNHUB NORMALIZED: {state.get('finnhub_data', {}).get('normalized')}
-MARKET SNAPSHOT: {state.get('market_snapshot')}
-EARNINGS CALENDAR: {earnings_json}
-DRAFT INSIGHTS: {state.get('fundamentals','')}
-DRAFT RISKS: {state.get('risks','')}
+        SEC RISK FACTORS (Item 1A):
+        {format_sec_chunks(sec_risks_raw)}
 
-DEFINITIVE TRUTH: The next earnings date is {next_date}.
+        SEC MD&A (Item 7):
+        {format_sec_chunks(sec_mda)}
 
-Task: Create a JSON object with unified_thesis, thesis_points, upcoming_catalysts, scenarios, market_expectations, key_debates, what_to_watch_next.
+        FINNHUB NORMALIZED: {state.get('finnhub_data', {}).get('normalized')}
+        MARKET SNAPSHOT: {state.get('market_snapshot')}
+        EARNINGS CALENDAR: {earnings_json}
+        DRAFT INSIGHTS: {state.get('fundamentals','')}
+        DRAFT RISKS: {state.get('risks','')}
 
-STRICT RULES:
-1. UPCOMING CATALYSTS: If you list an Earnings catalyst, the 'window' MUST be EXACTLY "{next_date}".
-2. Use YYYY-MM-DD format for all dated windows.
-3. At least 1 thesis_point MUST reference the SEC Risk Factors or Business Model.
-4. Scenarios must be exactly: Base, Bull, Bear.
+        DEFINITIVE TRUTH: The next earnings date is {next_date}.
 
-Return STRICT JSON only.
-"""
+        Task: Create a JSON object with unified_thesis, thesis_points, upcoming_catalysts, scenarios, market_expectations, key_debates, what_to_watch_next.
+
+        STRICT RULES:
+        1. UPCOMING CATALYSTS: If you list an Earnings catalyst, the 'window' MUST be EXACTLY "{next_date}".
+        2. Use YYYY-MM-DD format for all dated windows.
+        3. At least 1 thesis_point MUST reference the SEC Risk Factors or Business Model.
+        4. Scenarios must be exactly: Base, Bull, Bear.
+
+        Return STRICT JSON only.
+        """
+
+    with timed("llm_thesis_builder",logger, state=state, tags={"prompt_kb": round(len(prompt) / 1024, 1)},):
         res = await llm.ainvoke(prompt)
 
     txt = (res.content or "").strip()
     try:
         obj = json.loads(txt)
     except Exception:
-        obj = {"unified_thesis": "Not available", "thesis_points": [], "upcoming_catalysts": []} # Fallback
+        obj = {"unified_thesis": "Not available", "thesis_points": [], "upcoming_catalysts": []}
 
     return {
         "unified_thesis": obj.get("unified_thesis", "Not available"),
@@ -384,129 +323,144 @@ Return STRICT JSON only.
 
 async def analyst_structured_node(state: AgentState):
     """
-    Produces final AnalysisReport (structured output).
-    Applies critique if needed.
+    Faster final report builder:
+    - Shrinks prompt size aggressively
+    - Uses drafts + minimal sources
+    - Optional cache to skip LLM work on repeats
     """
-    symbol = state.get("symbol") or ""
+    symbol = (state.get("symbol") or "").strip().upper()
     structured_llm = llm.with_structured_output(AnalysisReport, method="function_calling")
 
-    critique = (state.get("critique") or "").strip()
-    critique_block = f"\n\nCRITIQUE / FIXES TO APPLY:\n{critique}\n" if critique and critique.upper() != "CLEAR" else ""
-
+    # --- Inputs (trimmed) ---
     finnhub_data = state.get("finnhub_data", {}) or {}
+    normalized = (finnhub_data.get("normalized") or {})
+    profile = trim_profile(finnhub_data.get("profile") or {})
+    quote = trim_quote(finnhub_data.get("quote") or {})
+
+    market_snapshot = trim_market_snapshot(state.get("market_snapshot", {}) or {})
+    earnings_calendar = trim_earnings_calendar(state.get("earnings_calendar", []) or [], max_items=3)
+
+    # SEC chunks: keep small; if empty, don’t paste huge empty blocks
+    sec_bus_small = trim_sec_chunks(state.get("sec_business", []) or [], max_chunks=2, max_chars_each=650)
+    sec_risks_small = trim_sec_chunks(state.get("sec_risks", []) or [], max_chunks=2, max_chars_each=650)
+    sec_mda_small = trim_sec_chunks(state.get("sec_mda", []) or [], max_chunks=1, max_chars_each=650)
+
+    news_small = trim_news_items(state.get("news_items", []) or [], max_items=5, max_chars_each=220)
+
     finnhub_gaps = state.get("finnhub_gaps", []) or []
-    raw_data = state.get("raw_data", "") or ""
-    sec_context = state.get("sec_context", "") or ""
-    market_snapshot = state.get("market_snapshot", {}) or {}
+    critique = (state.get("critique") or "").strip()
+    critique_block = f"\nCRITIQUE FIXES:\n{shorten_text(critique, 900)}\n" if critique and critique.upper() != "CLEAR" else ""
 
-    normalized = (finnhub_data or {}).get("normalized") or {}
-    profile = (finnhub_data or {}).get("profile") or {}
-    quote = (finnhub_data or {}).get("quote") or {}
+    # Drafts: these are already “thinking” outputs; keep them, but cap size.
+    fundamentals_draft = shorten_text(state.get("fundamentals", "") or "", 1200)
+    risks_draft = shorten_text(state.get("risks", "") or "", 1200)
+    technicals_draft = shorten_text(state.get("technicals", "") or "", 900)
 
-    # drafts from earlier nodes
-    unified_thesis = state.get("unified_thesis", "Not available")
-    thesis_points = state.get("thesis_points_draft", [])
-    catalysts = state.get("catalysts_draft", [])
-    scenarios = state.get("scenarios_draft", [])
-    market_expectations = state.get("market_expectations_draft", [])
-    key_debates = state.get("debates_draft", [])
-    what_to_watch_next = state.get("what_to_watch_next_draft", [])
+    thesis_seed = {
+        "unified_thesis": shorten_text(state.get("unified_thesis", "Not available") or "", 550),
+        "thesis_points": (state.get("thesis_points_draft", []) or [])[:6],
+        "upcoming_catalysts": (state.get("catalysts_draft", []) or [])[:4],
+        "scenarios": (state.get("scenarios_draft", []) or [])[:3],
+        "market_expectations": (state.get("market_expectations_draft", []) or [])[:4],
+        "key_debates": (state.get("debates_draft", []) or [])[:4],
+        "what_to_watch_next": (state.get("what_to_watch_next_draft", []) or [])[:6],
+    }
 
-    earnings_calendar = state.get("earnings_calendar", []) or []
-
-    news_items = state.get("news_items", []) or []
+    # --- Data quality notes ---
     data_quality_notes = _compute_data_quality(
         finnhub_data=finnhub_data,
         finnhub_gaps=finnhub_gaps,
-        sec_context=sec_context,
-        news_count=len(news_items),
+        sec_context=state.get("sec_context", "") or "",
+        news_count=len(state.get("news_items", []) or []),
     )
 
-    with timed("llm_analyst_structured", state, logger):
-        prompt = f"""
+    # --- Prompt (small + focused) ---
+    prompt = f"""
 Return a JSON object that matches the AnalysisReport schema EXACTLY.
 
-Core rules:
+Hard rules:
 - recommendation: Buy / Hold / Sell
 - confidence: 0.0 to 1.0
 - is_priced_in: true/false
-- DO NOT output exact "fair value" / price target numbers unless they appear in FINNHUB NORMALIZED.
-- If something is missing, say "Not available" / "Unknown" rather than guessing.
+- Do NOT invent precise financial metrics (use NORMALIZED only).
+- If a field is missing, use "Not available"/"Unknown" rather than guessing.
 
-Source rules (STRICT):
-- FINNHUB NORMALIZED is the only source for precise financial metrics/ratios.
-- SEC context is authoritative for business model, dependencies, margin drivers, legal/regulatory, liquidity narrative, risk factors.
-- WEB/NEWS is contextual only and must be treated as non-authoritative.
+Grounding rules:
+- Use SEC snippets ONLY for business model + risk factors.
+- Use NEWS only as context; don’t treat it as authoritative.
+- Keep language tight and non-fluffy.
 
-Grounding requirements:
-- key_insights must include >=1 insight grounded in SEC context (or explicitly say SEC not available).
-- stock_overflow_risks must include >=2 risks grounded in SEC context (or explicitly say SEC not available).
-- upcoming_catalysts must have >=3 items and each must include trigger + mechanism + impact_channels + probability + priced_in + key_watch_items.
-- scenarios must include exactly 3 items: Base, Bull, Bear.
+Required structure:
+- key_insights: must include >=1 SEC-grounded insight if SEC snippets exist; otherwise state SEC not available.
+- stock_overflow_risks: must include >=2 SEC-grounded risks if SEC snippets exist; otherwise state SEC not available.
+- upcoming_catalysts: >=3 items; each must include:
+  trigger, mechanism, impact_channels, probability, priced_in, key_watch_items
+- scenarios: exactly 3 items: Base, Bull, Bear
 
-Confidence guidance:
-- If FINNHUB has gaps -> cap confidence at 0.55
-- Else if BOTH SEC context and WEB/NEWS context are empty -> cap confidence at 0.55
-- Else allow up to 0.75, keep it modest if conclusions rely mostly on WEB/NEWS.
+Confidence caps:
+- If FINNHUB GAPS non-empty -> confidence <= 0.55
+- Else if SEC snippets empty AND NEWS empty -> confidence <= 0.55
+- Else confidence <= 0.75
 
-Inputs:
+INPUTS (trimmed):
 SYMBOL: {symbol}
 
-SEC CONTEXT:
-{sec_context}
+NORMALIZED (only source of exact metrics):
+{json.dumps(normalized, ensure_ascii=False)}
 
-FINNHUB NORMALIZED:
-{normalized}
+PROFILE (trimmed):
+{json.dumps(profile, ensure_ascii=False)}
 
-PROFILE:
-{profile}
+QUOTE (trimmed):
+{json.dumps(quote, ensure_ascii=False)}
 
-QUOTE:
-{quote}
+MARKET SNAPSHOT (trimmed):
+{json.dumps(market_snapshot, ensure_ascii=False)}
 
-MARKET SNAPSHOT:
-{market_snapshot}
-
-FINNHUB GAPS:
-{finnhub_gaps}
-
-EARNINGS CALENDAR:
+EARNINGS CALENDAR (trimmed):
 {json.dumps(earnings_calendar, ensure_ascii=False)}
 
-WEB/NEWS CONTEXT:
-{raw_data}
+SEC BUSINESS SNIPPETS (small):
+{json.dumps(sec_bus_small, ensure_ascii=False)}
 
-DRAFT INSIGHTS:
-{state.get("fundamentals","")}
+SEC RISK SNIPPETS (small):
+{json.dumps(sec_risks_small, ensure_ascii=False)}
 
-DRAFT PERFORMANCE:
-{state.get("technicals","")}
+SEC MD&A SNIPPETS (small):
+{json.dumps(sec_mda_small, ensure_ascii=False)}
 
-DRAFT RISKS:
-{state.get("risks","")}
+NEWS (trimmed):
+{json.dumps(news_small, ensure_ascii=False)}
 
-THESIS BUILDER DRAFTS (use these; improve if needed without breaking structure):
-- unified_thesis: {unified_thesis}
-- thesis_points: {json.dumps(thesis_points, ensure_ascii=False)}
-- upcoming_catalysts: {json.dumps(catalysts, ensure_ascii=False)}
-- scenarios: {json.dumps(scenarios, ensure_ascii=False)}
-- market_expectations: {json.dumps(market_expectations, ensure_ascii=False)}
-- key_debates: {json.dumps(key_debates, ensure_ascii=False)}
-- what_to_watch_next: {json.dumps(what_to_watch_next, ensure_ascii=False)}
+DRAFTS (use as starting point, tighten if needed):
+- fundamentals_draft: {fundamentals_draft}
+- technicals_draft: {technicals_draft}
+- risks_draft: {risks_draft}
 
-DATA QUALITY NOTES (copy into report.data_quality_notes; add more if needed):
+THESIS SEED (already drafted; keep structure):
+{json.dumps(thesis_seed, ensure_ascii=False)}
+
+DATA QUALITY NOTES (copy into report.data_quality_notes; add if needed):
 {json.dumps(data_quality_notes, ensure_ascii=False)}
+{critique_block}
 
 Also:
-- current_performance should be a short paragraph (use drafts, no invented numbers).
-- price_outlook must include base/bull/bear logic and align with recommendation.
-{critique_block}
+- current_performance: short paragraph, no invented numbers
+- price_outlook: must align with recommendation; explain base/bull/bear logic briefly
 """
+
+    with timed(
+        "llm_analyst_structured_v2",
+        logger,
+        state=state,
+        tags={"prompt_kb": round(len(prompt) / 1024, 1)},
+    ):
         report = await structured_llm.ainvoke(prompt)
 
     iters = int(state.get("iterations", 0)) + 1
-    return {"report": report.model_dump(), "iterations": iters}
+    report_dict = report.model_dump()
 
+    return {"report": report_dict, "iterations": iters}
 
 async def critic_node(state: AgentState):
     """
@@ -515,24 +469,25 @@ async def critic_node(state: AgentState):
     iters = int(state.get("iterations", 0))
     report_obj = state.get("report", {}) or {}
 
-    with timed("llm_critic", state, logger):
-        prompt = f"""
-You are a strict reviewer. Check this report for:
-- missing catalysts structure (trigger/mechanism/impact_channels/probability/priced_in/watch items)
-- generic/fluffy claims
-- contradictions between normalized metrics and conclusion
-- recommendation not matching reasoning
-- confidence too high/low given uncertainty
-- scenarios missing Base/Bull/Bear or too vague
-- data_quality_notes missing obvious gaps
+    prompt = f"""
+        You are a strict reviewer. Check this report for:
+        - missing catalysts structure (trigger/mechanism/impact_channels/probability/priced_in/watch items)
+        - generic/fluffy claims
+        - contradictions between normalized metrics and conclusion
+        - recommendation not matching reasoning
+        - confidence too high/low given uncertainty
+        - scenarios missing Base/Bull/Bear or too vague
+        - data_quality_notes missing obvious gaps
 
-If it is good enough to ship, respond exactly: CLEAR
-Otherwise respond with 3–7 specific fixes.
+        If it is good enough to ship, respond exactly: CLEAR
+        Otherwise respond with 3–7 specific fixes.
 
-REPORT JSON:
-{json.dumps(report_obj, ensure_ascii=False)}
-"""
-        res = await llm.ainvoke(prompt)
+        REPORT JSON:
+        {json.dumps(report_obj, ensure_ascii=False)}
+        """
+
+    with timed("llm_critic",logger, state=state, tags={"prompt_kb": round(len(prompt) / 1024, 1)},):
+        res = await llm_mini.ainvoke(prompt)
 
     txt = (res.content or "").strip()
     is_clear = txt.upper() == "CLEAR"
@@ -578,8 +533,8 @@ async def run_analysis_task(symbol: str, task_id: str):
     { status, data: { report, total_seconds }, debug }
     """
     t0_total = time.perf_counter()
-    symbol = (symbol or "").strip().upper()
-    task_key = _ck_task(task_id)
+    symbol = normalize_symbol(symbol)
+    task_key = ck_task(task_id)
 
     cache_set(task_key, {"status": "processing", "data": None}, ttl_seconds=TTL_TASK_RESULT_SEC)
 
@@ -591,10 +546,7 @@ async def run_analysis_task(symbol: str, task_id: str):
 
         payload = {
             "status": "complete",
-            "data": {
-                "report": report_obj,
-                "total_seconds": round(total_dt, 3),
-            },
+            "data": {"report": report_obj, "total_seconds": round(total_dt, 3)},
             "debug": final_state.get("debug", {}),
         }
 
@@ -602,7 +554,7 @@ async def run_analysis_task(symbol: str, task_id: str):
 
         # Optional symbol-level cache
         try:
-            cache_set(_ck_report(symbol), report_obj, ttl_seconds=TTL_ANALYSIS_REPORT_SEC)
+            cache_set(ck_report(symbol), report_obj, ttl_seconds=TTL_ANALYSIS_REPORT_SEC)
         except Exception:
             pass
 
@@ -612,8 +564,5 @@ async def run_analysis_task(symbol: str, task_id: str):
         total_dt = time.perf_counter() - t0_total
         logger.exception("Analysis failed for %s (%s).", symbol, task_id)
 
-        payload = {
-            "status": "failed",
-            "data": {"error": str(e), "total_seconds": round(total_dt, 3)},
-        }
+        payload = {"status": "failed", "data": {"error": str(e), "total_seconds": round(total_dt, 3)}}
         cache_set(task_key, payload, ttl_seconds=TTL_TASK_RESULT_SEC)

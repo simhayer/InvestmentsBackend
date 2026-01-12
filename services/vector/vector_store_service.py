@@ -28,6 +28,7 @@ def insert_chunks_ignore_duplicates(db: Session, rows: List[Dict[str, Any]]):
 class VectorStoreService:
     def __init__(self):
         self.ai = get_openai_client()
+        self._emb_cache: Dict[str, List[float]] = {}
 
     def get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
         """Fetch multiple embeddings in one call to save time and money."""
@@ -50,6 +51,17 @@ class VectorStoreService:
             input=[cleaned_text]
         )
         return response.data[0].embedding
+
+    def get_embedding_cached(self, text: str):
+        key = (text or "").strip()
+        if not key:
+            return None
+        if key in self._emb_cache:
+            return self._emb_cache[key]
+        vec = self.get_embedding(key)
+        if vec:
+            self._emb_cache[key] = vec
+        return vec
 
     def process_and_save_filing(self, db: Session, symbol: str, html_content: str, metadata: Dict[str, Any]) -> int:
         symbol = (symbol or "").strip().upper()
@@ -153,12 +165,14 @@ class VectorStoreService:
         query: str,
         section_name: Optional[str] = None,
         limit: int = 10,
+        *,
+        query_vector: Optional[list[float]] = None,
     ) -> List[Dict[str, Any]]:
         symbol = (symbol or "").strip().upper()
         if not symbol or not query:
             return []
 
-        query_vector = self.get_embedding(query)
+        query_vector = query_vector or self.get_embedding_cached(query)
         if not query_vector:
             return []
 

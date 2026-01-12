@@ -1,11 +1,22 @@
+import hashlib
 from typing import Any, Dict, List
 from utils.common_helpers import safe_float
 import asyncio
 from services.yahoo_service import get_price_history
+# services/ai/helpers/analyze_symbol_io.py
+import json
+import logging
+from contextlib import contextmanager
+from typing import Any, Dict, List, Optional, Tuple
 
-def preview(s: str, n: int = 220) -> str:
-    s = (s or "").strip().replace("\n", " ")
-    return s[:n] + ("…" if len(s) > n else "")
+from database import get_db
+from services.cache.cache_backend import cache_get, cache_set
+from services.vector.vector_store_service import VectorStoreService
+from utils.common_helpers import timed
+from services.ai.analyze_symbol.types import AgentState
+
+logger = logging.getLogger("analysis_timing")
+
 
 async def fetch_history_points(symbol: str, period="1y", interval="1d"):
     res = await asyncio.to_thread(get_price_history, symbol, period, interval)
@@ -87,3 +98,285 @@ def compute_market_snapshot(finnhub_data: Dict[str, Any]) -> Dict[str, Any]:
 
     snap["flags"] = flags
     return snap
+
+def normalize_symbol(symbol: str) -> str:
+    return (symbol or "").strip().upper()
+
+
+def preview(s: str, n: int = 220) -> str:
+    s = (s or "").strip().replace("\n", " ")
+    return s[:n] + ("…" if len(s) > n else "")
+
+
+def ck_fund(symbol: str) -> str:
+    return f"ANALYZE:FUND:{normalize_symbol(symbol)}"
+
+
+def ck_tav(symbol: str) -> str:
+    return f"ANALYZE:TAV:{normalize_symbol(symbol)}"
+
+
+def ck_task(task_id: str) -> str:
+    return f"ANALYZE:TASK:{(task_id or '').strip()}"
+
+
+def ck_report(symbol: str) -> str:
+    return f"ANALYZE:REPORT:{normalize_symbol(symbol)}"
+
+
+@contextmanager
+def db_session():
+    """
+    Wrap get_db() generator safely.
+    """
+    db_gen = get_db()
+    try:
+        db = next(db_gen)
+        yield db
+    finally:
+        # exhaust/close generator
+        try:
+            next(db_gen, None)
+        except Exception:
+            pass
+
+
+def format_sec_chunks(chunks: List[Dict[str, Any]]) -> str:
+    if not chunks:
+        return "No specific SEC section context found."
+    lines: List[str] = []
+    for c in chunks:
+        content = c.get("content")
+        if content:
+            lines.append(f"- {content}")
+    return "\n".join(lines) if lines else "No specific SEC section context found."
+
+
+async def get_fundamentals_with_cache(
+    *,
+    symbol: str,
+    state: AgentState,
+    ttl_seconds: int,
+    fetch_fundamentals_cached,  # injected to keep file decoupled
+) -> Tuple[Dict[str, Any], List[str]]:
+    """
+    Cache contract preserved:
+      cache value: {"data": finnhub_data, "gaps": finnhub_gaps}
+    """
+    key = ck_fund(symbol)
+    cached = cache_get(key)
+
+    if isinstance(cached, dict) and "data" in cached and "gaps" in cached:
+        finnhub_data = cached.get("data") or {}
+        finnhub_gaps = cached.get("gaps") or []
+        return finnhub_data, finnhub_gaps
+
+    with timed("finnhub_fundamentals", logger, state=state):
+        finres = await fetch_fundamentals_cached(symbol, timeout_s=5.0)
+
+    finnhub_data = finres.data
+    finnhub_gaps = finres.gaps
+    cache_set(key, {"data": finnhub_data, "gaps": finnhub_gaps}, ttl_seconds=ttl_seconds)
+    return finnhub_data, finnhub_gaps
+
+
+async def get_news_with_optional_tavily_fallback(
+    *,
+    symbol: str,
+    state: AgentState,
+    ttl_tavily_seconds: int,
+    get_company_news_cached,     # injected
+    tavily_search=None,          # injected
+    compact_tavily=None,         # injected
+) -> Tuple[List[Dict[str, Any]], str, bool]:
+    """
+    Preserves behavior:
+      - tries Finnhub news first (days_back=10, limit=10)
+      - if <3 items, tries Tavily with the SAME query string
+      - caches Tavily raw_str under ANALYZE:TAV:<SYMBOL>
+    """
+    news_items: List[Dict[str, Any]] = []
+    news_compact = ""
+    used_tavily = False
+
+    try:
+        with timed("finnhub_news", logger, state=state):
+            news_payload = await get_company_news_cached(symbol, days_back=10, limit=10)
+        news_items = news_payload.get("items") or []
+        news_compact = news_payload.get("compact") or ""
+    except Exception:
+        news_items = []
+        news_compact = ""
+
+    raw_str = news_compact
+
+    if (len(news_items) < 3) and tavily_search is not None and compact_tavily is not None:
+        tav_key = ck_tav(symbol)
+        cached_t = cache_get(tav_key)
+
+        if isinstance(cached_t, dict) and isinstance(cached_t.get("raw"), str):
+            raw_str = cached_t["raw"]
+            used_tavily = True
+        else:
+            try:
+                with timed("tavily_search", logger, state=state):
+                    results = await tavily_search(
+                        query=f"latest news, upcoming catalysts, bull and bear case for {symbol}",
+                        max_results=8,
+                        search_depth="advanced",
+                    )
+                raw_str = compact_tavily(results)
+                cache_set(tav_key, {"raw": raw_str}, ttl_seconds=ttl_tavily_seconds)
+                used_tavily = True
+            except Exception:
+                raw_str = news_compact
+
+    return news_items, raw_str, used_tavily
+
+
+def get_sec_routed_context(
+    *,
+    symbol: str,
+    state: AgentState,
+    task_id: str,
+    vs: Optional[VectorStoreService] = None,
+) -> Tuple[str, List[Dict[str, Any]], List[Dict[str, Any]], List[Dict[str, Any]], Dict[str, Any]]:
+    """
+    Preserves behavior:
+      - same section names: Item 1, Item 1A, Item 7
+      - same limits: 5, 8, 5
+      - builds combined sec_context up to 12000 chars
+    """
+    sec_business: List[Dict[str, Any]] = []
+    sec_risks: List[Dict[str, Any]] = []
+    sec_mda: List[Dict[str, Any]] = []
+    sec_context = ""
+    sec_debug = {"count": 0, "chunks": []}
+
+    try:
+        with db_session() as db:
+            vs = vs or VectorStoreService()
+
+            with timed("sec_vector_routing", logger, state=state):
+                sec_business = vs.get_context_for_analysis(db, symbol, "...", section_name="Item 1", limit=5)
+                sec_risks = vs.get_context_for_analysis(db, symbol, "...", section_name="Item 1A", limit=8)
+                sec_mda = vs.get_context_for_analysis(db, symbol, "...", section_name="Item 7", limit=5)
+
+            logger.debug(
+                "[%s] SEC routing for %s: sec_business=%s sec_risks=%s sec_mda=%s",
+                task_id, symbol, len(sec_business), len(sec_risks), len(sec_mda)
+            )
+
+            all_chunks = sec_business + sec_risks + sec_mda
+            sec_debug["count"] = len(all_chunks)
+            sec_debug["chunks"] = [
+                {"score": c.get("score"), "section": (c.get("metadata") or {}).get("section_name")}
+                for c in all_chunks[:10]
+            ]
+
+            sec_context = "\n".join([f"- {c.get('content')}" for c in all_chunks])[:12000]
+
+    except Exception as e:
+        logger.warning(f"[{task_id}] SEC routing failed for {symbol}: {e}")
+        sec_context = ""
+
+    return sec_context, sec_business, sec_risks, sec_mda, sec_debug
+
+
+def json_dumps(obj: Any) -> str:
+    return json.dumps(obj, ensure_ascii=False)
+
+
+
+
+def shorten_text(s: str, max_chars: int) -> str:
+    s = (s or "").strip()
+    if not s:
+        return ""
+    return s if len(s) <= max_chars else (s[: max_chars - 1] + "…")
+
+
+def trim_profile(profile: Dict[str, Any]) -> Dict[str, Any]:
+    # keep only what you actually use in your report
+    if not profile:
+        return {}
+    keep = ["name", "ticker", "exchange", "country", "currency", "sector", "industry", "marketCapitalization"]
+    out = {k: profile.get(k) for k in keep if profile.get(k) not in (None, "", "NA")}
+    return out
+
+
+def trim_quote(quote: Dict[str, Any]) -> Dict[str, Any]:
+    if not quote:
+        return {}
+    keep = ["c", "pc", "d", "dp", "h", "l", "o", "t"]
+    out = {k: quote.get(k) for k in keep if quote.get(k) not in (None, "", "NA")}
+    return out
+
+
+def trim_market_snapshot(ms: Dict[str, Any]) -> Dict[str, Any]:
+    if not ms:
+        return {}
+    # keep this small; avoid verbose narrative fields
+    keep = ["as_of", "price", "prev_close", "day_change_pct", "market_cap", "pe_ttm", "beta", "dividend_yield"]
+    out = {k: ms.get(k) for k in keep if ms.get(k) not in (None, "", "NA")}
+    return out
+
+
+def trim_earnings_calendar(cal: List[Dict[str, Any]], max_items: int = 3) -> List[Dict[str, Any]]:
+    if not cal:
+        return []
+    out: List[Dict[str, Any]] = []
+    for e in cal[:max_items]:
+        out.append({
+            "date": e.get("date"),
+            "eps_estimate": e.get("epsEstimate"),
+            "revenue_estimate": e.get("revenueEstimate"),
+            "quarter": e.get("quarter"),
+            "year": e.get("year"),
+        })
+    return out
+
+
+def trim_sec_chunks(chunks: List[Any], max_chunks: int = 2, max_chars_each: int = 650) -> List[Dict[str, str]]:
+    """
+    Your SEC chunks might be strings or dict-like objects depending on VectorStoreService.
+    We convert to small dicts with 'text' only.
+    """
+    if not chunks:
+        return []
+    trimmed: List[Dict[str, str]] = []
+    for c in chunks[:max_chunks]:
+        if isinstance(c, dict):
+            txt = c.get("text") or c.get("chunk") or c.get("content") or ""
+        else:
+            txt = str(c)
+        txt = shorten_text(txt, max_chars_each)
+        if txt:
+            trimmed.append({"text": txt})
+    return trimmed
+
+
+def trim_news_items(news_items: List[Dict[str, Any]], max_items: int = 5, max_chars_each: int = 220) -> List[Dict[str, str]]:
+    if not news_items:
+        return []
+    out: List[Dict[str, str]] = []
+    for n in news_items[:max_items]:
+        title = shorten_text(str(n.get("headline") or n.get("title") or ""), 120)
+        date = str(n.get("datetime") or n.get("date") or "")
+        summary = shorten_text(str(n.get("summary") or n.get("snippet") or ""), max_chars_each)
+        item = {
+            "date": date,
+            "title": title,
+            "summary": summary,
+        }
+        # keep it clean: drop empty fields
+        out.append({k: v for k, v in item.items() if v})
+    return out
+
+
+def stable_hash(obj: Any) -> str:
+    try:
+        raw = json.dumps(obj, ensure_ascii=False, sort_keys=True)
+    except Exception:
+        raw = str(obj)
+    return hashlib.md5(raw.encode("utf-8")).hexdigest()

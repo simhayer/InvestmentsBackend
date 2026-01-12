@@ -8,6 +8,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 from utils.common_helpers import canonical_key, safe_json, normalize_asset_type
 from services.cache.cache_backend import cache_get_many, cache_set_many
 import finnhub
+import random
 
 TTL_FINNHUB_QUOTE_SEC = 60
 
@@ -82,14 +83,44 @@ class FinnhubService:
 
         self.timeout = timeout
         self.max_concurrency = max(1, int(max_concurrency))
+        self._http: Optional[httpx.AsyncClient] = None
+
+    def _timeout(self) -> httpx.Timeout:
+        t = float(self.timeout)
+        return httpx.Timeout(timeout=t, connect=min(2.0, t))
+
+    def _limits(self) -> httpx.Limits:
+        # tune as needed; these are safe defaults
+        return httpx.Limits(max_connections=30, max_keepalive_connections=15)
+
+    async def _get_shared_client(self) -> httpx.AsyncClient:
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(
+                timeout=self._timeout(),
+                limits=self._limits(),
+                http2=True,
+                headers={"Accept": "application/json"},
+            )
+        return self._http
+
+    async def close(self) -> None:
+        """
+        Call this on app shutdown if you keep a long-lived FinnhubService instance.
+        """
+        if self._http is not None and not self._http.is_closed:
+            await self._http.aclose()
 
     @asynccontextmanager
     async def _client(self, client: Optional[httpx.AsyncClient] = None):
+        """
+        If caller provides a client, reuse it and DO NOT close it.
+        Otherwise use an instance-level shared client with pooling + http2.
+        """
         if client is not None:
             yield client
             return
-        async with httpx.AsyncClient(timeout=self.timeout) as c:
-            yield c
+        c = await self._get_shared_client()
+        yield c
 
     def _auth_params(self, **params: Any) -> Dict[str, Any]:
         return {**params, "token": self.api_key}
@@ -99,6 +130,30 @@ class FinnhubService:
         if not self.api_key:
             raise FinnhubServiceError("Missing FINNHUB_API_KEY")
         return finnhub.Client(api_key=self.api_key)
+    
+    async def _get(self, c: httpx.AsyncClient, path: str, *, params: dict) -> httpx.Response:
+        """
+        Minimal retry policy:
+        - retries: 429, 500, 502, 503, 504
+        - small exponential backoff with jitter
+        """
+        url = f"{self.BASE_URL}{path}"
+        retry_statuses = {429, 500, 502, 503, 504}
+        max_attempts = 3
+
+        for attempt in range(1, max_attempts + 1):
+            r = await c.get(url, params=params)
+            if r.status_code not in retry_statuses:
+                return r
+
+            if attempt == max_attempts:
+                return r
+
+            # backoff: 0.25, 0.5, 1.0 (+ jitter)
+            base = 0.25 * (2 ** (attempt - 1))
+            await asyncio.sleep(base + random.uniform(0.0, 0.15))
+
+        return r  # pragma: no cover
 
     # -----------------------
     # Quote (single)
@@ -121,8 +176,9 @@ class FinnhubService:
         formatted_symbol = format_finnhub_symbol(sym, typ)
 
         async with self._client(client) as c:
-            r = await c.get(
-                f"{self.BASE_URL}/quote",
+            r = await self._get(
+                c,
+                "/quote",
                 params=self._auth_params(symbol=formatted_symbol),
             )
             try:
@@ -244,17 +300,6 @@ class FinnhubService:
     max_concurrency: Optional[int] = None,
     ttl_seconds: int = TTL_FINNHUB_QUOTE_SEC,
     ) -> Dict[str, Optional[Dict[str, Any]]]:
-
-        def normalize_asset_type(typ: str | None) -> str:
-            t = (typ or "").strip().lower()
-            if not t:
-                return "equity"
-            if t in {"stock", "equity", "etf", "common stock", "adr"}:
-                return "equity"
-            if t in {"crypto", "cryptocurrency"}:
-                return "cryptocurrency"
-            return t
-
         # 1) normalize input, and precompute EVERYTHING once
         items: List[Dict[str, str]] = []
         for s, t in pairs:
@@ -263,6 +308,8 @@ class FinnhubService:
                 continue
 
             typ_n = normalize_asset_type(t)
+            if not typ_n:
+                typ_n = "equity"
             fs = format_finnhub_symbol(sym, typ_n)
 
             items.append({
@@ -344,50 +391,39 @@ class FinnhubService:
             except Exception:
                 return []
 
-    async def fetch_quote(
-        self,
-        symbol: str,
-        client: Optional[httpx.AsyncClient] = None,
-    ) -> Dict[str, Any]:
+    async def fetch_quote(self, symbol: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
         sym = (symbol or "").strip()
         if not sym:
             return {}
         async with self._client(client) as c:
             try:
-                r = await c.get(f"{self.BASE_URL}/quote", params=self._auth_params(symbol=sym))
+                r = await self._get(c, "/quote", params=self._auth_params(symbol=sym))
                 r.raise_for_status()
                 return safe_json(r) or {}
             except Exception:
                 return {}
 
-    async def fetch_profile(
-        self,
-        symbol: str,
-        client: Optional[httpx.AsyncClient] = None,
-    ) -> Dict[str, Any]:
+    async def fetch_profile(self, symbol: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
         sym = (symbol or "").strip()
         if not sym:
             return {}
         async with self._client(client) as c:
             try:
-                r = await c.get(f"{self.BASE_URL}/stock/profile2", params=self._auth_params(symbol=sym))
+                r = await self._get(c, "/stock/profile2", params=self._auth_params(symbol=sym))
                 r.raise_for_status()
                 return safe_json(r) or {}
             except Exception:
                 return {}
 
-    async def fetch_basic_financials(
-        self,
-        symbol: str,
-        client: Optional[httpx.AsyncClient] = None,
-    ) -> Dict[str, Any]:
+    async def fetch_basic_financials(self, symbol: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
         sym = (symbol or "").strip()
         if not sym:
             return {}
         async with self._client(client) as c:
             try:
-                r = await c.get(
-                    f"{self.BASE_URL}/stock/metric",
+                r = await self._get(
+                    c,
+                    "/stock/metric",
                     params=self._auth_params(symbol=sym, metric="all"),
                 )
                 r.raise_for_status()
@@ -407,8 +443,9 @@ class FinnhubService:
             return []
         async with self._client(client) as c:
             try:
-                r = await c.get(
-                    f"{self.BASE_URL}/stock/earnings",
+                r = await self._get(
+                    c,
+                    "/stock/earnings",
                     params=self._auth_params(symbol=sym, limit=limit),
                 )
                 r.raise_for_status()
@@ -467,9 +504,6 @@ class FinnhubService:
         international: bool = False,
         client: Optional[httpx.AsyncClient] = None,
     ) -> Dict[str, Any]:
-        """
-        /calendar/earnings?from=YYYY-MM-DD&to=YYYY-MM-DD&symbol=AAPL
-        """
         fd = (from_date or "").strip()
         td = (to_date or "").strip()
         sym = (symbol or "").strip().upper()
@@ -488,7 +522,7 @@ class FinnhubService:
 
         async with self._client(client) as c:
             try:
-                r = await c.get(f"{self.BASE_URL}/calendar/earnings", params=params)
+                r = await self._get(c, "/calendar/earnings", params=params)
                 r.raise_for_status()
                 return safe_json(r) or {}
             except Exception:
