@@ -5,9 +5,18 @@ import json
 from typing import Any, Dict
 import httpx
 import time
-from typing import Callable, Tuple, Type
+from typing import Callable, Tuple, Type, Mapping
 import logging
-from services.ai.analyze_symbol.types import AgentState
+
+def fmt_pct(x: Optional[float]) -> str:
+    if x is None:
+        return "Unknown"
+    return f"{x:+.2f}%"
+
+def fmt_price(x: Optional[float]) -> str:
+    if x is None:
+        return "Unknown"
+    return f"{x:.2f}"
 
 def normalize_asset_type(typ: str | None) -> str | None:
     t = (typ or "").strip().lower()
@@ -135,12 +144,19 @@ def retry(
 
     raise RuntimeError(f"retry failed after {attempts} attempts") from err
 
-# ----------------------------
-# 4) Timing helper
-# ----------------------------
-def timed(name: str, state: AgentState, logger: logging.Logger):
-    symbol = state.get("symbol", "NA")
-    task_id = state.get("task_id", "no_task")
+def timed(
+    name: str,
+    logger: logging.Logger,
+    *,
+    state: Optional[Mapping[str, Any]] = None,
+    tags: Optional[Mapping[str, Any]] = None,
+):
+    task_id = None
+    symbol = None
+
+    if state:
+        task_id = state.get("task_id")
+        symbol = state.get("symbol")
 
     class _T:
         def __enter__(self):
@@ -149,7 +165,21 @@ def timed(name: str, state: AgentState, logger: logging.Logger):
 
         def __exit__(self, exc_type, exc, tb):
             dt = time.perf_counter() - self.t0
-            logger.info("[%s] %s: %s=%.2fs", task_id, symbol, name, dt)
+
+            parts = []
+            if task_id:
+                parts.append(f"[{task_id}]")
+            if symbol:
+                parts.append(str(symbol))
+            if tags:
+                parts.extend(f"{k}={v}" for k, v in tags.items())
+
+            prefix = " ".join(parts)
+            if prefix:
+                logger.info("%s %s=%.2fs", prefix, name, dt)
+            else:
+                logger.info("%s=%.2fs", name, dt)
+
             return False
 
     return _T()
