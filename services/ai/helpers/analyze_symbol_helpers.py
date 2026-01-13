@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from database import get_db
 from services.cache.cache_backend import cache_get, cache_set
 from services.vector.vector_store_service import VectorStoreService
-from utils.common_helpers import timed
+from utils.common_helpers import timed, fmt_pct
 from services.ai.analyze_symbol.types import AgentState
 
 logger = logging.getLogger("analysis_timing")
@@ -380,3 +380,161 @@ def stable_hash(obj: Any) -> str:
     except Exception:
         raw = str(obj)
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
+
+def _get(d: Dict[str, Any], *keys, default=None):
+    for k in keys:
+        if isinstance(d, dict) and k in d:
+            return d.get(k)
+    return default
+
+def build_technicals_text_from_pack(symbol: str, tech_pack: Dict[str, Any]) -> str:
+    """
+    Builds a short "Market Performance" paragraph from your computed tech_pack.
+    This assumes tech_pack contains common fields; it degrades gracefully if missing.
+
+    Expected-ish keys (adjust if your pack differs):
+      - returns: {"1D": x, "1M": x, "1Y": x} or similar
+      - trend: {"above_ma50": bool, "above_ma200": bool} or ma fields
+      - relative: {"vs_spy_1y": x} or similar
+    """
+    returns = _get(tech_pack, "returns", default={}) or {}
+    r1d = returns.get("1D") or returns.get("1d")
+    r1m = returns.get("1M") or returns.get("1m")
+    r1y = returns.get("1Y") or returns.get("1y")
+
+    # Trend flags (try a few common shapes)
+    trend = _get(tech_pack, "trend", default={}) or {}
+    above_50 = trend.get("above_ma50")
+    above_200 = trend.get("above_ma200")
+
+    # If your pack stores MAs as numbers, infer
+    price = _get(tech_pack, "last_price", "price", default=None)
+    ma50 = _get(tech_pack, "ma50", "sma50", default=None)
+    ma200 = _get(tech_pack, "ma200", "sma200", default=None)
+    if above_50 is None and price is not None and ma50 is not None:
+        above_50 = price >= ma50
+    if above_200 is None and price is not None and ma200 is not None:
+        above_200 = price >= ma200
+
+    rel = _get(tech_pack, "relative", default={}) or {}
+    vs_spy_1y = rel.get("vs_spy_1y") or rel.get("vsSPY_1Y") or rel.get("vs_spy")
+
+    pieces: List[str] = []
+    pieces.append(
+        f"{symbol} returns: 1D {fmt_pct(r1d)}, 1M {fmt_pct(r1m)}, 1Y {fmt_pct(r1y)}."
+    )
+
+    if above_50 is not None or above_200 is not None:
+        t = []
+        if above_50 is not None:
+            t.append("above the 50-day MA" if above_50 else "below the 50-day MA")
+        if above_200 is not None:
+            t.append("above the 200-day MA" if above_200 else "below the 200-day MA")
+        pieces.append("Trend: " + ", ".join(t) + ".")
+
+    if vs_spy_1y is not None:
+        pieces.append(f"Relative vs SPY (1Y): {fmt_pct(vs_spy_1y)}.")
+
+    return " ".join(pieces).strip()
+
+
+REQ_CATALYST_FIELDS = [
+    "name", "window", "trigger", "mechanism", "likely_market_reaction",
+    "impact_channels", "probability", "magnitude", "priced_in", "key_watch_items"
+]
+
+def _is_nonempty_str(x: Any) -> bool:
+    return isinstance(x, str) and x.strip() != ""
+
+def _as_list(x: Any) -> List[Any]:
+    return x if isinstance(x, list) else []
+
+def validate_report(report: Dict[str, Any], *, next_earnings_date: str, finnhub_gaps: List[str]) -> List[str]:
+    issues: List[str] = []
+
+    if not isinstance(report, dict):
+        return ["Report is not a dict."]
+
+    # --- recommendation / confidence ---
+    rec = report.get("recommendation")
+    if rec not in ("Buy", "Hold", "Sell"):
+        issues.append("recommendation must be Buy/Hold/Sell.")
+
+    conf = report.get("confidence")
+    if not isinstance(conf, (int, float)) or conf < 0.0 or conf > 1.0:
+        issues.append("confidence must be a number between 0 and 1.")
+    else:
+        if finnhub_gaps and conf > 0.55:
+            issues.append("confidence too high given FINNHUB gaps (cap 0.55).")
+
+    # --- scenarios ---
+    scenarios = _as_list(report.get("scenarios"))
+    # collect only string names to avoid None values which cause typing errors with sorted()
+    names = [s.get("name") for s in scenarios if isinstance(s, dict) and isinstance(s.get("name"), str)]
+    # ensure sorted() receives only str items to satisfy static type checkers
+    if sorted([n for n in names if isinstance(n, str)]) != ["Base", "Bear", "Bull"] or len(scenarios) != 3:
+        issues.append("scenarios must be exactly 3 with names Base/Bull/Bear.")
+
+    # --- catalysts ---
+    catalysts = _as_list(report.get("upcoming_catalysts"))
+    if len(catalysts) != 3:
+        issues.append("upcoming_catalysts must be exactly 3 items.")
+    else:
+        for i, c in enumerate(catalysts, start=1):
+            if not isinstance(c, dict):
+                issues.append(f"catalyst #{i} is not an object.")
+                continue
+
+            missing = [f for f in REQ_CATALYST_FIELDS if f not in c]
+            if missing:
+                issues.append(f"catalyst #{i} missing fields: {', '.join(missing)}")
+
+            # window format checks
+            window = c.get("window")
+            if not _is_nonempty_str(window):
+                issues.append(f"catalyst #{i} window is empty.")
+            else:
+                # If earnings-related, enforce exact date
+                name = (c.get("name") or "").lower()
+                trig = (c.get("trigger") or "").lower()
+                if ("earnings" in name) or ("earnings" in trig):
+                    if next_earnings_date != "Unknown" and window != next_earnings_date:
+                        issues.append(f"earnings catalyst window must equal {next_earnings_date} exactly.")
+
+            # probability bounds
+            p = c.get("probability")
+            if not isinstance(p, (int, float)) or p < 0.0 or p > 1.0:
+                issues.append(f"catalyst #{i} probability must be 0..1.")
+
+            # impact_channels sanity
+            impact = _as_list(c.get("impact_channels"))
+            if len(impact) == 0:
+                issues.append(f"catalyst #{i} impact_channels is empty.")
+            if len(impact) > 3:
+                issues.append(f"catalyst #{i} impact_channels should be <= 3 for brevity.")
+
+            # key_watch_items sanity
+            watch = _as_list(c.get("key_watch_items"))
+            if len(watch) == 0:
+                issues.append(f"catalyst #{i} key_watch_items is empty.")
+            if len(watch) > 4:
+                issues.append(f"catalyst #{i} key_watch_items should be <= 4 for brevity.")
+
+            # evidence note not empty if evidence exists
+            evid = _as_list(c.get("evidence"))
+            for e in evid:
+                if isinstance(e, dict) and e.get("note") == "":
+                    issues.append(f"catalyst #{i} has evidence with empty note; either omit evidence or add short note.")
+
+    # --- thesis_points ---
+    thesis_points = _as_list(report.get("thesis_points"))
+    if thesis_points and len(thesis_points) > 5:
+        issues.append("thesis_points should be <= 5 for speed/brevity.")
+
+    # --- key_insights and risks basic ---
+    if len(_as_list(report.get("key_insights"))) < 3:
+        issues.append("key_insights should have at least 3 items.")
+    if len(_as_list(report.get("stock_overflow_risks"))) < 4:
+        issues.append("stock_overflow_risks should have at least 4 items.")
+
+    return issues

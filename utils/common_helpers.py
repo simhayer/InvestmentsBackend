@@ -8,6 +8,16 @@ import time
 from typing import Callable, Tuple, Type, Mapping
 import logging
 
+def fmt_pct(x: Optional[float]) -> str:
+    if x is None:
+        return "Unknown"
+    return f"{x:+.2f}%"
+
+def fmt_price(x: Optional[float]) -> str:
+    if x is None:
+        return "Unknown"
+    return f"{x:.2f}"
+
 def normalize_asset_type(typ: str | None) -> str | None:
     t = (typ or "").strip().lower()
     if not t:

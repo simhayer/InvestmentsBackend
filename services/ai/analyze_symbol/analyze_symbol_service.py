@@ -40,6 +40,8 @@ from services.ai.helpers.analyze_symbol_helpers import (
     trim_sec_chunks,
     trim_news_items,
     shorten_text,
+    build_technicals_text_from_pack,
+    validate_report
     )
 
 from .types import AnalysisReport, AgentState
@@ -115,6 +117,7 @@ async def research_node(state: AgentState):
             limit=6,
             international=False,
         )
+        earnings_calendar = sorted(earnings_calendar, key=lambda x: x.get("date") or "9999-99-99")
 
     # 3) News (Finnhub cached) + optional Tavily fallback (query unchanged)
     news_items, raw_str, used_tavily = await get_news_with_optional_tavily_fallback(
@@ -215,6 +218,7 @@ async def drafts_node(state: AgentState):
         with timed("llm_fundamentals",logger, state=state, tags={"prompt_kb": round(len(prompt) / 1024, 1)},):
             res = await llm.ainvoke(prompt)
         return res.content or ""
+    
 
     async def do_risks():
         prompt = f"""
@@ -233,269 +237,178 @@ async def drafts_node(state: AgentState):
             Return 4-8 short bullets.
             """
         with timed("llm_risks",logger, state=state, tags={"prompt_kb": round(len(prompt) / 1024, 1)},):
-            res = await llm.ainvoke(prompt)
+            res = await llm_mini.ainvoke(prompt)
         return res.content or ""
 
-    async def do_technicals():
-        prompt = f"""
-            Write a "Market Performance" section for {symbol} using:
-            {tech_pack}
+    
+    technicals_text = build_technicals_text_from_pack(symbol, tech_pack)
 
-            Rules:
-            - Mention returns (1D, 1M, 1Y) and trend vs MAs.
-            - Mention relative performance vs SPY.
-            """
-        with timed("llm_technicals", logger, state=state, tags={"prompt_kb": round(len(prompt) / 1024, 1)},):
-            res = await llm.ainvoke(prompt)
-        return res.content or ""
-
-    fundamentals, technicals, risks = await asyncio.gather(
-        do_fundamentals(), do_technicals(), do_risks()
+    fundamentals, risks = await asyncio.gather(
+        do_fundamentals(), do_risks()
     )
 
-    return {"fundamentals": fundamentals, "technicals": technicals, "risks": risks}
+    return {"fundamentals": fundamentals, "technicals": technicals_text, "risks": risks}
 
-
-async def thesis_builder_node(state: AgentState):
-    """
-    Produces unified thesis + catalysts + scenarios + debates drafts.
-    Enforces strict temporal grounding using earnings_calendar.
-    """
-    symbol = state.get("symbol") or ""
-
-    sec_bus = state.get("sec_business", [])
-    sec_risks_raw = state.get("sec_risks", [])
-    sec_mda = state.get("sec_mda", [])
-
-    earnings_calendar = state.get("earnings_calendar", []) or []
-    earnings_json = json_dumps(earnings_calendar)
-    next_date = earnings_calendar[0].get("date") if earnings_calendar else "Unknown"
-
-    prompt = f"""
-        You are writing a professional-grade investment note for {symbol}. Output STRICT JSON only.
-
-        SEC BUSINESS (Item 1):
-        {format_sec_chunks(sec_bus)}
-
-        SEC RISK FACTORS (Item 1A):
-        {format_sec_chunks(sec_risks_raw)}
-
-        SEC MD&A (Item 7):
-        {format_sec_chunks(sec_mda)}
-
-        FINNHUB NORMALIZED: {state.get('finnhub_data', {}).get('normalized')}
-        MARKET SNAPSHOT: {state.get('market_snapshot')}
-        EARNINGS CALENDAR: {earnings_json}
-        DRAFT INSIGHTS: {state.get('fundamentals','')}
-        DRAFT RISKS: {state.get('risks','')}
-
-        DEFINITIVE TRUTH: The next earnings date is {next_date}.
-
-        Task: Create a JSON object with unified_thesis, thesis_points, upcoming_catalysts, scenarios, market_expectations, key_debates, what_to_watch_next.
-
-        STRICT RULES:
-        1. UPCOMING CATALYSTS: If you list an Earnings catalyst, the 'window' MUST be EXACTLY "{next_date}".
-        2. Use YYYY-MM-DD format for all dated windows.
-        3. At least 1 thesis_point MUST reference the SEC Risk Factors or Business Model.
-        4. Scenarios must be exactly: Base, Bull, Bear.
-
-        Return STRICT JSON only.
-        """
-
-    with timed("llm_thesis_builder",logger, state=state, tags={"prompt_kb": round(len(prompt) / 1024, 1)},):
-        res = await llm.ainvoke(prompt)
-
-    txt = (res.content or "").strip()
-    try:
-        obj = json.loads(txt)
-    except Exception:
-        obj = {"unified_thesis": "Not available", "thesis_points": [], "upcoming_catalysts": []}
-
-    return {
-        "unified_thesis": obj.get("unified_thesis", "Not available"),
-        "thesis_points_draft": obj.get("thesis_points", []),
-        "catalysts_draft": obj.get("upcoming_catalysts", []),
-        "scenarios_draft": obj.get("scenarios", []),
-        "market_expectations_draft": obj.get("market_expectations", []),
-        "debates_draft": obj.get("key_debates", []),
-        "what_to_watch_next_draft": obj.get("what_to_watch_next", []),
-    }
 
 async def analyst_structured_node(state: AgentState):
-    """
-    Faster final report builder:
-    - Shrinks prompt size aggressively
-    - Uses drafts + minimal sources
-    - Optional cache to skip LLM work on repeats
-    """
     symbol = (state.get("symbol") or "").strip().upper()
-    structured_llm = llm.with_structured_output(AnalysisReport, method="function_calling")
 
-    # --- Inputs (trimmed) ---
+    structured_llm = (
+        llm.with_structured_output(AnalysisReport, method="function_calling")
+        .bind(temperature=0.2)
+    )
+
     finnhub_data = state.get("finnhub_data", {}) or {}
     normalized = (finnhub_data.get("normalized") or {})
-    profile = trim_profile(finnhub_data.get("profile") or {})
-    quote = trim_quote(finnhub_data.get("quote") or {})
 
-    market_snapshot = trim_market_snapshot(state.get("market_snapshot", {}) or {})
-    earnings_calendar = trim_earnings_calendar(state.get("earnings_calendar", []) or [], max_items=3)
+    # ---- TRIM EVERYTHING ----
+    profile_small = trim_profile(finnhub_data.get("profile") or {})
+    quote_small = trim_quote(finnhub_data.get("quote") or {})
+    market_snapshot_small = trim_market_snapshot(state.get("market_snapshot", {}) or {})
 
-    # SEC chunks: keep small; if empty, don’t paste huge empty blocks
+    earnings_calendar = state.get("earnings_calendar", []) or []
+    # sort ascending so "next earnings" is truly next
+    earnings_calendar = sorted(earnings_calendar, key=lambda x: x.get("date") or "9999-99-99")
+    earnings_small = trim_earnings_calendar(earnings_calendar, max_items=2)
+    next_date = earnings_small[0].get("date") if earnings_small else "Unknown"
+
     sec_bus_small = trim_sec_chunks(state.get("sec_business", []) or [], max_chunks=2, max_chars_each=650)
     sec_risks_small = trim_sec_chunks(state.get("sec_risks", []) or [], max_chunks=2, max_chars_each=650)
     sec_mda_small = trim_sec_chunks(state.get("sec_mda", []) or [], max_chunks=1, max_chars_each=650)
 
-    news_small = trim_news_items(state.get("news_items", []) or [], max_items=5, max_chars_each=220)
+    news_items = state.get("news_items", []) or []
+    news_small = trim_news_items(news_items, max_items=5, max_chars_each=220)
 
     finnhub_gaps = state.get("finnhub_gaps", []) or []
+
+    # drafts are already “compressed thinking”
+    fundamentals_draft = shorten_text(state.get("fundamentals", "") or "", 1200)
+    risks_draft = shorten_text(state.get("risks", "") or "", 1200)
+    technicals_text = shorten_text(state.get("technicals", "") or "", 500)
+
     critique = (state.get("critique") or "").strip()
     critique_block = f"\nCRITIQUE FIXES:\n{shorten_text(critique, 900)}\n" if critique and critique.upper() != "CLEAR" else ""
 
-    # Drafts: these are already “thinking” outputs; keep them, but cap size.
-    fundamentals_draft = shorten_text(state.get("fundamentals", "") or "", 1200)
-    risks_draft = shorten_text(state.get("risks", "") or "", 1200)
-    technicals_draft = shorten_text(state.get("technicals", "") or "", 900)
-
-    thesis_seed = {
-        "unified_thesis": shorten_text(state.get("unified_thesis", "Not available") or "", 550),
-        "thesis_points": (state.get("thesis_points_draft", []) or [])[:6],
-        "upcoming_catalysts": (state.get("catalysts_draft", []) or [])[:4],
-        "scenarios": (state.get("scenarios_draft", []) or [])[:3],
-        "market_expectations": (state.get("market_expectations_draft", []) or [])[:4],
-        "key_debates": (state.get("debates_draft", []) or [])[:4],
-        "what_to_watch_next": (state.get("what_to_watch_next_draft", []) or [])[:6],
-    }
-
-    # --- Data quality notes ---
     data_quality_notes = _compute_data_quality(
         finnhub_data=finnhub_data,
         finnhub_gaps=finnhub_gaps,
         sec_context=state.get("sec_context", "") or "",
-        news_count=len(state.get("news_items", []) or []),
+        news_count=len(news_items),
     )
 
-    # --- Prompt (small + focused) ---
     prompt = f"""
 Return a JSON object that matches the AnalysisReport schema EXACTLY.
+
+Definitive truth: next earnings date is {next_date}.
 
 Hard rules:
 - recommendation: Buy / Hold / Sell
 - confidence: 0.0 to 1.0
 - is_priced_in: true/false
-- Do NOT invent precise financial metrics (use NORMALIZED only).
-- If a field is missing, use "Not available"/"Unknown" rather than guessing.
+- Use FINNHUB NORMALIZED as the only source of exact metrics.
+- Scenarios must be exactly: Base, Bull, Bear.
+- upcoming_catalysts: exactly 3 items.
+  - If a catalyst is earnings-related, window MUST be exactly "{next_date}" (YYYY-MM-DD).
 
-Grounding rules:
-- Use SEC snippets ONLY for business model + risk factors.
-- Use NEWS only as context; don’t treat it as authoritative.
-- Keep language tight and non-fluffy.
-
-Required structure:
-- key_insights: must include >=1 SEC-grounded insight if SEC snippets exist; otherwise state SEC not available.
-- stock_overflow_risks: must include >=2 SEC-grounded risks if SEC snippets exist; otherwise state SEC not available.
-- upcoming_catalysts: >=3 items; each must include:
-  trigger, mechanism, impact_channels, probability, priced_in, key_watch_items
-- scenarios: exactly 3 items: Base, Bull, Bear
-
-Confidence caps:
-- If FINNHUB GAPS non-empty -> confidence <= 0.55
-- Else if SEC snippets empty AND NEWS empty -> confidence <= 0.55
-- Else confidence <= 0.75
+Brevity caps (speed):
+- key_insights: 3–6
+- stock_overflow_risks: 4–8
+- thesis_points: <= 5
+- key_debates: <= 4
+- what_to_watch_next: <= 6
+- evidence: optional; if present, note must be non-empty and <= 8 words.
 
 INPUTS (trimmed):
 SYMBOL: {symbol}
 
-NORMALIZED (only source of exact metrics):
-{json.dumps(normalized, ensure_ascii=False)}
+NORMALIZED:
+{json_dumps(normalized)}
 
 PROFILE (trimmed):
-{json.dumps(profile, ensure_ascii=False)}
+{json_dumps(profile_small)}
 
 QUOTE (trimmed):
-{json.dumps(quote, ensure_ascii=False)}
+{json_dumps(quote_small)}
 
 MARKET SNAPSHOT (trimmed):
-{json.dumps(market_snapshot, ensure_ascii=False)}
+{json_dumps(market_snapshot_small)}
 
-EARNINGS CALENDAR (trimmed):
-{json.dumps(earnings_calendar, ensure_ascii=False)}
+EARNINGS (trimmed):
+{json_dumps(earnings_small)}
 
-SEC BUSINESS SNIPPETS (small):
-{json.dumps(sec_bus_small, ensure_ascii=False)}
+SEC BUSINESS SNIPS:
+{json_dumps(sec_bus_small)}
 
-SEC RISK SNIPPETS (small):
-{json.dumps(sec_risks_small, ensure_ascii=False)}
+SEC RISK SNIPS:
+{json_dumps(sec_risks_small)}
 
-SEC MD&A SNIPPETS (small):
-{json.dumps(sec_mda_small, ensure_ascii=False)}
+SEC MD&A SNIPS:
+{json_dumps(sec_mda_small)}
 
 NEWS (trimmed):
-{json.dumps(news_small, ensure_ascii=False)}
+{json_dumps(news_small)}
 
-DRAFTS (use as starting point, tighten if needed):
-- fundamentals_draft: {fundamentals_draft}
-- technicals_draft: {technicals_draft}
-- risks_draft: {risks_draft}
+DRAFT INSIGHTS (seed):
+{fundamentals_draft}
 
-THESIS SEED (already drafted; keep structure):
-{json.dumps(thesis_seed, ensure_ascii=False)}
+DRAFT RISKS (seed):
+{risks_draft}
 
-DATA QUALITY NOTES (copy into report.data_quality_notes; add if needed):
-{json.dumps(data_quality_notes, ensure_ascii=False)}
+MARKET PERFORMANCE (deterministic):
+{technicals_text}
+
+DATA QUALITY NOTES (copy into report.data_quality_notes):
+{json_dumps(data_quality_notes)}
 {critique_block}
-
-Also:
-- current_performance: short paragraph, no invented numbers
-- price_outlook: must align with recommendation; explain base/bull/bear logic briefly
 """
 
-    with timed(
-        "llm_analyst_structured_v2",
-        logger,
-        state=state,
-        tags={"prompt_kb": round(len(prompt) / 1024, 1)},
-    ):
+    with timed("llm_analyst_structured_merged", logger, state=state, tags={"prompt_kb": round(len(prompt)/1024, 1)}):
         report = await structured_llm.ainvoke(prompt)
 
     iters = int(state.get("iterations", 0)) + 1
-    report_dict = report.model_dump()
-
-    return {"report": report_dict, "iterations": iters}
+    return {"report": report.model_dump(), "iterations": iters}
 
 async def critic_node(state: AgentState):
-    """
-    Cheap guardrail. Max 1 revision for speed.
-    """
-    iters = int(state.get("iterations", 0))
     report_obj = state.get("report", {}) or {}
 
+    earnings_calendar = state.get("earnings_calendar", []) or []
+    earnings_calendar = sorted(earnings_calendar, key=lambda x: x.get("date") or "9999-99-99")
+    raw_next = earnings_calendar[0].get("date") if earnings_calendar else None
+    next_date = str(raw_next) if raw_next else "Unknown"
+
+    finnhub_gaps = state.get("finnhub_gaps", []) or []
+
+    issues = validate_report(report_obj, next_earnings_date=next_date, finnhub_gaps=finnhub_gaps)
+    if not issues:
+        return {"is_valid": True, "critique": "CLEAR"}
+
+    # Only send what matters
+    small_payload = {
+        "issues": issues,
+        "recommendation": report_obj.get("recommendation"),
+        "confidence": report_obj.get("confidence"),
+        "upcoming_catalysts": report_obj.get("upcoming_catalysts"),
+        "scenarios": report_obj.get("scenarios"),
+    }
+
     prompt = f"""
-        You are a strict reviewer. Check this report for:
-        - missing catalysts structure (trigger/mechanism/impact_channels/probability/priced_in/watch items)
-        - generic/fluffy claims
-        - contradictions between normalized metrics and conclusion
-        - recommendation not matching reasoning
-        - confidence too high/low given uncertainty
-        - scenarios missing Base/Bull/Bear or too vague
-        - data_quality_notes missing obvious gaps
+You are a strict reviewer. Fix the report by addressing ONLY the listed issues.
+Return 3–7 specific fix instructions. Do not add new sections.
 
-        If it is good enough to ship, respond exactly: CLEAR
-        Otherwise respond with 3–7 specific fixes.
+ISSUES:
+{json.dumps(issues, ensure_ascii=False)}
 
-        REPORT JSON:
-        {json.dumps(report_obj, ensure_ascii=False)}
-        """
+PAYLOAD:
+{json.dumps(small_payload, ensure_ascii=False)}
 
-    with timed("llm_critic",logger, state=state, tags={"prompt_kb": round(len(prompt) / 1024, 1)},):
-        res = await llm_mini.ainvoke(prompt)
+If everything is fixed already, respond exactly: CLEAR
+"""
+
+    with timed("llm_critic_mini", logger, state=state, tags={"prompt_kb": round(len(prompt)/1024, 1)}):
+        res = await llm_mini.ainvoke(prompt)  # your mini model
 
     txt = (res.content or "").strip()
-    is_clear = txt.upper() == "CLEAR"
-
-    if iters >= 1:
-        return {"is_valid": True, "critique": "" if is_clear else txt}
-
-    return {"is_valid": bool(is_clear), "critique": "" if is_clear else txt}
+    return {"is_valid": txt.upper() == "CLEAR", "critique": "" if txt.upper() == "CLEAR" else txt}
 
 
 # ----------------------------
@@ -504,14 +417,12 @@ async def critic_node(state: AgentState):
 workflow = StateGraph(AgentState)
 workflow.add_node("research", research_node)
 workflow.add_node("drafts", drafts_node)
-workflow.add_node("thesis_builder", thesis_builder_node)
 workflow.add_node("analyst", analyst_structured_node)
 workflow.add_node("critic", critic_node)
 
 workflow.set_entry_point("research")
 workflow.add_edge("research", "drafts")
-workflow.add_edge("drafts", "thesis_builder")
-workflow.add_edge("thesis_builder", "analyst")
+workflow.add_edge("drafts", "analyst")
 workflow.add_edge("analyst", "critic")
 
 workflow.add_conditional_edges(

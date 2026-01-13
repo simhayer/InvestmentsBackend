@@ -8,17 +8,6 @@ from pydantic import BaseModel, Field
 Magnitude = Literal["Low", "Medium", "High", "Unknown"]
 PricedIn = Literal["Low", "Partial", "High", "Unknown"]
 CatalystWindow = str  # keep flexible: "Next 30–60 days", "Q2 2026", "Next earnings", etc.
-EvidenceTag = Literal["FINNHUB", "SEC", "NEWS", "TECHNICALS", "OTHER"]
-
-
-class EvidenceItem(BaseModel):
-    """
-    Lightweight credibility layer for UI and QA.
-    Keep it short; don’t try to be perfect citations yet.
-    """
-    source: EvidenceTag
-    note: str = Field(default="", description="Short pointer like '10-K risk factors' or 'gross margin'.")
-
 
 class ThesisPoint(BaseModel):
     """
@@ -59,7 +48,6 @@ class Catalyst(BaseModel):
     magnitude: Magnitude = "Unknown"
     priced_in: PricedIn = "Unknown"
     key_watch_items: List[str] = Field(default_factory=list, description="Concrete metrics to watch.")
-    evidence: List[EvidenceItem] = Field(default_factory=list)
 
 class Scenario(BaseModel):
     """
@@ -69,7 +57,6 @@ class Scenario(BaseModel):
     narrative: str = Field(description="What happens and why.")
     key_drivers: List[str] = Field(default_factory=list)
     watch_items: List[str] = Field(default_factory=list)
-    evidence: List[EvidenceItem] = Field(default_factory=list)
 
 
 class DebateItem(BaseModel):
@@ -144,31 +131,19 @@ class AgentState(BaseAgentState, total=False):
     raw_data: str
     finnhub_data: Dict[str, Any]
     finnhub_gaps: List[str]
-    
-    # Standard combined context
+
     sec_context: str
+    sec_business: List[Dict[str, Any]]
+    sec_risks: List[Dict[str, Any]]
+    sec_mda: List[Dict[str, Any]]
 
-    # --- New Routed SEC Context Keys ---
-    # These store the high-fidelity segments for specific drafting
-    sec_business: List[Dict[str, Any]]  # Item 1 content
-    sec_risks: List[Dict[str, Any]]     # Item 1A content
-    sec_mda: List[Dict[str, Any]]       # Item 7 content
-    
-    # Calendar data for temporal grounding
     earnings_calendar: List[Dict[str, Any]]
+    news_items: List[Dict[str, Any]]  # <-- add this if not already present
 
-    # Node-specific drafts
     fundamentals: str
-    technicals: str
+    technicals: str  # now deterministic text
     risks: str
 
-    # Structured builder drafts
-    thesis_draft: str
-    catalysts_draft: List[Dict[str, Any]]
-    scenarios_draft: List[Dict[str, Any]]
-    debates_draft: List[Dict[str, Any]]
-
-    # Final outputs and control
     report: Dict[str, Any]
     critique: str
     is_valid: bool
