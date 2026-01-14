@@ -20,3 +20,4 @@ python-jose==3.5.0
 python-jose==3.5.0
 pgvector==0.4.2
 sec-parser==0.58.1
+langgraph==1.0.6

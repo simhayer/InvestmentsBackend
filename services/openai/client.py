@@ -1,5 +1,6 @@
 import os
 from openai import OpenAI
+from langchain_openai import ChatOpenAI
 
 _client = None
 
@@ -18,3 +19,6 @@ def get_openai_client() -> OpenAI:
         _client = OpenAI(api_key=api_key)
 
     return _client
+
+llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o"), temperature=0)
+llm_mini = ChatOpenAI(model=os.getenv("OPENAI_MODEL_MINI", "gpt-4o-mini"), temperature=0)

@@ -3,23 +3,24 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
-
 import httpx
-
 from services.finnhub.finnhub_service import FinnhubService, FinnhubServiceError
 from services.cache.cache_backend import cache_get, cache_set
+from services.finnhub.client import FINNHUB_CLIENT
+from utils.common_helpers import timed
+import logging
+logger = logging.getLogger(__name__)
 
 TTL_FUNDAMENTALS_SEC = 600
+TTL_METRICS_SEC = 24*3600
 
 def _ck_fund(symbol: str) -> str:
     return f"FUNDAMENTALS:{(symbol or '').strip().upper()}"
-
 
 @dataclass(frozen=True)
 class FundamentalsResult:
     data: Dict[str, Any]
     gaps: List[str]
-
 
 def _coerce_float(value: Any) -> Optional[float]:
     try:
@@ -29,7 +30,6 @@ def _coerce_float(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
 
-
 def _pick_metric(metrics: Dict[str, Any], *keys: str) -> Optional[float]:
     for key in keys:
         if key in metrics:
@@ -37,7 +37,6 @@ def _pick_metric(metrics: Dict[str, Any], *keys: str) -> Optional[float]:
             if val is not None:
                 return val
     return None
-
 
 async def fetch_fundamentals(symbol: str, *, timeout_s: float = 5.0) -> FundamentalsResult:
     clean_symbol = (symbol or "").strip().upper()
@@ -50,15 +49,28 @@ async def fetch_fundamentals(symbol: str, *, timeout_s: float = 5.0) -> Fundamen
         svc = FinnhubService(timeout=timeout_s)
     except FinnhubServiceError as exc:
         return FundamentalsResult({}, [str(exc)])
+    
+    client = FINNHUB_CLIENT
 
-    async with httpx.AsyncClient(timeout=timeout_s) as client:
-        results = await asyncio.gather(
-            svc.fetch_profile(clean_symbol, client=client),
-            svc.fetch_quote(clean_symbol, client=client),
-            svc.fetch_basic_financials(clean_symbol, client=client),
-            svc.fetch_earnings(clean_symbol, client=client),
-            return_exceptions=True,
-        )
+    results = await asyncio.gather(
+        svc.fetch_profile(clean_symbol, client=client),
+        svc.fetch_quote(clean_symbol, client=client),
+        svc.fetch_basic_financials(clean_symbol, client=client),
+        svc.fetch_earnings(clean_symbol, client=client),
+        return_exceptions=True,
+    )
+
+    with timed("fh_profile", logger, state={"symbol": clean_symbol, "task_id": "fundamentals"}):
+        profile = await svc.fetch_profile(clean_symbol, client=client)
+
+    with timed("fh_quote", logger, state={"symbol": clean_symbol, "task_id": "fundamentals"}):
+        quote = await svc.fetch_quote(clean_symbol, client=client)
+
+    with timed("fh_metrics", logger, state={"symbol": clean_symbol, "task_id": "fundamentals"}):
+        metrics_raw = await svc.fetch_basic_financials(clean_symbol, client=client)
+
+    with timed("fh_earnings", logger, state={"symbol": clean_symbol, "task_id": "fundamentals"}):
+        earnings_raw = await svc.fetch_earnings(clean_symbol, client=client)
 
     profile, quote, metrics_raw, earnings_raw = results
 
