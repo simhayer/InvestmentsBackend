@@ -1,5 +1,6 @@
 import json
 import os
+import time
 from typing import Any, AsyncGenerator, Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -60,6 +61,7 @@ async def chat_endpoint(
     session_id = (req.session_id or "").strip() or _make_session_id(user.id)
     history = load_chat_history(user.id, session_id)
 
+    t0 = time.perf_counter()
     answer, debug = await run_chat_turn(
         message=message,
         user_id=user.id,
@@ -69,6 +71,7 @@ async def chat_endpoint(
         db=db,
         finnhub=finnhub,
     )
+    response_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
     append_chat_history(
         user.id,
@@ -82,6 +85,7 @@ async def chat_endpoint(
     return {
         "session_id": session_id,
         "answer": answer,
+        "response_ms": response_ms,
         "debug": debug,
     }
 
@@ -102,6 +106,7 @@ async def chat_stream_endpoint(
 
     async def event_stream() -> AsyncGenerator[str, None]:
         yield _sse_pack("meta", {"session_id": session_id})
+        t0 = time.perf_counter()
         try:
             answer, _debug = await run_chat_turn(
                 message=message,
@@ -115,6 +120,7 @@ async def chat_stream_endpoint(
         except Exception as exc:
             yield _sse_pack("error", {"error": str(exc)})
             return
+        response_ms = round((time.perf_counter() - t0) * 1000.0, 2)
 
         append_chat_history(
             user.id,
@@ -127,7 +133,7 @@ async def chat_stream_endpoint(
 
         for chunk in _chunk_text(answer):
             yield _sse_pack("delta", chunk)
-        yield _sse_pack("done", {"status": "ok"})
+        yield _sse_pack("done", {"status": "ok", "response_ms": response_ms})
 
     headers = {
         "Cache-Control": "no-cache",

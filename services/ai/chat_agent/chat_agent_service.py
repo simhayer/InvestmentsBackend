@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -14,7 +15,9 @@ from sqlalchemy.orm import Session
 
 from services.cache.cache_backend import cache_get, cache_set
 from services.finnhub.finnhub_fundamentals import fetch_fundamentals_cached
+from services.holding_service import get_all_holdings, get_holdings_with_live_prices
 from services.portfolio_service import get_portfolio_summary
+from services.tavily.client import search as tavily_search, compact_results as compact_tavily
 from services.vector.vector_store_service import VectorStoreService
 from models.user_onboarding_profile import UserOnboardingProfile
 from .types import ChatState, IntentResult
@@ -29,8 +32,30 @@ CHAT_HISTORY_TTL_SEC = int(os.getenv("CHAT_HISTORY_TTL_SEC", "21600"))  # 6h
 CHAT_MAX_HISTORY = int(os.getenv("CHAT_MAX_HISTORY", "14"))
 MAX_SYMBOLS = int(os.getenv("CHAT_MAX_SYMBOLS", "3"))
 MAX_VECTOR_CHARS = int(os.getenv("CHAT_MAX_VECTOR_CHARS", "6000"))
+MAX_HOLDINGS = int(os.getenv("CHAT_MAX_HOLDINGS", "25"))
+TTL_TAVILY_SEC = int(os.getenv("TTL_TAVILY_SEC", "900"))
 
 _EXPLICIT_SYMBOL_RE = re.compile(r"\$([A-Za-z]{1,6})\b")
+_HOLDINGS_Q_RE = re.compile(r"\b(what|which)\b.*\b(own|hold|holdings|positions)\b", re.IGNORECASE)
+_OWN_RE = re.compile(r"\b(?:do i|do we|do you|i|we)\s+(?:own|have|hold)\b", re.IGNORECASE)
+_LIST_RE = re.compile(r"\b(?:what|which|list|show)\b.*\b(holdings|positions|stocks|portfolio)\b", re.IGNORECASE)
+_SYMBOL_AFTER_OWN_RE = re.compile(r"\b(?:own|have|hold)\s+([A-Za-z]{1,12})\b", re.IGNORECASE)
+_STOPWORDS = {
+    "any",
+    "some",
+    "stocks",
+    "stock",
+    "holdings",
+    "positions",
+    "portfolio",
+    "shares",
+    "etf",
+    "etfs",
+    "crypto",
+    "cryptos",
+    "already",
+    "currently",
+}
 
 
 def _history_key(user_id: Any, session_id: str) -> str:
@@ -109,6 +134,170 @@ def _json_safe(value: Any) -> Any:
     return value
 
 
+def _is_holdings_list_question(text: str) -> bool:
+    t = text or ""
+    if _LIST_RE.search(t):
+        return True
+    t_low = t.lower()
+    if "own" in t_low and ("stock" in t_low or "stocks" in t_low or "holdings" in t_low or "positions" in t_low):
+        return True
+    return False
+
+
+def _extract_symbol_candidate(text: str) -> str | None:
+    if not text:
+        return None
+    hit = _EXPLICIT_SYMBOL_RE.search(text)
+    if hit:
+        return hit.group(1).upper()
+    hit = _SYMBOL_AFTER_OWN_RE.search(text)
+    if hit:
+        cand = hit.group(1).strip()
+        if cand and cand.lower() not in _STOPWORDS:
+            return cand.upper()
+    caps = re.findall(r"\b[A-Z]{2,6}\b", text)
+    for c in caps:
+        if c.lower() not in _STOPWORDS:
+            return c.upper()
+    return None
+
+
+def _aggregate_holdings(rows: List[Any]) -> List[Dict[str, Any]]:
+    out: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        sym = (getattr(row, "symbol", "") or "").strip().upper()
+        if not sym:
+            continue
+        rec = out.get(sym)
+        if not rec:
+            rec = {"symbol": sym, "name": getattr(row, "name", None), "quantity": 0.0}
+            out[sym] = rec
+        qty = getattr(row, "quantity", None)
+        try:
+            rec["quantity"] += float(qty or 0.0)
+        except (TypeError, ValueError):
+            pass
+    return list(out.values())
+
+
+def _render_holdings_list(rows: List[Any]) -> str:
+    holdings = _aggregate_holdings(rows)
+    if not holdings:
+        return "I couldn't find any holdings on your account."
+    lines = ["Here are the holdings I can see:"]
+    for h in holdings:
+        sym = h.get("symbol") or "Unknown"
+        name = h.get("name")
+        qty = h.get("quantity")
+        label = f"{sym}"
+        if name:
+            label = f"{sym} ({name})"
+        if qty:
+            lines.append(f"- {label}, qty {qty}")
+        else:
+            lines.append(f"- {label}")
+    lines.append("Want a breakdown by performance or sector?")
+    return "\n".join(lines)
+
+
+def _render_ownership_answer(rows: List[Any], candidate: str) -> str:
+    if not rows:
+        return "I couldn't find any holdings on your account."
+    sym = candidate.strip().upper()
+    matched = []
+    for row in rows:
+        row_sym = (getattr(row, "symbol", "") or "").strip().upper()
+        row_name = (getattr(row, "name", "") or "").strip().lower()
+        if sym == row_sym or sym.lower() in row_name:
+            matched.append(row)
+    if matched:
+        qty = sum(float(getattr(r, "quantity", 0.0) or 0.0) for r in matched)
+        if qty:
+            return f"Yes — you own {sym}. Total quantity: {qty}."
+        return f"Yes — you own {sym}."
+    return f"I don't see {sym} in your holdings. If you meant a ticker, try using the ticker symbol (e.g., $TSLA)."
+
+
+async def fast_path_node(state: ChatState) -> Dict[str, Any]:
+    message = (state.get("message") or "").strip()
+    db: Session = state.get("db")
+    user_id = state.get("user_id")
+
+    if not message or db is None or user_id is None:
+        return {"short_circuit": False}
+
+    if _is_holdings_list_question(message):
+        rows = get_all_holdings(str(user_id), db)
+        return {
+            "answer": _render_holdings_list(rows),
+            "short_circuit": True,
+            "fast_path_reason": "holdings_list",
+            "debug": {"fast_path": "holdings_list"},
+        }
+
+    if _OWN_RE.search(message):
+        candidate = _extract_symbol_candidate(message)
+        if not candidate:
+            return {"short_circuit": False}
+        rows = get_all_holdings(str(user_id), db)
+        return {
+            "answer": _render_ownership_answer(rows, candidate),
+            "short_circuit": True,
+            "fast_path_reason": "holdings_check",
+            "debug": {"fast_path": "holdings_check", "symbol": candidate},
+        }
+
+    return {"short_circuit": False}
+
+
+def _ck_news(q: str) -> str:
+    digest = hashlib.sha256((q or "").strip().lower().encode("utf-8")).hexdigest()[:16]
+    return f"CHAT:NEWS:{digest}"
+
+
+def _holding_brief(item: Any) -> Dict[str, Any]:
+    data = _json_safe(item)
+    if not isinstance(data, dict):
+        return {}
+    keys = [
+        "symbol",
+        "name",
+        "type",
+        "quantity",
+        "current_price",
+        "value",
+        "currency",
+        "weight",
+        "unrealized_pl",
+        "unrealized_pl_pct",
+        "account_name",
+    ]
+    return {k: data.get(k) for k in keys}
+
+
+def _render_holdings_answer(holdings: List[Dict[str, Any]]) -> str:
+    if not holdings:
+        return "I could not find any holdings on your account."
+    lines = ["Here are the current holdings I can see:"]
+    for h in holdings:
+        sym = h.get("symbol") or "Unknown"
+        name = h.get("name")
+        qty = h.get("quantity")
+        val = h.get("value")
+        cur = h.get("currency") or "USD"
+        label = f"{sym}"
+        if name:
+            label = f"{sym} ({name})"
+        parts = [label]
+        if qty is not None:
+            parts.append(f"qty {qty}")
+        if val is not None:
+            parts.append(f"value {val} {cur}")
+        lines.append("- " + ", ".join(parts))
+    lines.append("Want a breakdown by sector or performance?")
+    return "\n".join(lines)
+
+
 async def route_node(state: ChatState) -> Dict[str, Any]:
     message = (state.get("message") or "").strip()
     history = state.get("history") or []
@@ -153,7 +342,7 @@ async def route_node(state: ChatState) -> Dict[str, Any]:
     }
 
 
-async def context_node(state: ChatState) -> Dict[str, Any]:
+async def research_node(state: ChatState) -> Dict[str, Any]:
     db: Session = state.get("db")
     finnhub = state.get("finnhub")
     user_id = state.get("user_id")
@@ -171,6 +360,7 @@ async def context_node(state: ChatState) -> Dict[str, Any]:
         user_profile = _serialize_onboarding(profile)
 
     portfolio_summary: Dict[str, Any] = {}
+    holdings: List[Dict[str, Any]] = []
     if state.get("needs_portfolio") and finnhub is not None and db is not None:
         try:
             currency = (state.get("user_currency") or "USD").upper()
@@ -181,6 +371,18 @@ async def context_node(state: ChatState) -> Dict[str, Any]:
                 currency=currency,
                 top_n=5,
             )
+            holdings_payload = await get_holdings_with_live_prices(
+                user_id=str(user_id),
+                db=db,
+                finnhub=finnhub,
+                currency=currency,
+                top_only=False,
+                top_n=0,
+                include_weights=True,
+            )
+            items = (holdings_payload or {}).get("items") or []
+            holdings = [_holding_brief(it) for it in items if it]  # type: ignore[arg-type]
+            holdings = [h for h in holdings if h.get("symbol")][:MAX_HOLDINGS]
         except Exception as exc:
             logger.warning("portfolio_summary failed: %s", exc)
 
@@ -197,11 +399,56 @@ async def context_node(state: ChatState) -> Dict[str, Any]:
             fundamentals_gaps[sym] = res.gaps
 
     vector_context = ""
+    sec_business_context = ""
+    sec_risk_context = ""
+    sec_mda_context = ""
     if symbols and intent != "crypto":
         vector_service = VectorStoreService()
         chunks: List[str] = []
+        business_chunks: List[str] = []
+        risk_chunks: List[str] = []
+        mda_chunks: List[str] = []
         for sym in symbols:
             try:
+                business_sec = vector_service.get_context_for_analysis(
+                    db=db,
+                    symbol=sym,
+                    query="business model, segments, products, customers, revenue drivers",
+                    limit=6,
+                )
+                if business_sec:
+                    body = "\n".join(
+                        f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')}) {c.get('content')}"
+                        for c in business_sec
+                    )
+                    business_chunks.append(f"{sym} SEC BUSINESS CONTEXT:\n{body}")
+
+                risk_sec = vector_service.get_context_for_analysis(
+                    db=db,
+                    symbol=sym,
+                    query="risk factors, competition, regulation, liquidity, debt, margin pressure",
+                    limit=6,
+                )
+                if risk_sec:
+                    body = "\n".join(
+                        f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')}) {c.get('content')}"
+                        for c in risk_sec
+                    )
+                    risk_chunks.append(f"{sym} SEC RISK CONTEXT:\n{body}")
+
+                mda_sec = vector_service.get_context_for_analysis(
+                    db=db,
+                    symbol=sym,
+                    query="management discussion and analysis, outlook, trends, guidance, MD&A",
+                    limit=6,
+                )
+                if mda_sec:
+                    body = "\n".join(
+                        f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')}) {c.get('content')}"
+                        for c in mda_sec
+                    )
+                    mda_chunks.append(f"{sym} SEC MD&A CONTEXT:\n{body}")
+
                 sec_chunks = vector_service.get_context_for_analysis(
                     db=db,
                     symbol=sym,
@@ -217,22 +464,61 @@ async def context_node(state: ChatState) -> Dict[str, Any]:
             except Exception as exc:
                 logger.warning("vector_context failed for %s: %s", sym, exc)
         vector_context = "\n\n".join(chunks)[:MAX_VECTOR_CHARS]
+        sec_business_context = "\n\n".join(business_chunks)[:MAX_VECTOR_CHARS]
+        sec_risk_context = "\n\n".join(risk_chunks)[:MAX_VECTOR_CHARS]
+        sec_mda_context = "\n\n".join(mda_chunks)[:MAX_VECTOR_CHARS]
+
+    news_context = ""
+    if intent in {"stock_analysis", "market_news", "crypto"}:
+        query = ""
+        if symbols:
+            query = f"latest news, catalysts, and risks for {symbols[0]}"
+        elif intent == "market_news":
+            query = f"latest market news and catalysts: {message}"
+        if query:
+            news_key = _ck_news(query)
+            cached = cache_get(news_key)
+            if isinstance(cached, str):
+                news_context = cached
+            else:
+                try:
+                    results = await tavily_search(
+                        query=query,
+                        max_results=6,
+                        include_answer=False,
+                        include_raw_content=False,
+                        search_depth="advanced",
+                    )
+                    news_context = compact_tavily(results)
+                    cache_set(news_key, news_context, ttl_seconds=TTL_TAVILY_SEC)
+                except Exception as exc:
+                    logger.warning("tavily search failed: %s", exc)
 
     debug = {
         "symbols": symbols,
         "intent": intent,
         "has_portfolio": bool(portfolio_summary),
+        "holdings_count": len(holdings),
         "has_profile": bool(user_profile),
         "vector_chars": len(vector_context),
+        "sec_business_chars": len(sec_business_context),
+        "sec_risk_chars": len(sec_risk_context),
+        "sec_mda_chars": len(sec_mda_context),
+        "news_chars": len(news_context),
         "fundamentals_symbols": list(fundamentals.keys()),
     }
 
     return {
         "user_profile": user_profile,
-        "portfolio_summary": portfolio_summary,
+        "portfolio_summary": _json_safe(portfolio_summary),
+        "holdings": holdings,
         "fundamentals": fundamentals,
         "fundamentals_gaps": fundamentals_gaps,
         "vector_context": vector_context,
+        "sec_business_context": sec_business_context,
+        "sec_risk_context": sec_risk_context,
+        "sec_mda_context": sec_mda_context,
+        "news_context": news_context,
         "debug": debug,
     }
 
@@ -250,16 +536,27 @@ async def answer_node(state: ChatState) -> Dict[str, Any]:
             "iterations": int(state.get("iterations", 0)) + 1,
         }
 
+    holdings = state.get("holdings") or []
+    if intent == "portfolio" and holdings and _HOLDINGS_Q_RE.search(message):
+        return {
+            "answer": _render_holdings_answer(holdings),
+            "iterations": int(state.get("iterations", 0)) + 1,
+        }
+
     critique = (state.get("critique") or "").strip()
     critique_block = f"\n\nCRITIQUE TO FIX:\n{critique}\n" if critique else ""
 
     history_block = _format_history(history)
     profile_block = json.dumps(_json_safe(state.get("user_profile") or {}), separators=(",", ":"))
     portfolio_block = json.dumps(_json_safe(state.get("portfolio_summary") or {}), separators=(",", ":"))
+    holdings_block = json.dumps(_json_safe(state.get("holdings") or []), separators=(",", ":"))
     fundamentals_block = json.dumps(_json_safe(state.get("fundamentals") or {}), separators=(",", ":"))
     gaps_block = json.dumps(_json_safe(state.get("fundamentals_gaps") or {}), separators=(",", ":"))
     vector_context = state.get("vector_context") or ""
-
+    sec_business_context = state.get("sec_business_context") or ""
+    sec_risk_context = state.get("sec_risk_context") or ""
+    sec_mda_context = state.get("sec_mda_context") or ""
+    news_context = state.get("news_context") or ""
     prompt = f"""
         You are a senior financial analyst and stock expert.
         Stay strictly within stocks, ETFs, crypto, portfolio, and market analysis.
@@ -270,9 +567,15 @@ async def answer_node(state: ChatState) -> Dict[str, Any]:
         - Use fundamentals data (if present) for concrete metrics.
         - If the user asks about a company but no explicit ticker is provided, ask for the ticker.
         - Avoid trading instructions. Provide analysis and education only.
+        - If portfolio data is provided, only reference those holdings.
 
         Personalization:
         - Tailor tone to the user's onboarding profile when present (risk level, time horizon, experience).
+        - Include only sections that have supporting data (skip empty sections).
+        - If news_context is provided, include a short "News" section grounded in those items.
+        - If SEC context is provided, include a short "SEC" section (business/risks/MD&A as available).
+        - If portfolio data is provided, include a "Portfolio" section with concrete holdings/summary.
+        - If fundamentals are provided, include key metrics and note gaps when relevant.
 
         CHAT HISTORY:
         {history_block}
@@ -289,6 +592,9 @@ async def answer_node(state: ChatState) -> Dict[str, Any]:
         PORTFOLIO SUMMARY:
         {portfolio_block}
 
+        HOLDINGS:
+        {holdings_block}
+
         FUNDAMENTALS:
         {fundamentals_block}
 
@@ -297,6 +603,18 @@ async def answer_node(state: ChatState) -> Dict[str, Any]:
 
         VECTOR CONTEXT (SEC filings):
         {vector_context}
+
+        SEC BUSINESS SNIPS:
+        {sec_business_context}
+
+        SEC RISK SNIPS:
+        {sec_risk_context}
+
+        SEC MD&A SNIPS:
+        {sec_mda_context}
+
+        NEWS CONTEXT:
+        {news_context}
         {critique_block}
 
         Response style:
@@ -347,19 +665,27 @@ async def critic_node(state: ChatState) -> Dict[str, Any]:
 def _route_next(state: ChatState) -> str:
     if (state.get("intent") or "").strip().lower() == "off_topic":
         return "off_topic"
-    return "context"
+    return "research"
+
+
+def _fast_next(state: ChatState) -> str:
+    if state.get("short_circuit"):
+        return "end"
+    return "route"
 
 
 workflow = StateGraph(ChatState)
+workflow.add_node("fast_path", fast_path_node)
 workflow.add_node("route", route_node)
-workflow.add_node("context", context_node)
+workflow.add_node("research", research_node)
 workflow.add_node("answer", answer_node)
 workflow.add_node("critic", critic_node)
 workflow.add_node("off_topic", answer_node)
 
-workflow.set_entry_point("route")
-workflow.add_conditional_edges("route", _route_next, {"context": "context", "off_topic": "off_topic"})
-workflow.add_edge("context", "answer")
+workflow.set_entry_point("fast_path")
+workflow.add_conditional_edges("fast_path", _fast_next, {"route": "route", "end": END})
+workflow.add_conditional_edges("route", _route_next, {"research": "research", "off_topic": "off_topic"})
+workflow.add_edge("research", "answer")
 workflow.add_edge("answer", "critic")
 workflow.add_conditional_edges(
     "critic",

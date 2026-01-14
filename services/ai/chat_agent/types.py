@@ -25,14 +25,21 @@ class ChatState(TypedDict, total=False):
 
     user_profile: Dict[str, Any]
     portfolio_summary: Dict[str, Any]
+    holdings: List[Dict[str, Any]]
     fundamentals: Dict[str, Any]
     fundamentals_gaps: Dict[str, List[str]]
     vector_context: str
+    sec_business_context: str
+    sec_risk_context: str
+    sec_mda_context: str
+    news_context: str
 
     answer: str
     critique: str
     is_valid: bool
     iterations: int
+    short_circuit: bool
+    fast_path_reason: str
     debug: Dict[str, Any]
 
     db: Any
