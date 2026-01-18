@@ -56,6 +56,91 @@ _STOPWORDS = {
     "already",
     "currently",
 }
+_NEWS_HINTS = {
+    "news",
+    "headline",
+    "headlines",
+    "catalyst",
+    "catalysts",
+    "event",
+    "events",
+    "earnings",
+    "guidance",
+    "downgrade",
+    "upgrade",
+    "lawsuit",
+    "investigation",
+}
+_FUNDAMENTAL_HINTS = {
+    "fundamentals",
+    "financials",
+    "valuation",
+    "metrics",
+    "margin",
+    "revenue",
+    "earnings",
+    "profit",
+    "balance sheet",
+    "cash flow",
+}
+_SEC_BUSINESS_HINTS = {
+    "business",
+    "model",
+    "segments",
+    "customers",
+    "products",
+    "revenue",
+    "moat",
+}
+_SEC_GENERAL_HINTS = {
+    "sec",
+    "filing",
+    "filings",
+    "10-k",
+    "10k",
+    "10-q",
+    "10q",
+    "8-k",
+    "8k",
+}
+_SEC_RISK_HINTS = {
+    "risk",
+    "risks",
+    "uncertainty",
+    "headwinds",
+    "competition",
+    "regulation",
+    "liquidity",
+    "debt",
+    "margin",
+}
+_SEC_MDA_HINTS = {
+    "md&a",
+    "mda",
+    "outlook",
+    "guidance",
+    "trend",
+    "trends",
+    "management discussion",
+}
+_HOLDINGS_DETAIL_HINTS = {
+    "holdings",
+    "positions",
+    "allocation",
+    "weights",
+    "diversif",
+    "exposure",
+    "sector",
+    "what do i own",
+    "what do we own",
+    "list",
+    "show",
+}
+
+
+def _contains_any(text: str, terms: set[str]) -> bool:
+    t = (text or "").lower()
+    return any(term in t for term in terms)
 
 
 def _history_key(user_id: Any, session_id: str) -> str:
@@ -342,6 +427,56 @@ async def route_node(state: ChatState) -> Dict[str, Any]:
     }
 
 
+async def context_plan_node(state: ChatState) -> Dict[str, Any]:
+    message = (state.get("message") or "").strip()
+    intent = (state.get("intent") or "").strip()
+    symbols = state.get("symbols") or []
+    needs_portfolio = bool(state.get("needs_portfolio"))
+    needs_user_profile = bool(state.get("needs_user_profile"))
+
+    msg_lower = message.lower()
+    mentions_portfolio = "portfolio" in msg_lower or "holdings" in msg_lower or "positions" in msg_lower
+    holdings_detail = bool(
+        _HOLDINGS_Q_RE.search(message)
+        or _LIST_RE.search(message)
+        or _contains_any(message, _HOLDINGS_DETAIL_HINTS)
+    )
+
+    fetch_portfolio_summary = needs_portfolio or intent == "portfolio" or mentions_portfolio
+    fetch_holdings = fetch_portfolio_summary and holdings_detail
+    fetch_user_profile = needs_user_profile
+
+    fetch_fundamentals = bool(symbols) and (
+        intent in {"stock_analysis", "education", "portfolio"}
+        or _contains_any(message, _FUNDAMENTAL_HINTS)
+    )
+    fetch_sec_context = bool(symbols) and (
+        intent in {"stock_analysis", "education", "portfolio"}
+        or _contains_any(message, _SEC_GENERAL_HINTS)
+    )
+    fetch_sec_business = fetch_sec_context and _contains_any(message, _SEC_BUSINESS_HINTS)
+    fetch_sec_risk = fetch_sec_context and _contains_any(message, _SEC_RISK_HINTS)
+    fetch_sec_mda = fetch_sec_context and _contains_any(message, _SEC_MDA_HINTS)
+
+    fetch_news = False
+    if intent == "market_news":
+        fetch_news = True
+    elif _contains_any(message, _NEWS_HINTS):
+        fetch_news = True
+
+    return {
+        "fetch_user_profile": fetch_user_profile,
+        "fetch_portfolio_summary": fetch_portfolio_summary,
+        "fetch_holdings": fetch_holdings,
+        "fetch_fundamentals": fetch_fundamentals,
+        "fetch_sec_context": fetch_sec_context,
+        "fetch_sec_business": fetch_sec_business,
+        "fetch_sec_risk": fetch_sec_risk,
+        "fetch_sec_mda": fetch_sec_mda,
+        "fetch_news": fetch_news,
+    }
+
+
 async def research_node(state: ChatState) -> Dict[str, Any]:
     db: Session = state.get("db")
     finnhub = state.get("finnhub")
@@ -350,8 +485,18 @@ async def research_node(state: ChatState) -> Dict[str, Any]:
     symbols = state.get("symbols") or []
     intent = state.get("intent") or ""
 
+    fetch_user_profile = bool(state.get("fetch_user_profile") or state.get("needs_user_profile"))
+    fetch_portfolio_summary = bool(state.get("fetch_portfolio_summary") or state.get("needs_portfolio"))
+    fetch_holdings = bool(state.get("fetch_holdings"))
+    fetch_fundamentals = bool(state.get("fetch_fundamentals"))
+    fetch_sec_context = bool(state.get("fetch_sec_context"))
+    fetch_sec_business = bool(state.get("fetch_sec_business"))
+    fetch_sec_risk = bool(state.get("fetch_sec_risk"))
+    fetch_sec_mda = bool(state.get("fetch_sec_mda"))
+    fetch_news = bool(state.get("fetch_news"))
+
     user_profile: Dict[str, Any] = {}
-    if state.get("needs_user_profile") and db is not None and user_id is not None:
+    if fetch_user_profile and db is not None and user_id is not None:
         profile = (
             db.query(UserOnboardingProfile)
             .filter(UserOnboardingProfile.user_id == user_id)
@@ -361,34 +506,36 @@ async def research_node(state: ChatState) -> Dict[str, Any]:
 
     portfolio_summary: Dict[str, Any] = {}
     holdings: List[Dict[str, Any]] = []
-    if state.get("needs_portfolio") and finnhub is not None and db is not None:
+    if (fetch_portfolio_summary or fetch_holdings) and finnhub is not None and db is not None:
         try:
             currency = (state.get("user_currency") or "USD").upper()
-            portfolio_summary = await get_portfolio_summary(
-                user_id=str(user_id),
-                db=db,
-                finnhub=finnhub,
-                currency=currency,
-                top_n=5,
-            )
-            holdings_payload = await get_holdings_with_live_prices(
-                user_id=str(user_id),
-                db=db,
-                finnhub=finnhub,
-                currency=currency,
-                top_only=False,
-                top_n=0,
-                include_weights=True,
-            )
-            items = (holdings_payload or {}).get("items") or []
-            holdings = [_holding_brief(it) for it in items if it]  # type: ignore[arg-type]
-            holdings = [h for h in holdings if h.get("symbol")][:MAX_HOLDINGS]
+            if fetch_portfolio_summary:
+                portfolio_summary = await get_portfolio_summary(
+                    user_id=str(user_id),
+                    db=db,
+                    finnhub=finnhub,
+                    currency=currency,
+                    top_n=5,
+                )
+            if fetch_holdings:
+                holdings_payload = await get_holdings_with_live_prices(
+                    user_id=str(user_id),
+                    db=db,
+                    finnhub=finnhub,
+                    currency=currency,
+                    top_only=False,
+                    top_n=0,
+                    include_weights=True,
+                )
+                items = (holdings_payload or {}).get("items") or []
+                holdings = [_holding_brief(it) for it in items if it]  # type: ignore[arg-type]
+                holdings = [h for h in holdings if h.get("symbol")][:MAX_HOLDINGS]
         except Exception as exc:
             logger.warning("portfolio_summary failed: %s", exc)
 
     fundamentals: Dict[str, Any] = {}
     fundamentals_gaps: Dict[str, List[str]] = {}
-    if symbols:
+    if fetch_fundamentals and symbols:
         tasks = [fetch_fundamentals_cached(sym, timeout_s=5.0) for sym in symbols]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         for sym, res in zip(symbols, results):
@@ -402,7 +549,7 @@ async def research_node(state: ChatState) -> Dict[str, Any]:
     sec_business_context = ""
     sec_risk_context = ""
     sec_mda_context = ""
-    if symbols and intent != "crypto":
+    if symbols and intent != "crypto" and (fetch_sec_context or fetch_sec_business or fetch_sec_risk or fetch_sec_mda):
         vector_service = VectorStoreService()
         chunks: List[str] = []
         business_chunks: List[str] = []
@@ -410,57 +557,61 @@ async def research_node(state: ChatState) -> Dict[str, Any]:
         mda_chunks: List[str] = []
         for sym in symbols:
             try:
-                business_sec = vector_service.get_context_for_analysis(
-                    db=db,
-                    symbol=sym,
-                    query="business model, segments, products, customers, revenue drivers",
-                    limit=6,
-                )
-                if business_sec:
-                    body = "\n".join(
-                        f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')}) {c.get('content')}"
-                        for c in business_sec
+                if fetch_sec_business:
+                    business_sec = vector_service.get_context_for_analysis(
+                        db=db,
+                        symbol=sym,
+                        query="business model, segments, products, customers, revenue drivers",
+                        limit=6,
                     )
-                    business_chunks.append(f"{sym} SEC BUSINESS CONTEXT:\n{body}")
+                    if business_sec:
+                        body = "\n".join(
+                            f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')}) {c.get('content')}"
+                            for c in business_sec
+                        )
+                        business_chunks.append(f"{sym} SEC BUSINESS CONTEXT:\n{body}")
 
-                risk_sec = vector_service.get_context_for_analysis(
-                    db=db,
-                    symbol=sym,
-                    query="risk factors, competition, regulation, liquidity, debt, margin pressure",
-                    limit=6,
-                )
-                if risk_sec:
-                    body = "\n".join(
-                        f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')}) {c.get('content')}"
-                        for c in risk_sec
+                if fetch_sec_risk:
+                    risk_sec = vector_service.get_context_for_analysis(
+                        db=db,
+                        symbol=sym,
+                        query="risk factors, competition, regulation, liquidity, debt, margin pressure",
+                        limit=6,
                     )
-                    risk_chunks.append(f"{sym} SEC RISK CONTEXT:\n{body}")
+                    if risk_sec:
+                        body = "\n".join(
+                            f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')}) {c.get('content')}"
+                            for c in risk_sec
+                        )
+                        risk_chunks.append(f"{sym} SEC RISK CONTEXT:\n{body}")
 
-                mda_sec = vector_service.get_context_for_analysis(
-                    db=db,
-                    symbol=sym,
-                    query="management discussion and analysis, outlook, trends, guidance, MD&A",
-                    limit=6,
-                )
-                if mda_sec:
-                    body = "\n".join(
-                        f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')}) {c.get('content')}"
-                        for c in mda_sec
+                if fetch_sec_mda:
+                    mda_sec = vector_service.get_context_for_analysis(
+                        db=db,
+                        symbol=sym,
+                        query="management discussion and analysis, outlook, trends, guidance, MD&A",
+                        limit=6,
                     )
-                    mda_chunks.append(f"{sym} SEC MD&A CONTEXT:\n{body}")
+                    if mda_sec:
+                        body = "\n".join(
+                            f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')}) {c.get('content')}"
+                            for c in mda_sec
+                        )
+                        mda_chunks.append(f"{sym} SEC MD&A CONTEXT:\n{body}")
 
-                sec_chunks = vector_service.get_context_for_analysis(
-                    db=db,
-                    symbol=sym,
-                    query=message,
-                    limit=6,
-                )
-                if sec_chunks:
-                    body = "\n".join(
-                        f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')}) {c.get('content')}"
-                        for c in sec_chunks
+                if fetch_sec_context:
+                    sec_chunks = vector_service.get_context_for_analysis(
+                        db=db,
+                        symbol=sym,
+                        query=message,
+                        limit=6,
                     )
-                    chunks.append(f"{sym} SEC CONTEXT:\n{body}")
+                    if sec_chunks:
+                        body = "\n".join(
+                            f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')}) {c.get('content')}"
+                            for c in sec_chunks
+                        )
+                        chunks.append(f"{sym} SEC CONTEXT:\n{body}")
             except Exception as exc:
                 logger.warning("vector_context failed for %s: %s", sym, exc)
         vector_context = "\n\n".join(chunks)[:MAX_VECTOR_CHARS]
@@ -469,12 +620,14 @@ async def research_node(state: ChatState) -> Dict[str, Any]:
         sec_mda_context = "\n\n".join(mda_chunks)[:MAX_VECTOR_CHARS]
 
     news_context = ""
-    if intent in {"stock_analysis", "market_news", "crypto"}:
+    if fetch_news:
         query = ""
         if symbols:
             query = f"latest news, catalysts, and risks for {symbols[0]}"
         elif intent == "market_news":
             query = f"latest market news and catalysts: {message}"
+        else:
+            query = f"latest news related to: {message}"
         if query:
             news_key = _ck_news(query)
             cached = cache_get(news_key)
@@ -497,6 +650,15 @@ async def research_node(state: ChatState) -> Dict[str, Any]:
     debug = {
         "symbols": symbols,
         "intent": intent,
+        "fetch_user_profile": fetch_user_profile,
+        "fetch_portfolio_summary": fetch_portfolio_summary,
+        "fetch_holdings": fetch_holdings,
+        "fetch_fundamentals": fetch_fundamentals,
+        "fetch_sec_context": fetch_sec_context,
+        "fetch_sec_business": fetch_sec_business,
+        "fetch_sec_risk": fetch_sec_risk,
+        "fetch_sec_mda": fetch_sec_mda,
+        "fetch_news": fetch_news,
         "has_portfolio": bool(portfolio_summary),
         "holdings_count": len(holdings),
         "has_profile": bool(user_profile),
@@ -665,7 +827,7 @@ async def critic_node(state: ChatState) -> Dict[str, Any]:
 def _route_next(state: ChatState) -> str:
     if (state.get("intent") or "").strip().lower() == "off_topic":
         return "off_topic"
-    return "research"
+    return "plan"
 
 
 def _fast_next(state: ChatState) -> str:
@@ -677,6 +839,7 @@ def _fast_next(state: ChatState) -> str:
 workflow = StateGraph(ChatState)
 workflow.add_node("fast_path", fast_path_node)
 workflow.add_node("route", route_node)
+workflow.add_node("plan", context_plan_node)
 workflow.add_node("research", research_node)
 workflow.add_node("answer", answer_node)
 workflow.add_node("critic", critic_node)
@@ -684,7 +847,8 @@ workflow.add_node("off_topic", answer_node)
 
 workflow.set_entry_point("fast_path")
 workflow.add_conditional_edges("fast_path", _fast_next, {"route": "route", "end": END})
-workflow.add_conditional_edges("route", _route_next, {"research": "research", "off_topic": "off_topic"})
+workflow.add_conditional_edges("route", _route_next, {"plan": "plan", "off_topic": "off_topic"})
+workflow.add_edge("plan", "research")
 workflow.add_edge("research", "answer")
 workflow.add_edge("answer", "critic")
 workflow.add_conditional_edges(

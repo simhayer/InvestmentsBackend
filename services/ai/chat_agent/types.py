@@ -22,6 +22,15 @@ class ChatState(TypedDict, total=False):
     symbols: List[str]
     needs_portfolio: bool
     needs_user_profile: bool
+    fetch_user_profile: bool
+    fetch_portfolio_summary: bool
+    fetch_holdings: bool
+    fetch_fundamentals: bool
+    fetch_sec_context: bool
+    fetch_sec_business: bool
+    fetch_sec_risk: bool
+    fetch_sec_mda: bool
+    fetch_news: bool
 
     user_profile: Dict[str, Any]
     portfolio_summary: Dict[str, Any]
