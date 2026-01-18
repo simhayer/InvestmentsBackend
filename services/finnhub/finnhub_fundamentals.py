@@ -60,18 +60,6 @@ async def fetch_fundamentals(symbol: str, *, timeout_s: float = 5.0) -> Fundamen
         return_exceptions=True,
     )
 
-    with timed("fh_profile", logger, state={"symbol": clean_symbol, "task_id": "fundamentals"}):
-        profile = await svc.fetch_profile(clean_symbol, client=client)
-
-    with timed("fh_quote", logger, state={"symbol": clean_symbol, "task_id": "fundamentals"}):
-        quote = await svc.fetch_quote(clean_symbol, client=client)
-
-    with timed("fh_metrics", logger, state={"symbol": clean_symbol, "task_id": "fundamentals"}):
-        metrics_raw = await svc.fetch_basic_financials(clean_symbol, client=client)
-
-    with timed("fh_earnings", logger, state={"symbol": clean_symbol, "task_id": "fundamentals"}):
-        earnings_raw = await svc.fetch_earnings(clean_symbol, client=client)
-
     profile, quote, metrics_raw, earnings_raw = results
 
     if isinstance(profile, Exception) or not isinstance(profile, dict) or not profile:
@@ -93,15 +81,37 @@ async def fetch_fundamentals(symbol: str, *, timeout_s: float = 5.0) -> Fundamen
     else:
         earnings = [row for row in earnings_raw if isinstance(row, dict)]
 
+    ev = _pick_metric(metrics, "enterpriseValue")
+    ev_to_fcf = _pick_metric(metrics, "currentEv/freeCashFlowTTM")
+
+    free_cash_flow = (
+        ev / ev_to_fcf
+        if ev is not None and ev_to_fcf not in (None, 0)
+        else None
+    )
+
     normalized = {
         "market_cap": _pick_metric(metrics, "marketCapitalization")
         or _coerce_float(profile.get("marketCapitalization")),
+
         "pe_ttm": _pick_metric(metrics, "peTTM"),
-        "revenue_growth_yoy": _pick_metric(metrics, "revenueGrowthTTM", "revenueGrowthTTMYoy"),
+
+        "revenue_growth_yoy": _pick_metric(
+            metrics, "revenueGrowthTTMYoy", "revenueGrowthQuarterlyYoy"
+        ),
+
         "gross_margin": _pick_metric(metrics, "grossMarginTTM"),
         "operating_margin": _pick_metric(metrics, "operatingMarginTTM"),
-        "free_cash_flow": _pick_metric(metrics, "freeCashFlowTTM"),
-        "debt_to_equity": _pick_metric(metrics, "totalDebtToEquity", "debtToEquity"),
+
+        "free_cash_flow": free_cash_flow,
+
+        "debt_to_equity": _pick_metric(
+            metrics,
+            "totalDebt/totalEquityQuarterly",
+            "totalDebt/totalEquityAnnual",
+            "longTermDebt/equityQuarterly",
+            "longTermDebt/equityAnnual",
+        ),
     }
 
     data = {

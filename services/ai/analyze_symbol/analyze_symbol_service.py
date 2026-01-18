@@ -199,6 +199,7 @@ async def drafts_node(state: AgentState):
     async def do_fundamentals():
         prompt = f"""
             Analyze {symbol}. Write 3–6 Key Insights as short bullets.
+            - At least one insight must identify a potential mispricing or market assumption.
 
             BUSINESS MODEL CONTEXT (SEC Item 1):
             {format_sec_chunks(sec_bus)}
@@ -317,6 +318,9 @@ Brevity caps (speed):
 - key_debates: <= 4
 - what_to_watch_next: <= 6
 - evidence: optional; if present, note must be non-empty and <= 8 words.
+
+Decision rule:
+- The recommendation must explicitly reference at least one upside driver and one downside risk.
 
 INPUTS (trimmed):
 SYMBOL: {symbol}
