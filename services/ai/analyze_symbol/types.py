@@ -66,6 +66,15 @@ class DebateItem(BaseModel):
     debate: str = Field(description="e.g., 'Margin durability vs competitive pressure'")
     what_to_watch: List[str] = Field(default_factory=list)
 
+class MarketEdge(BaseModel):
+    consensus_view: str = Field(description="What the market currently assumes.")
+    variant_view: str = Field(description="Why that assumption may be wrong or fragile.")
+    why_it_matters: str = Field(description="Implications if the variant view is correct.")
+
+class KeyInsight(BaseModel):
+    insight: str
+    evidence: Optional[str]
+    implication: Optional[str]
 
 # ----------------------------
 # Output schema (upgraded)
@@ -73,7 +82,7 @@ class DebateItem(BaseModel):
 class AnalysisReport(BaseModel):
     # Keep existing fields
     symbol: str
-    key_insights: List[str] = Field(description="Critical fundamental highlights")
+    key_insights: List[KeyInsight] = Field(description="Critical fundamental highlights")
     current_performance: str = Field(description="Technical and price action analysis")
     stock_overflow_risks: List[str] = Field(description="Red flags and assessment of risks")
     price_outlook: str = Field(description="Deeply reasoned AI outlook balancing bull/bear cases")
@@ -116,6 +125,16 @@ class AnalysisReport(BaseModel):
     data_quality_notes: List[str] = Field(
         default_factory=list,
         description="Call out missing fundamentals/weak news/empty SEC context."
+    )
+
+    market_edge: Optional[MarketEdge] = Field(
+        default=None,
+        description="Where is the market likely wrong? Consensus vs variant view."
+    )
+
+    pricing_assessment: Optional[Dict[str, str]] = Field(
+        default=None,
+        description="What is priced in vs not priced in."
     )
 
 

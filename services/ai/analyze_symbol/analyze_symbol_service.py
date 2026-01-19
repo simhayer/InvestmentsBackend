@@ -200,6 +200,10 @@ async def drafts_node(state: AgentState):
         prompt = f"""
             Analyze {symbol}. Write 3–6 Key Insights as short bullets.
             - At least one insight must identify a potential mispricing or market assumption.
+            - At least one insight must explicitly state:
+                (a) what the market consensus assumes
+                (b) why that assumption may be wrong or fragile
+            - Avoid statements that would apply to any mega-cap tech stock.
 
             BUSINESS MODEL CONTEXT (SEC Item 1):
             {format_sec_chunks(sec_bus)}
@@ -214,6 +218,7 @@ async def drafts_node(state: AgentState):
             Rules:
             - Ground at least 2 bullets in the SEC context (business model/drivers).
             - Use concrete metrics from FINNHUB NORMALIZED.
+            - Use contrast words: "despite", "however", "underestimates", "overlooks".
             Return plain text bullets.
             """
         with timed("llm_fundamentals",logger, state=state, tags={"prompt_kb": round(len(prompt) / 1024, 1)},):
@@ -224,6 +229,9 @@ async def drafts_node(state: AgentState):
     async def do_risks():
         prompt = f"""
             Identify stock risks for {symbol}. Be skeptical.
+                (a) the cost or revenue line affected
+                (b) timing (near-term vs structural)
+                (c) why this risk is NOT fully diversified away by Apple's scale
 
             OFFICIAL RISK FACTORS (SEC Item 1A):
             {format_sec_chunks(sec_risks_raw)}
@@ -302,27 +310,99 @@ Return a JSON object that matches the AnalysisReport schema EXACTLY.
 
 Definitive truth: next earnings date is {next_date}.
 
-Hard rules:
-- recommendation: Buy / Hold / Sell
-- confidence: 0.0 to 1.0
-- is_priced_in: true/false
-- Use FINNHUB NORMALIZED as the only source of exact metrics.
-- Scenarios must be exactly: Base, Bull, Bear.
-- upcoming_catalysts: exactly 3 items.
-  - If a catalyst is earnings-related, window MUST be exactly "{next_date}" (YYYY-MM-DD).
+====================
+NON-NEGOTIABLE RULES
+====================
 
-Brevity caps (speed):
-- key_insights: 3–6
-- stock_overflow_risks: 4–8
-- thesis_points: <= 5
-- key_debates: <= 4
-- what_to_watch_next: <= 6
-- evidence: optional; if present, note must be non-empty and <= 8 words.
+GENERAL
+- Write like a buy-side analyst, not a summary bot.
+- Avoid generic language. Every claim must earn its place.
+- Do NOT use placeholder phrases such as:
+  "Potential Mispricing", "Market Assumption", "Strong Performance",
+  "Key Risk", "Mixed Outlook", "Could Impact", "May See Upside".
+- If a statement could apply to multiple mega-cap tech stocks, it is INVALID.
+  Rewrite until it is Apple-specific.
 
-Decision rule:
-- The recommendation must explicitly reference at least one upside driver and one downside risk.
+METRICS & DATA
+- Use FINNHUB NORMALIZED as the ONLY source of exact metrics.
+- Metrics must be INTERPRETED, not merely repeated.
+  (e.g., explain why 6.4% growth matters at a 33x multiple.)
 
-INPUTS (trimmed):
+KEY INSIGHTS (STRICT)
+- Provide 3–6 insights.
+- Each insight MUST:
+  (1) reference at least one concrete metric AND
+  (2) reference a market expectation, assumption, or valuation implication.
+- At least one insight MUST explicitly link valuation (P/E or expectations)
+  to growth, margins, or risk.
+- Titles like "Potential Mispricing Insight" or "Market Assumption" are forbidden.
+
+MARKET EDGE (REQUIRED IF confidence ≥ 0.6)
+- market_edge MUST be present if confidence is 0.6 or higher.
+- It must clearly state:
+  - what the market assumes
+  - why that assumption may be wrong or fragile
+  - why it matters for valuation or risk
+- At least one key_insight MUST reference the same gap described in market_edge.
+
+IS_PRICED_IN LOGIC (STRICT)
+- is_priced_in MUST be a boolean.
+
+- pricing_assessment MUST be an object with EXACT keys:
+  - market_expectation (non-empty string)
+  - variant_outcome (non-empty string)
+  - valuation_sensitivity (non-empty string)
+
+- If is_priced_in = false:
+  - pricing_assessment.market_expectation MUST state what the market embeds.
+  - pricing_assessment.variant_outcome MUST state what outcome differs.
+  - pricing_assessment.valuation_sensitivity MUST state why the multiple/valuation is sensitive to that gap.
+
+- If is_priced_in = true:
+  - pricing_assessment MUST still be present and explain what upside/downside is already reflected and why.
+
+RECOMMENDATION DISCIPLINE
+- recommendation MUST explicitly reference:
+  - one upside driver AND
+  - one downside risk AND
+  - valuation context.
+AND must imply what would trigger:
+    - an upgrade
+    - or a downgrade
+- Avoid vague phrasing.
+- Implicitly or explicitly indicate what would cause an upgrade or downgrade.
+
+PRICE OUTLOOK
+- Must reference valuation AND downside asymmetry.
+- Must explicitly connect at least ONE fundamental change (growth, margin, cost, or risk) to a plausible multiple expansion or contraction.
+- Avoid conditional fluff ("if things go well").
+- Focus on how expectations vs reality could shift the multiple.
+
+SCENARIOS
+- Scenarios must be EXACTLY: Base, Bull, Bear.
+- Each scenario should imply relative upside or downside
+  (qualitative language is sufficient; no price targets).
+
+CONFIDENCE
+- confidence (0.0–1.0) MUST be defensible by:
+  - data completeness
+  - thesis robustness
+  - sensitivity to key risks.
+- If confidence ≥ 0.7, at least ONE key_insight must:
+   - rely on SEC disclosures OR
+   - cite a falsifiable operational assumption.
+- If DATA QUALITY NOTES are non-empty, confidence should generally be < 0.8
+  unless explicitly justified.
+
+CATALYSTS
+- upcoming_catalysts MUST contain exactly 3 items.
+- If a catalyst is earnings-related, window MUST be "{next_date}".
+- Mechanisms must describe how valuation or expectations change.
+
+====================
+INPUTS (TRIMMED)
+====================
+
 SYMBOL: {symbol}
 
 NORMALIZED:
@@ -352,18 +432,20 @@ SEC MD&A SNIPS:
 NEWS (trimmed):
 {json_dumps(news_small)}
 
-DRAFT INSIGHTS (seed):
+DRAFT INSIGHTS (seed, may be rewritten):
 {fundamentals_draft}
 
-DRAFT RISKS (seed):
+DRAFT RISKS (seed, may be rewritten):
 {risks_draft}
 
 MARKET PERFORMANCE (deterministic):
 {technicals_text}
 
-DATA QUALITY NOTES (copy into report.data_quality_notes):
+DATA QUALITY NOTES (copy verbatim into report.data_quality_notes):
 {json_dumps(data_quality_notes)}
-{critique_block}
+
+IMPORTANT:
+If any section violates the rules above, rewrite it BEFORE finalizing the JSON.
 """
 
     with timed("llm_analyst_structured_merged", logger, state=state, tags={"prompt_kb": round(len(prompt)/1024, 1)}):
@@ -385,12 +467,18 @@ async def critic_node(state: AgentState):
     issues = validate_report(report_obj, next_earnings_date=next_date, finnhub_gaps=finnhub_gaps)
     if not issues:
         return {"is_valid": True, "critique": "CLEAR"}
+    else:
+        logger.info("Report validation found %d issues for %s", len(issues), state.get("symbol", ""))
+        print("Issues:", issues)
 
     # Only send what matters
     small_payload = {
         "issues": issues,
         "recommendation": report_obj.get("recommendation"),
         "confidence": report_obj.get("confidence"),
+        "is_priced_in": report_obj.get("is_priced_in"),
+        "pricing_assessment": report_obj.get("pricing_assessment"),
+        "stock_overflow_risks": report_obj.get("stock_overflow_risks"),
         "upcoming_catalysts": report_obj.get("upcoming_catalysts"),
         "scenarios": report_obj.get("scenarios"),
     }

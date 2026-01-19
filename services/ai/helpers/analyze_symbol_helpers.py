@@ -7,7 +7,7 @@ from services.yahoo_service import get_price_history
 import json
 import logging
 from contextlib import contextmanager
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 from database import get_db
 from services.cache.cache_backend import cache_get, cache_set
@@ -449,6 +449,14 @@ def _is_nonempty_str(x: Any) -> bool:
 def _as_list(x: Any) -> List[Any]:
     return x if isinstance(x, list) else []
 
+def _is_str_or_none(x):
+    return x is None or isinstance(x, str)
+
+def _req_nonempty_str(d, key, issues, msg):
+    v = d.get(key)
+    if not isinstance(v, str) or not v.strip():
+        issues.append(msg)
+
 def validate_report(report: Dict[str, Any], *, next_earnings_date: str, finnhub_gaps: List[str]) -> List[str]:
     issues: List[str] = []
 
@@ -463,16 +471,35 @@ def validate_report(report: Dict[str, Any], *, next_earnings_date: str, finnhub_
     conf = report.get("confidence")
     if not isinstance(conf, (int, float)) or conf < 0.0 or conf > 1.0:
         issues.append("confidence must be a number between 0 and 1.")
+        conf = None
     else:
         if finnhub_gaps and conf > 0.55:
             issues.append("confidence too high given FINNHUB gaps (cap 0.55).")
 
+    # --- key_insights (now objects) ---
+    key_insights = _as_list(report.get("key_insights"))
+    if len(key_insights) < 3:
+        issues.append("key_insights should have at least 3 items.")
+    else:
+        for i, ki in enumerate(key_insights, 1):
+            if not isinstance(ki, dict):
+                issues.append(f"key_insight #{i} must be an object.")
+                continue
+            if not isinstance(ki.get("insight"), str) or not ki["insight"].strip():
+                issues.append(f"key_insight #{i} missing non-empty insight.")
+            if not _is_str_or_none(ki.get("evidence")):
+                issues.append(f"key_insight #{i} evidence must be string or null.")
+            if not _is_str_or_none(ki.get("implication")):
+                issues.append(f"key_insight #{i} implication must be string or null.")
+
+    # --- risks ---
+    if len(_as_list(report.get("stock_overflow_risks"))) < 2:
+        issues.append("stock_overflow_risks should have at least 2 items.")
+
     # --- scenarios ---
     scenarios = _as_list(report.get("scenarios"))
-    # collect only string names to avoid None values which cause typing errors with sorted()
-    names = [s.get("name") for s in scenarios if isinstance(s, dict) and isinstance(s.get("name"), str)]
-    # ensure sorted() receives only str items to satisfy static type checkers
-    if sorted([n for n in names if isinstance(n, str)]) != ["Base", "Bear", "Bull"] or len(scenarios) != 3:
+    names: List[str] = [cast(str, s.get("name")) for s in scenarios if isinstance(s, dict) and isinstance(s.get("name"), str)]
+    if len(scenarios) != 3 or sorted(names) != ["Base", "Bear", "Bull"]:
         issues.append("scenarios must be exactly 3 with names Base/Bull/Bear.")
 
     # --- catalysts ---
@@ -484,57 +511,52 @@ def validate_report(report: Dict[str, Any], *, next_earnings_date: str, finnhub_
             if not isinstance(c, dict):
                 issues.append(f"catalyst #{i} is not an object.")
                 continue
-
             missing = [f for f in REQ_CATALYST_FIELDS if f not in c]
             if missing:
                 issues.append(f"catalyst #{i} missing fields: {', '.join(missing)}")
 
-            # window format checks
             window = c.get("window")
             if not _is_nonempty_str(window):
                 issues.append(f"catalyst #{i} window is empty.")
             else:
-                # If earnings-related, enforce exact date
                 name = (c.get("name") or "").lower()
                 trig = (c.get("trigger") or "").lower()
                 if ("earnings" in name) or ("earnings" in trig):
                     if next_earnings_date != "Unknown" and window != next_earnings_date:
                         issues.append(f"earnings catalyst window must equal {next_earnings_date} exactly.")
 
-            # probability bounds
             p = c.get("probability")
             if not isinstance(p, (int, float)) or p < 0.0 or p > 1.0:
                 issues.append(f"catalyst #{i} probability must be 0..1.")
 
-            # impact_channels sanity
-            impact = _as_list(c.get("impact_channels"))
-            if len(impact) == 0:
-                issues.append(f"catalyst #{i} impact_channels is empty.")
-            if len(impact) > 3:
-                issues.append(f"catalyst #{i} impact_channels should be <= 3 for brevity.")
+    # --- market_edge rules tied to confidence ---
+    if isinstance(conf, (int, float)) and conf >= 0.6:
+        me = report.get("market_edge")
+        if not isinstance(me, dict):
+            issues.append("market_edge must be present when confidence >= 0.6.")
+        else:
+            _req_nonempty_str(me, "consensus_view", issues, "market_edge.consensus_view must be non-empty.")
+            _req_nonempty_str(me, "variant_view", issues, "market_edge.variant_view must be non-empty.")
+            _req_nonempty_str(me, "why_it_matters", issues, "market_edge.why_it_matters must be non-empty.")
 
-            # key_watch_items sanity
-            watch = _as_list(c.get("key_watch_items"))
-            if len(watch) == 0:
-                issues.append(f"catalyst #{i} key_watch_items is empty.")
-            if len(watch) > 4:
-                issues.append(f"catalyst #{i} key_watch_items should be <= 4 for brevity.")
+    # --- is_priced_in logic ---
+    is_priced_in = report.get("is_priced_in")
+    if not isinstance(is_priced_in, bool):
+        issues.append("is_priced_in must be boolean.")
+    else:
+        pa = report.get("pricing_assessment")
+        if is_priced_in is False:
+            if not isinstance(pa, dict):
+                issues.append("pricing_assessment must be present when is_priced_in = false.")
+            else:
+                # choose keys you want to standardize:
+                for k in ("market_expectation", "variant_outcome", "valuation_sensitivity"):
+                    if not _is_nonempty_str(pa.get(k)):
+                        issues.append(f"pricing_assessment.{k} must be non-empty when is_priced_in = false.")
 
-            # evidence note not empty if evidence exists
-            evid = _as_list(c.get("evidence"))
-            for e in evid:
-                if isinstance(e, dict) and e.get("note") == "":
-                    issues.append(f"catalyst #{i} has evidence with empty note; either omit evidence or add short note.")
-
-    # --- thesis_points ---
+    # --- thesis_points cap (keep yours) ---
     thesis_points = _as_list(report.get("thesis_points"))
     if thesis_points and len(thesis_points) > 5:
         issues.append("thesis_points should be <= 5 for speed/brevity.")
-
-    # --- key_insights and risks basic ---
-    if len(_as_list(report.get("key_insights"))) < 3:
-        issues.append("key_insights should have at least 3 items.")
-    if len(_as_list(report.get("stock_overflow_risks"))) < 4:
-        issues.append("stock_overflow_risks should have at least 4 items.")
 
     return issues
