@@ -15,6 +15,7 @@ from services.finnhub.finnhub_service import FinnhubService
 from services.supabase_auth import get_current_db_user
 from services.ai.chat_agent.chat_agent_service import (
     run_chat_turn,
+    run_chat_turn_stream,
     load_chat_history,
     append_chat_history,
 )
@@ -29,12 +30,6 @@ class ChatRequest(BaseModel):
 
 def _make_session_id(user_id: Any) -> str:
     return f"sess_{user_id}_{os.urandom(6).hex()}"
-
-
-def _chunk_text(text: str, size: int = 220) -> List[str]:
-    if not text:
-        return [""]
-    return [text[i:i + size] for i in range(0, len(text), size)]
 
 
 def _sse_pack(event: str, data: Any) -> str:
@@ -108,7 +103,8 @@ async def chat_stream_endpoint(
         yield _sse_pack("meta", {"session_id": session_id})
         t0 = time.perf_counter()
         try:
-            answer, _debug = await run_chat_turn(
+            answer_parts: List[str] = []
+            async for chunk in run_chat_turn_stream(
                 message=message,
                 user_id=user.id,
                 user_currency=user.currency or "USD",
@@ -116,11 +112,15 @@ async def chat_stream_endpoint(
                 history=history,
                 db=db,
                 finnhub=finnhub,
-            )
+            ):
+                if chunk:
+                    answer_parts.append(chunk)
+                    yield _sse_pack("delta", chunk)
         except Exception as exc:
             yield _sse_pack("error", {"error": str(exc)})
             return
         response_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+        answer = "".join(answer_parts).strip()
 
         append_chat_history(
             user.id,
@@ -131,8 +131,6 @@ async def chat_stream_endpoint(
             ],
         )
 
-        for chunk in _chunk_text(answer):
-            yield _sse_pack("delta", chunk)
         yield _sse_pack("done", {"status": "ok", "response_ms": response_ms})
 
     headers = {

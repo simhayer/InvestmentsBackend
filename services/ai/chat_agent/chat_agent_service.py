@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import logging
 import os
@@ -10,16 +9,20 @@ from typing import Any, Dict, List, Tuple
 
 from langgraph.graph import StateGraph, END
 from langchain_openai import ChatOpenAI
-from pydantic import BaseModel
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from services.cache.cache_backend import cache_get, cache_set
-from services.finnhub.finnhub_fundamentals import fetch_fundamentals_cached
-from services.holding_service import get_all_holdings, get_holdings_with_live_prices
-from services.portfolio_service import get_portfolio_summary
-from services.tavily.client import search as tavily_search, compact_results as compact_tavily
-from services.vector.vector_store_service import VectorStoreService
-from models.user_onboarding_profile import UserOnboardingProfile
+from services.holding_service import get_all_holdings
+from services.ai.chat_agent.tools import (
+    TOOL_REGISTRY,
+    ToolContext,
+    ToolSelection,
+    prepare_tool_args,
+    render_tool_manifest,
+    validate_tool_args,
+)
 from .types import ChatState, IntentResult
 
 logger = logging.getLogger("chat_agent")
@@ -27,13 +30,20 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
 llm = ChatOpenAI(model=os.getenv("OPENAI_MODEL", "gpt-4o"), temperature=0.2)
+llm_stream = ChatOpenAI(
+    model=os.getenv("OPENAI_MODEL", "gpt-4o"),
+    temperature=0.2,
+    streaming=True,
+)
+planner_llm = ChatOpenAI(
+    model=os.getenv("OPENAI_PLANNER_MODEL", "gpt-4.1-mini"),
+    temperature=0.0,
+)
 
 CHAT_HISTORY_TTL_SEC = int(os.getenv("CHAT_HISTORY_TTL_SEC", "21600"))  # 6h
 CHAT_MAX_HISTORY = int(os.getenv("CHAT_MAX_HISTORY", "14"))
 MAX_SYMBOLS = int(os.getenv("CHAT_MAX_SYMBOLS", "3"))
-MAX_VECTOR_CHARS = int(os.getenv("CHAT_MAX_VECTOR_CHARS", "6000"))
 MAX_HOLDINGS = int(os.getenv("CHAT_MAX_HOLDINGS", "25"))
-TTL_TAVILY_SEC = int(os.getenv("TTL_TAVILY_SEC", "900"))
 
 _EXPLICIT_SYMBOL_RE = re.compile(r"\$([A-Za-z]{1,6})\b")
 _HOLDINGS_Q_RE = re.compile(r"\b(what|which)\b.*\b(own|hold|holdings|positions)\b", re.IGNORECASE)
@@ -56,91 +66,10 @@ _STOPWORDS = {
     "already",
     "currently",
 }
-_NEWS_HINTS = {
-    "news",
-    "headline",
-    "headlines",
-    "catalyst",
-    "catalysts",
-    "event",
-    "events",
-    "earnings",
-    "guidance",
-    "downgrade",
-    "upgrade",
-    "lawsuit",
-    "investigation",
-}
-_FUNDAMENTAL_HINTS = {
-    "fundamentals",
-    "financials",
-    "valuation",
-    "metrics",
-    "margin",
-    "revenue",
-    "earnings",
-    "profit",
-    "balance sheet",
-    "cash flow",
-}
-_SEC_BUSINESS_HINTS = {
-    "business",
-    "model",
-    "segments",
-    "customers",
-    "products",
-    "revenue",
-    "moat",
-}
-_SEC_GENERAL_HINTS = {
-    "sec",
-    "filing",
-    "filings",
-    "10-k",
-    "10k",
-    "10-q",
-    "10q",
-    "8-k",
-    "8k",
-}
-_SEC_RISK_HINTS = {
-    "risk",
-    "risks",
-    "uncertainty",
-    "headwinds",
-    "competition",
-    "regulation",
-    "liquidity",
-    "debt",
-    "margin",
-}
-_SEC_MDA_HINTS = {
-    "md&a",
-    "mda",
-    "outlook",
-    "guidance",
-    "trend",
-    "trends",
-    "management discussion",
-}
-_HOLDINGS_DETAIL_HINTS = {
-    "holdings",
-    "positions",
-    "allocation",
-    "weights",
-    "diversif",
-    "exposure",
-    "sector",
-    "what do i own",
-    "what do we own",
-    "list",
-    "show",
-}
 
 
-def _contains_any(text: str, terms: set[str]) -> bool:
-    t = (text or "").lower()
-    return any(term in t for term in terms)
+class ToolPlan(BaseModel):
+    allowed_tools: List[str] = Field(default_factory=list)
 
 
 def _history_key(user_id: Any, session_id: str) -> str:
@@ -175,24 +104,6 @@ def append_chat_history(
     save_chat_history(user_id, session_id, history)
     return history
 
-
-def _serialize_onboarding(profile: UserOnboardingProfile | None) -> Dict[str, Any]:
-    if not profile:
-        return {}
-    return {
-        "time_horizon": profile.time_horizon,
-        "primary_goal": profile.primary_goal,
-        "risk_level": profile.risk_level,
-        "experience_level": profile.experience_level,
-        "age_band": profile.age_band,
-        "country": profile.country,
-        "asset_preferences": profile.asset_preferences,
-        "style_preference": profile.style_preference,
-        "notification_level": profile.notification_level,
-        "notes": profile.notes,
-    }
-
-
 def _format_history(history: List[Dict[str, str]]) -> str:
     lines = []
     for msg in history[-CHAT_MAX_HISTORY:]:
@@ -217,6 +128,77 @@ def _json_safe(value: Any) -> Any:
     if isinstance(value, (list, tuple)):
         return [_json_safe(v) for v in value]
     return value
+
+
+def _build_answer_messages(
+    state: ChatState,
+    tool_results: List[Dict[str, Any]],
+) -> List[Any]:
+    intent = state.get("intent") or ""
+    message = state.get("message") or ""
+    history = state.get("history") or []
+    symbols = state.get("symbols") or []
+
+    history_block = _format_history(history)
+    system_content = """
+You are a senior financial analyst and stock expert.
+Stay strictly within stocks, ETFs, crypto, portfolio, and market analysis.
+
+Guardrails:
+- Do NOT invent numbers. If data is missing, say "Not available".
+- Use SEC snippets as authoritative for company fundamentals and risks.
+- Use fundamentals data (if present) for concrete metrics only.
+- If the user asks about a company but no explicit ticker is provided, ask for the ticker.
+- Avoid trading instructions. Provide analysis and education only.
+- If portfolio data is provided, only reference those holdings.
+- Use only the tool outputs provided; do not hallucinate extra data.
+
+Personalization:
+- Tailor tone to the user's onboarding profile when present (risk level, time horizon, experience).
+- Include only sections that have supporting data (skip empty sections).
+- If news is provided, include a short "News" section grounded in those items.
+- If SEC snippets are provided, include a short "SEC" section (business/risks/MD&A as available).
+- If portfolio data is provided, include a "Portfolio" section with concrete holdings/summary.
+- If fundamentals are provided, include key metrics and note gaps when relevant.
+
+Response style:
+- Be concise and structured.
+- Use short paragraphs or bullets.
+- End with a short prompt for follow-up if needed.
+""".strip()
+
+    user_content = f"""
+CHAT HISTORY:
+{history_block}
+
+USER MESSAGE:
+{message}
+
+INTENT:
+{intent}
+
+SYMBOLS:
+{symbols}
+""".strip()
+
+    tool_calls = []
+    tool_messages: List[ToolMessage] = []
+    for idx, item in enumerate(tool_results or []):
+        name = item.get("name") or ""
+        args = item.get("arguments") or {}
+        data = item.get("data") or {}
+        if not name:
+            continue
+        tool_call_id = f"tool_call_{idx}"
+        tool_calls.append({"name": name, "args": args, "id": tool_call_id})
+        content = json.dumps(_json_safe(data), separators=(",", ":"))
+        tool_messages.append(ToolMessage(content=content, tool_call_id=tool_call_id))
+
+    messages: List[Any] = [SystemMessage(content=system_content), HumanMessage(content=user_content)]
+    if tool_calls:
+        messages.append(AIMessage(content="", tool_calls=tool_calls))
+        messages.extend(tool_messages)
+    return messages
 
 
 def _is_holdings_list_question(text: str) -> bool:
@@ -335,31 +317,6 @@ async def fast_path_node(state: ChatState) -> Dict[str, Any]:
     return {"short_circuit": False}
 
 
-def _ck_news(q: str) -> str:
-    digest = hashlib.sha256((q or "").strip().lower().encode("utf-8")).hexdigest()[:16]
-    return f"CHAT:NEWS:{digest}"
-
-
-def _holding_brief(item: Any) -> Dict[str, Any]:
-    data = _json_safe(item)
-    if not isinstance(data, dict):
-        return {}
-    keys = [
-        "symbol",
-        "name",
-        "type",
-        "quantity",
-        "current_price",
-        "value",
-        "currency",
-        "weight",
-        "unrealized_pl",
-        "unrealized_pl_pct",
-        "account_name",
-    ]
-    return {k: data.get(k) for k in keys}
-
-
 def _render_holdings_answer(holdings: List[Dict[str, Any]]) -> str:
     if not holdings:
         return "I could not find any holdings on your account."
@@ -427,317 +384,43 @@ async def route_node(state: ChatState) -> Dict[str, Any]:
     }
 
 
-async def context_plan_node(state: ChatState) -> Dict[str, Any]:
+def _default_tool_caps(symbols: List[str]) -> Dict[str, Any]:
+    sec_max_calls = 4 if symbols else 0
+    return {
+        "get_user_profile": {"max_calls": 1},
+        "get_portfolio_summary": {"max_calls": 1, "top_n": 5},
+        "get_holdings": {"max_calls": 1, "max_items": MAX_HOLDINGS},
+        "get_fundamentals": {"max_calls": 1, "max_symbols": MAX_SYMBOLS},
+        "get_sec_snippets": {"max_calls": sec_max_calls, "max_snippets": 6},
+        "get_news": {"max_calls": 1, "max_results": 6},
+    }
+
+
+async def plan_node(state: ChatState) -> Dict[str, Any]:
     message = (state.get("message") or "").strip()
     intent = (state.get("intent") or "").strip()
     symbols = state.get("symbols") or []
     needs_portfolio = bool(state.get("needs_portfolio"))
     needs_user_profile = bool(state.get("needs_user_profile"))
 
-    msg_lower = message.lower()
-    mentions_portfolio = "portfolio" in msg_lower or "holdings" in msg_lower or "positions" in msg_lower
-    holdings_detail = bool(
-        _HOLDINGS_Q_RE.search(message)
-        or _LIST_RE.search(message)
-        or _contains_any(message, _HOLDINGS_DETAIL_HINTS)
-    )
+    history_block = _format_history(state.get("history") or [])
+    tool_manifest = render_tool_manifest(list(TOOL_REGISTRY.keys()))
 
-    fetch_portfolio_summary = needs_portfolio or intent == "portfolio" or mentions_portfolio
-    fetch_holdings = fetch_portfolio_summary and holdings_detail
-    fetch_user_profile = needs_user_profile
-
-    fetch_fundamentals = bool(symbols) and (
-        intent in {"stock_analysis", "education", "portfolio"}
-        or _contains_any(message, _FUNDAMENTAL_HINTS)
-    )
-    fetch_sec_context = bool(symbols) and (
-        intent in {"stock_analysis", "education", "portfolio"}
-        or _contains_any(message, _SEC_GENERAL_HINTS)
-    )
-    fetch_sec_business = fetch_sec_context and _contains_any(message, _SEC_BUSINESS_HINTS)
-    fetch_sec_risk = fetch_sec_context and _contains_any(message, _SEC_RISK_HINTS)
-    fetch_sec_mda = fetch_sec_context and _contains_any(message, _SEC_MDA_HINTS)
-
-    fetch_news = False
-    if intent == "market_news":
-        fetch_news = True
-    elif _contains_any(message, _NEWS_HINTS):
-        fetch_news = True
-
-    return {
-        "fetch_user_profile": fetch_user_profile,
-        "fetch_portfolio_summary": fetch_portfolio_summary,
-        "fetch_holdings": fetch_holdings,
-        "fetch_fundamentals": fetch_fundamentals,
-        "fetch_sec_context": fetch_sec_context,
-        "fetch_sec_business": fetch_sec_business,
-        "fetch_sec_risk": fetch_sec_risk,
-        "fetch_sec_mda": fetch_sec_mda,
-        "fetch_news": fetch_news,
-    }
-
-
-async def research_node(state: ChatState) -> Dict[str, Any]:
-    db: Session = state.get("db")
-    finnhub = state.get("finnhub")
-    user_id = state.get("user_id")
-    message = state.get("message") or ""
-    symbols = state.get("symbols") or []
-    intent = state.get("intent") or ""
-
-    fetch_user_profile = bool(state.get("fetch_user_profile") or state.get("needs_user_profile"))
-    fetch_portfolio_summary = bool(state.get("fetch_portfolio_summary") or state.get("needs_portfolio"))
-    fetch_holdings = bool(state.get("fetch_holdings"))
-    fetch_fundamentals = bool(state.get("fetch_fundamentals"))
-    fetch_sec_context = bool(state.get("fetch_sec_context"))
-    fetch_sec_business = bool(state.get("fetch_sec_business"))
-    fetch_sec_risk = bool(state.get("fetch_sec_risk"))
-    fetch_sec_mda = bool(state.get("fetch_sec_mda"))
-    fetch_news = bool(state.get("fetch_news"))
-
-    user_profile: Dict[str, Any] = {}
-    if fetch_user_profile and db is not None and user_id is not None:
-        profile = (
-            db.query(UserOnboardingProfile)
-            .filter(UserOnboardingProfile.user_id == user_id)
-            .first()
-        )
-        user_profile = _serialize_onboarding(profile)
-
-    portfolio_summary: Dict[str, Any] = {}
-    holdings: List[Dict[str, Any]] = []
-    if (fetch_portfolio_summary or fetch_holdings) and finnhub is not None and db is not None:
-        try:
-            currency = (state.get("user_currency") or "USD").upper()
-            if fetch_portfolio_summary:
-                portfolio_summary = await get_portfolio_summary(
-                    user_id=str(user_id),
-                    db=db,
-                    finnhub=finnhub,
-                    currency=currency,
-                    top_n=5,
-                )
-            if fetch_holdings:
-                holdings_payload = await get_holdings_with_live_prices(
-                    user_id=str(user_id),
-                    db=db,
-                    finnhub=finnhub,
-                    currency=currency,
-                    top_only=False,
-                    top_n=0,
-                    include_weights=True,
-                )
-                items = (holdings_payload or {}).get("items") or []
-                holdings = [_holding_brief(it) for it in items if it]  # type: ignore[arg-type]
-                holdings = [h for h in holdings if h.get("symbol")][:MAX_HOLDINGS]
-        except Exception as exc:
-            logger.warning("portfolio_summary failed: %s", exc)
-
-    fundamentals: Dict[str, Any] = {}
-    fundamentals_gaps: Dict[str, List[str]] = {}
-    if fetch_fundamentals and symbols:
-        tasks = [fetch_fundamentals_cached(sym, timeout_s=5.0) for sym in symbols]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-        for sym, res in zip(symbols, results):
-            if isinstance(res, Exception):
-                fundamentals_gaps[sym] = [str(res)]
-                continue
-            fundamentals[sym] = res.data
-            fundamentals_gaps[sym] = res.gaps
-
-    vector_context = ""
-    sec_business_context = ""
-    sec_risk_context = ""
-    sec_mda_context = ""
-    if symbols and intent != "crypto" and (fetch_sec_context or fetch_sec_business or fetch_sec_risk or fetch_sec_mda):
-        vector_service = VectorStoreService()
-        chunks: List[str] = []
-        business_chunks: List[str] = []
-        risk_chunks: List[str] = []
-        mda_chunks: List[str] = []
-        for sym in symbols:
-            try:
-                if fetch_sec_business:
-                    business_sec = vector_service.get_context_for_analysis(
-                        db=db,
-                        symbol=sym,
-                        query="business model, segments, products, customers, revenue drivers",
-                        limit=6,
-                    )
-                    if business_sec:
-                        body = "\n".join(
-                            f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')}) {c.get('content')}"
-                            for c in business_sec
-                        )
-                        business_chunks.append(f"{sym} SEC BUSINESS CONTEXT:\n{body}")
-
-                if fetch_sec_risk:
-                    risk_sec = vector_service.get_context_for_analysis(
-                        db=db,
-                        symbol=sym,
-                        query="risk factors, competition, regulation, liquidity, debt, margin pressure",
-                        limit=6,
-                    )
-                    if risk_sec:
-                        body = "\n".join(
-                            f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')}) {c.get('content')}"
-                            for c in risk_sec
-                        )
-                        risk_chunks.append(f"{sym} SEC RISK CONTEXT:\n{body}")
-
-                if fetch_sec_mda:
-                    mda_sec = vector_service.get_context_for_analysis(
-                        db=db,
-                        symbol=sym,
-                        query="management discussion and analysis, outlook, trends, guidance, MD&A",
-                        limit=6,
-                    )
-                    if mda_sec:
-                        body = "\n".join(
-                            f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')}) {c.get('content')}"
-                            for c in mda_sec
-                        )
-                        mda_chunks.append(f"{sym} SEC MD&A CONTEXT:\n{body}")
-
-                if fetch_sec_context:
-                    sec_chunks = vector_service.get_context_for_analysis(
-                        db=db,
-                        symbol=sym,
-                        query=message,
-                        limit=6,
-                    )
-                    if sec_chunks:
-                        body = "\n".join(
-                            f"- ({c.get('metadata', {}).get('form_type','?')} {c.get('metadata', {}).get('filed_date','?')}) {c.get('content')}"
-                            for c in sec_chunks
-                        )
-                        chunks.append(f"{sym} SEC CONTEXT:\n{body}")
-            except Exception as exc:
-                logger.warning("vector_context failed for %s: %s", sym, exc)
-        vector_context = "\n\n".join(chunks)[:MAX_VECTOR_CHARS]
-        sec_business_context = "\n\n".join(business_chunks)[:MAX_VECTOR_CHARS]
-        sec_risk_context = "\n\n".join(risk_chunks)[:MAX_VECTOR_CHARS]
-        sec_mda_context = "\n\n".join(mda_chunks)[:MAX_VECTOR_CHARS]
-
-    news_context = ""
-    if fetch_news:
-        query = ""
-        if symbols:
-            query = f"latest news, catalysts, and risks for {symbols[0]}"
-        elif intent == "market_news":
-            query = f"latest market news and catalysts: {message}"
-        else:
-            query = f"latest news related to: {message}"
-        if query:
-            news_key = _ck_news(query)
-            cached = cache_get(news_key)
-            if isinstance(cached, str):
-                news_context = cached
-            else:
-                try:
-                    results = await tavily_search(
-                        query=query,
-                        max_results=6,
-                        include_answer=False,
-                        include_raw_content=False,
-                        search_depth="advanced",
-                    )
-                    news_context = compact_tavily(results)
-                    cache_set(news_key, news_context, ttl_seconds=TTL_TAVILY_SEC)
-                except Exception as exc:
-                    logger.warning("tavily search failed: %s", exc)
-
-    debug = {
-        "symbols": symbols,
-        "intent": intent,
-        "fetch_user_profile": fetch_user_profile,
-        "fetch_portfolio_summary": fetch_portfolio_summary,
-        "fetch_holdings": fetch_holdings,
-        "fetch_fundamentals": fetch_fundamentals,
-        "fetch_sec_context": fetch_sec_context,
-        "fetch_sec_business": fetch_sec_business,
-        "fetch_sec_risk": fetch_sec_risk,
-        "fetch_sec_mda": fetch_sec_mda,
-        "fetch_news": fetch_news,
-        "has_portfolio": bool(portfolio_summary),
-        "holdings_count": len(holdings),
-        "has_profile": bool(user_profile),
-        "vector_chars": len(vector_context),
-        "sec_business_chars": len(sec_business_context),
-        "sec_risk_chars": len(sec_risk_context),
-        "sec_mda_chars": len(sec_mda_context),
-        "news_chars": len(news_context),
-        "fundamentals_symbols": list(fundamentals.keys()),
-    }
-
-    return {
-        "user_profile": user_profile,
-        "portfolio_summary": _json_safe(portfolio_summary),
-        "holdings": holdings,
-        "fundamentals": fundamentals,
-        "fundamentals_gaps": fundamentals_gaps,
-        "vector_context": vector_context,
-        "sec_business_context": sec_business_context,
-        "sec_risk_context": sec_risk_context,
-        "sec_mda_context": sec_mda_context,
-        "news_context": news_context,
-        "debug": debug,
-    }
-
-
-async def answer_node(state: ChatState) -> Dict[str, Any]:
-    intent = state.get("intent") or ""
-    message = state.get("message") or ""
-    history = state.get("history") or []
-    symbols = state.get("symbols") or []
-
-    if intent == "off_topic":
-        return {
-            "answer": "I can only help with stocks, crypto, portfolio questions, and market analysis. "
-                      "If you have a finance question, ask away.",
-            "iterations": int(state.get("iterations", 0)) + 1,
-        }
-
-    holdings = state.get("holdings") or []
-    if intent == "portfolio" and holdings and _HOLDINGS_Q_RE.search(message):
-        return {
-            "answer": _render_holdings_answer(holdings),
-            "iterations": int(state.get("iterations", 0)) + 1,
-        }
-
-    critique = (state.get("critique") or "").strip()
-    critique_block = f"\n\nCRITIQUE TO FIX:\n{critique}\n" if critique else ""
-
-    history_block = _format_history(history)
-    profile_block = json.dumps(_json_safe(state.get("user_profile") or {}), separators=(",", ":"))
-    portfolio_block = json.dumps(_json_safe(state.get("portfolio_summary") or {}), separators=(",", ":"))
-    holdings_block = json.dumps(_json_safe(state.get("holdings") or []), separators=(",", ":"))
-    fundamentals_block = json.dumps(_json_safe(state.get("fundamentals") or {}), separators=(",", ":"))
-    gaps_block = json.dumps(_json_safe(state.get("fundamentals_gaps") or {}), separators=(",", ":"))
-    vector_context = state.get("vector_context") or ""
-    sec_business_context = state.get("sec_business_context") or ""
-    sec_risk_context = state.get("sec_risk_context") or ""
-    sec_mda_context = state.get("sec_mda_context") or ""
-    news_context = state.get("news_context") or ""
+    structured_llm = planner_llm.with_structured_output(ToolPlan, method="function_calling")
     prompt = f"""
-        You are a senior financial analyst and stock expert.
-        Stay strictly within stocks, ETFs, crypto, portfolio, and market analysis.
+        You are a planner that decides which tools are allowed for a finance assistant.
 
-        Guardrails:
-        - Do NOT invent numbers. If data is missing, say "Not available".
-        - Use SEC vector context as authoritative for company fundamentals and risks.
-        - Use fundamentals data (if present) for concrete metrics.
-        - If the user asks about a company but no explicit ticker is provided, ask for the ticker.
-        - Avoid trading instructions. Provide analysis and education only.
-        - If portfolio data is provided, only reference those holdings.
+        Rules:
+        - Only choose tools from TOOL LIST.
+        - Choose only tools needed to answer the user's request.
+        - If no tools are needed, return an empty list.
+        - If the user asks about their portfolio or holdings, allow portfolio tools.
+        - If the user asks for company analysis with explicit tickers, allow fundamentals/SEC tools.
+        - If the user asks for market or company news, allow the news tool.
+        - If personalization would help, allow the user profile tool.
 
-        Personalization:
-        - Tailor tone to the user's onboarding profile when present (risk level, time horizon, experience).
-        - Include only sections that have supporting data (skip empty sections).
-        - If news_context is provided, include a short "News" section grounded in those items.
-        - If SEC context is provided, include a short "SEC" section (business/risks/MD&A as available).
-        - If portfolio data is provided, include a "Portfolio" section with concrete holdings/summary.
-        - If fundamentals are provided, include key metrics and note gaps when relevant.
+        TOOL LIST:
+        {tool_manifest}
 
         CHAT HISTORY:
         {history_block}
@@ -745,83 +428,273 @@ async def answer_node(state: ChatState) -> Dict[str, Any]:
         USER MESSAGE:
         {message}
 
+        INTENT:
+        {intent}
+
         SYMBOLS:
         {symbols}
 
-        USER PROFILE:
-        {profile_block}
-
-        PORTFOLIO SUMMARY:
-        {portfolio_block}
-
-        HOLDINGS:
-        {holdings_block}
-
-        FUNDAMENTALS:
-        {fundamentals_block}
-
-        FUNDAMENTALS GAPS:
-        {gaps_block}
-
-        VECTOR CONTEXT (SEC filings):
-        {vector_context}
-
-        SEC BUSINESS SNIPS:
-        {sec_business_context}
-
-        SEC RISK SNIPS:
-        {sec_risk_context}
-
-        SEC MD&A SNIPS:
-        {sec_mda_context}
-
-        NEWS CONTEXT:
-        {news_context}
-        {critique_block}
-
-        Response style:
-        - Be concise and structured.
-        - Use short paragraphs or bullets.
-        - End with a short prompt for follow-up if needed.
         """
 
-    res = await llm.ainvoke(prompt)
+    try:
+        res = await structured_llm.ainvoke(prompt)
+        allowed_tools = [t for t in res.allowed_tools if t in TOOL_REGISTRY]
+    except Exception as exc:
+        logger.warning("planner failed: %s", exc)
+        allowed_tools = []
+        if needs_user_profile:
+            allowed_tools.append("get_user_profile")
+        if needs_portfolio or intent == "portfolio":
+            allowed_tools.append("get_portfolio_summary")
+            allowed_tools.append("get_holdings")
+        if symbols:
+            allowed_tools.append("get_fundamentals")
+            allowed_tools.append("get_sec_snippets")
+        if intent == "market_news":
+            allowed_tools.append("get_news")
+
+    if not symbols:
+        allowed_tools = [t for t in allowed_tools if t not in {"get_fundamentals", "get_sec_snippets"}]
+
+    tool_caps = _default_tool_caps(symbols)
+    debug = {
+        "symbols": symbols,
+        "intent": intent,
+        "allowed_tools": allowed_tools,
+        "tool_caps": tool_caps,
+    }
+
+    merged_debug = dict(state.get("debug") or {})
+    merged_debug.update(debug)
     return {
-        "answer": (res.content or "").strip(),
-        "iterations": int(state.get("iterations", 0)) + 1,
+        "allowed_tools": allowed_tools,
+        "tool_caps": tool_caps,
+        "debug": merged_debug,
     }
 
 
-async def critic_node(state: ChatState) -> Dict[str, Any]:
-    iters = int(state.get("iterations", 0))
-    answer = state.get("answer") or ""
+def _filter_tool_calls(
+    calls: List[Any],
+    allowed_tools: List[str],
+    tool_caps: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    if not calls:
+        return []
+    max_calls: Dict[str, int] = {}
+    for name in allowed_tools:
+        caps = tool_caps.get(name) or {}
+        max_calls[name] = int(caps.get("max_calls", 1))
+    out: List[Dict[str, Any]] = []
+    counts: Dict[str, int] = {}
+    for call in calls:
+        name = getattr(call, "name", None) or (call.get("name") if isinstance(call, dict) else None)
+        if not name or name not in allowed_tools:
+            continue
+        if counts.get(name, 0) >= max_calls.get(name, 1):
+            continue
+        args = getattr(call, "arguments", None)
+        if args is None and isinstance(call, dict):
+            args = call.get("arguments")
+        if not isinstance(args, dict):
+            args = {}
+        out.append({"name": name, "arguments": args})
+        counts[name] = counts.get(name, 0) + 1
+    return out
 
-    if not answer:
-        return {"is_valid": True, "critique": ""}
 
+async def tool_select_node(state: ChatState) -> Dict[str, Any]:
+    allowed_tools = state.get("allowed_tools") or []
+    if not allowed_tools:
+        merged_debug = dict(state.get("debug") or {})
+        merged_debug.update({"tool_calls": 0})
+        return {"tool_calls": [], "debug": merged_debug}
+
+    message = (state.get("message") or "").strip()
+    intent = (state.get("intent") or "").strip()
+    symbols = state.get("symbols") or []
+    history_block = _format_history(state.get("history") or [])
+    tool_caps = state.get("tool_caps") or {}
+    tool_manifest = render_tool_manifest(allowed_tools)
+
+    structured_llm = llm.with_structured_output(ToolSelection, method="function_calling")
     prompt = f"""
-        You are a strict reviewer for finance answers.
-        Check for:
-        - off-topic content
-        - invented numbers or data not grounded in provided context
-        - investment advice beyond analysis/education
-        - contradictions with provided fundamentals or SEC context
+        You are selecting tools for a finance assistant.
 
-        If it is good enough to ship, respond exactly: CLEAR
-        Otherwise respond with 3-6 specific fixes.
+        Rules:
+        - Use only tools in ALLOWED TOOLS.
+        - Call tools only if needed to answer.
+        - Respect tool caps; do not exceed max_calls.
+        - Return a JSON object with: {{ "calls": [{{"name": "...", "arguments": {{...}}}}] }}.
+        - If no tools are needed, return {{ "calls": [] }}.
 
-        ANSWER:
-        {answer}
+        ALLOWED TOOLS:
+        {tool_manifest}
+
+        TOOL CAPS:
+        {json.dumps(tool_caps, separators=(",", ":"))}
+
+        CHAT HISTORY:
+        {history_block}
+
+        USER MESSAGE:
+        {message}
+
+        INTENT:
+        {intent}
+
+        SYMBOLS:
+        {symbols}
         """
 
-    res = await llm.ainvoke(prompt)
-    txt = (res.content or "").strip()
-    is_clear = txt.upper() == "CLEAR"
+    res = await structured_llm.ainvoke(prompt)
+    calls = _filter_tool_calls(res.calls, allowed_tools, tool_caps)
+    merged_debug = dict(state.get("debug") or {})
+    merged_debug.update({"tool_calls": len(calls)})
+    return {
+        "tool_calls": calls,
+        "debug": merged_debug,
+    }
 
-    if iters >= 1:
-        return {"is_valid": True, "critique": "" if is_clear else txt}
 
-    return {"is_valid": bool(is_clear), "critique": "" if is_clear else txt}
+async def tool_exec_node(state: ChatState) -> Dict[str, Any]:
+    allowed_tools = state.get("allowed_tools") or []
+    tool_calls = state.get("tool_calls") or []
+    tool_caps = state.get("tool_caps") or {}
+
+    ctx = ToolContext(
+        db=state.get("db"),
+        finnhub=state.get("finnhub"),
+        user_id=state.get("user_id"),
+        user_currency=state.get("user_currency") or "USD",
+        message=state.get("message") or "",
+        symbols=state.get("symbols") or [],
+    )
+
+    tasks: List[asyncio.Task[Any]] = []
+    meta: List[Dict[str, Any]] = []
+    errors: List[Dict[str, Any]] = []
+
+    for call in tool_calls:
+        name = (call.get("name") or "").strip()
+        if not name or name not in allowed_tools:
+            continue
+        spec = TOOL_REGISTRY.get(name)
+        if not spec:
+            errors.append({"name": name, "error": "unknown_tool"})
+            continue
+        raw_args = call.get("arguments") or {}
+        caps = tool_caps.get(name) or {}
+        prepared_args = prepare_tool_args(name, raw_args, caps, state)
+        validated_args = validate_tool_args(name, prepared_args)
+        if not validated_args:
+            errors.append({"name": name, "error": "invalid_args", "arguments": prepared_args})
+            continue
+        tasks.append(asyncio.create_task(spec.run(validated_args, ctx)))
+        meta.append({"name": name, "arguments": prepared_args})
+
+    results: List[Dict[str, Any]] = []
+    if tasks:
+        outputs = await asyncio.gather(*tasks, return_exceptions=True)
+        for output, info in zip(outputs, meta):
+            name = info.get("name")
+            args = info.get("arguments") or {}
+            if isinstance(output, Exception):
+                errors.append({"name": name, "error": str(output), "arguments": args})
+                continue
+            results.append({"name": name, "arguments": args, "data": _json_safe(output)})
+
+    debug = {
+        "tool_results": len(results),
+        "tool_errors": len(errors),
+    }
+    merged_debug = dict(state.get("debug") or {})
+    merged_debug.update(debug)
+    return {
+        "tool_results": results,
+        "tool_errors": errors,
+        "debug": merged_debug,
+    }
+
+
+def _aggregate_tool_results(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    profile: Dict[str, Any] = {}
+    portfolio_summary: Dict[str, Any] = {}
+    holdings: List[Dict[str, Any]] = []
+    fundamentals: Dict[str, Any] = {}
+    fundamentals_gaps: Dict[str, List[str]] = {}
+    sec_snippets: Dict[str, List[Dict[str, Any]]] = {"general": [], "business": [], "risk": [], "mda": []}
+    news_items: List[Dict[str, Any]] = []
+
+    for item in tool_results or []:
+        name = item.get("name")
+        data = item.get("data") or {}
+        if name == "get_user_profile":
+            if isinstance(data, dict):
+                profile = data
+        elif name == "get_portfolio_summary":
+            if isinstance(data, dict):
+                portfolio_summary = data
+        elif name == "get_holdings":
+            if isinstance(data, list):
+                holdings = data
+        elif name == "get_fundamentals":
+            if isinstance(data, dict):
+                fundamentals.update(data.get("fundamentals") or {})
+                fundamentals_gaps.update(data.get("gaps") or {})
+        elif name == "get_sec_snippets":
+            if isinstance(data, dict):
+                section = (data.get("section") or "general").strip().lower()
+                snippets = data.get("snippets") or []
+                if isinstance(snippets, list) and section in sec_snippets:
+                    sec_snippets[section].extend(snippets)
+        elif name == "get_news":
+            if isinstance(data, dict):
+                query = data.get("query") or ""
+                items = data.get("items") or []
+                if isinstance(items, list):
+                    for entry in items:
+                        if not isinstance(entry, dict):
+                            continue
+                        payload = dict(entry)
+                        if query:
+                            payload["query"] = query
+                        news_items.append(payload)
+
+    return {
+        "user_profile": profile,
+        "portfolio_summary": portfolio_summary,
+        "holdings": holdings,
+        "fundamentals": fundamentals,
+        "fundamentals_gaps": fundamentals_gaps,
+        "sec_snippets": sec_snippets,
+        "news_items": news_items,
+    }
+
+
+async def answer_node(state: ChatState) -> Dict[str, Any]:
+    tool_results = state.get("tool_results") or []
+
+    intent = state.get("intent") or ""
+    message = state.get("message") or ""
+
+    if intent == "off_topic":
+        return {
+            "answer": "I can only help with stocks, crypto, portfolio questions, and market analysis. "
+                      "If you have a finance question, ask away.",
+        }
+
+    tool_data = _aggregate_tool_results(tool_results)
+    holdings = tool_data.get("holdings") or []
+    if intent == "portfolio" and holdings and _HOLDINGS_Q_RE.search(message):
+        return {
+            "answer": _render_holdings_answer(holdings),
+        }
+
+    messages = _build_answer_messages(state, tool_results)
+    res = await llm.ainvoke(messages)
+    return {
+        "answer": (res.content or "").strip(),
+    }
 
 
 def _route_next(state: ChatState) -> str:
@@ -839,23 +712,19 @@ def _fast_next(state: ChatState) -> str:
 workflow = StateGraph(ChatState)
 workflow.add_node("fast_path", fast_path_node)
 workflow.add_node("route", route_node)
-workflow.add_node("plan", context_plan_node)
-workflow.add_node("research", research_node)
+workflow.add_node("plan", plan_node)
+workflow.add_node("tool_select", tool_select_node)
+workflow.add_node("tool_exec", tool_exec_node)
 workflow.add_node("answer", answer_node)
-workflow.add_node("critic", critic_node)
 workflow.add_node("off_topic", answer_node)
 
 workflow.set_entry_point("fast_path")
 workflow.add_conditional_edges("fast_path", _fast_next, {"route": "route", "end": END})
 workflow.add_conditional_edges("route", _route_next, {"plan": "plan", "off_topic": "off_topic"})
-workflow.add_edge("plan", "research")
-workflow.add_edge("research", "answer")
-workflow.add_edge("answer", "critic")
-workflow.add_conditional_edges(
-    "critic",
-    lambda s: "end" if s.get("is_valid") else "revise",
-    {"revise": "answer", "end": END},
-)
+workflow.add_edge("plan", "tool_select")
+workflow.add_edge("tool_select", "tool_exec")
+workflow.add_edge("tool_exec", "answer")
+workflow.add_edge("answer", END)
 workflow.add_edge("off_topic", END)
 
 app_graph = workflow.compile()
@@ -879,10 +748,68 @@ async def run_chat_turn(
         "history": history,
         "db": db,
         "finnhub": finnhub,
-        "iterations": 0,
     }
 
     final_state = await app_graph.ainvoke(initial_state)
     answer = final_state.get("answer") or ""
     debug = final_state.get("debug") or {}
     return answer, debug
+
+
+async def run_chat_turn_stream(
+    *,
+    message: str,
+    user_id: Any,
+    user_currency: str,
+    session_id: str,
+    history: List[Dict[str, str]],
+    db: Session,
+    finnhub: Any,
+):
+    state: ChatState = {
+        "message": message,
+        "user_id": user_id,
+        "user_currency": user_currency,
+        "session_id": session_id,
+        "history": history,
+        "db": db,
+        "finnhub": finnhub,
+    }
+
+    state.update(await fast_path_node(state))
+    if state.get("short_circuit"):
+        answer = state.get("answer") or ""
+        if answer:
+            yield answer
+        return
+
+    state.update(await route_node(state))
+    if (state.get("intent") or "").strip().lower() == "off_topic":
+        answer = (
+            "I can only help with stocks, crypto, portfolio questions, and market analysis. "
+            "If you have a finance question, ask away."
+        )
+        if answer:
+            yield answer
+        return
+
+    state.update(await plan_node(state))
+    state.update(await tool_select_node(state))
+    state.update(await tool_exec_node(state))
+
+    tool_data = _aggregate_tool_results(state.get("tool_results") or [])
+    holdings = tool_data.get("holdings") or []
+    if (state.get("intent") or "") == "portfolio" and holdings and _HOLDINGS_Q_RE.search(message):
+        answer = _render_holdings_answer(holdings)
+        if answer:
+            yield answer
+        return
+
+    messages = _build_answer_messages(state, state.get("tool_results") or [])
+    answer_parts: List[str] = []
+    async for chunk in llm_stream.astream(messages):
+        text = (chunk.content or "")
+        if not text:
+            continue
+        answer_parts.append(text)
+        yield text
