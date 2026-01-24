@@ -1,6 +1,4 @@
-from fastapi import BackgroundTasks, Depends, APIRouter
-from sqlalchemy.orm import Session
-from database import get_db
+from fastapi import BackgroundTasks, APIRouter
 from services.filings.filing_service import FilingService
 
 router = APIRouter()
