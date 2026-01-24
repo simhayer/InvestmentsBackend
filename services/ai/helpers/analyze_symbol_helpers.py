@@ -560,3 +560,40 @@ def validate_report(report: Dict[str, Any], *, next_earnings_date: str, finnhub_
         issues.append("thesis_points should be <= 5 for speed/brevity.")
 
     return issues
+
+
+def compute_data_quality(
+    finnhub_data: Dict[str, Any],
+    finnhub_gaps: List[str],
+    sec_context: str,
+    news_count: int
+) -> List[str]:
+    notes: List[str] = []
+
+    if finnhub_gaps:
+        notes.append(
+            f"Fundamentals gaps present: {', '.join(finnhub_gaps[:10])}{'...' if len(finnhub_gaps) > 10 else ''}"
+        )
+
+    if not sec_context or len(sec_context.strip()) < 80:
+        notes.append("SEC filing context is limited or unavailable.")
+
+    if news_count < 3:
+        notes.append("News coverage is light; catalysts may be incomplete or less reliable.")
+
+    normalized = (finnhub_data or {}).get("normalized") or {}
+    common_keys = [
+        "market_cap",
+        "pe_ttm",
+        "revenue_growth_yoy",
+        "gross_margin",
+        "operating_margin",
+        "free_cash_flow",
+        "debt_to_equity",
+    ]
+    missing_common = [k for k in common_keys if normalized.get(k) in (None, "", "NA")]
+    if len(missing_common) >= 4:
+        notes.append("Several key normalized metrics are missing; treat valuation/profitability conclusions cautiously.")
+
+    return notes
+

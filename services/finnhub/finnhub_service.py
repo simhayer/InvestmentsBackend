@@ -527,3 +527,54 @@ class FinnhubService:
                 return safe_json(r) or {}
             except Exception:
                 return {}
+            
+# todo, use the grouping in the future
+    async def fetch_peers(
+    self,
+    symbol: str,
+    *,
+    grouping: Optional[str] = None,  # "sector"|"industry"|"subIndustry"
+    client: httpx.AsyncClient,
+    ) -> List[str]:
+        sym = (symbol or "").strip().upper()
+        if not sym:
+            return []
+
+        params = self._auth_params(symbol=sym)
+        if grouping:
+            params["grouping"] = grouping
+
+        async with self._client(client) as c:
+            try:
+                r = await self._get(
+                    c,
+                    "/stock/peers",
+                    params=params,  # ✅ use the params with grouping
+                )
+                r.raise_for_status()
+
+                data = r.json()  # peers endpoint returns a list
+                if not isinstance(data, list):
+                    return []
+                print(f"fetch_peers: raw data for {sym}: {data}")
+                if not isinstance(data, list):
+                    return []
+
+                peers = [s.strip().upper() for s in data if isinstance(s, str) and s.strip()]
+                peers = [p for p in peers if p != sym]  # remove self
+
+                seen: set[str] = set()
+                out: List[str] = []
+                for p in peers:
+                    if p in seen:
+                        continue
+                    seen.add(p)
+                    out.append(p)
+
+                print('fetched peers:', out)
+                return out
+
+            except Exception as e:
+                # better than print; swap to logger if you have it
+                print(f"fetch_peers failed for {sym}: {e}")
+                return []

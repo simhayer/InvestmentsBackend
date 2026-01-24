@@ -76,6 +76,20 @@ class KeyInsight(BaseModel):
     evidence: Optional[str]
     implication: Optional[str]
 
+class PeerMetricStat(BaseModel):
+    company: Optional[float] = None
+    peer_median: Optional[float] = None
+    company_percentile: Optional[float] = Field(default=None, ge=0.0, le=100.0)
+
+    peer_count: Optional[int] = None
+    higher_is_better: Optional[bool] = None
+
+class PeerComparison(BaseModel):
+    peers_used: List[str] = Field(default_factory=list)
+    scores: Dict[str, Optional[float]] = Field(default_factory=dict)
+    key_stats: Dict[str, PeerMetricStat] = Field(default_factory=dict)
+    summary: List[str] = Field(default_factory=list)
+
 # ----------------------------
 # Output schema (upgraded)
 # ----------------------------
@@ -137,6 +151,11 @@ class AnalysisReport(BaseModel):
         description="What is priced in vs not priced in."
     )
 
+    peer_comparison: Optional[PeerComparison] = Field(
+        default=None,
+        description="Peer and sector benchmarking summary (compact)."
+    )
+
 
 # ----------------------------
 # Graph state (upgraded)
@@ -150,6 +169,8 @@ class AgentState(BaseAgentState, total=False):
     raw_data: str
     finnhub_data: Dict[str, Any]
     finnhub_gaps: List[str]
+    peer_benchmark: Dict[str, Any]
+    peer_gaps: List[str]
 
     sec_context: str
     sec_business: List[Dict[str, Any]]

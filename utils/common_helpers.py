@@ -2,7 +2,7 @@ from decimal import Decimal
 import math
 from typing import Any, Optional
 import json
-from typing import Any, Dict
+from typing import Any, Dict, List, Optional
 import httpx
 import time
 from typing import Callable, Tuple, Type, Mapping
@@ -31,6 +31,16 @@ def normalize_asset_type(typ: str | None) -> str | None:
         return "cryptocurrency"
 
     return t
+
+def median(vals: List[float]) -> Optional[float]:
+    if not vals:
+        return None
+    s = sorted(vals)
+    n = len(s)
+    mid = n // 2
+    if n % 2 == 1:
+        return s[mid]
+    return (s[mid - 1] + s[mid]) / 2.0
 
 def to_float(x: Any) -> float:
     if x is None:
