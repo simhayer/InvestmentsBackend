@@ -9,6 +9,9 @@ Magnitude = Literal["Low", "Medium", "High", "Unknown"]
 PricedIn = Literal["Low", "Partial", "High", "Unknown"]
 CatalystWindow = str  # keep flexible: "Next 30–60 days", "Q2 2026", "Next earnings", etc.
 
+class TextBlock(BaseModel):
+    bullets: List[str] = Field(min_items=3, max_items=5)
+
 class ThesisPoint(BaseModel):
     """
     One claim + why it matters + what could disprove it.
@@ -88,7 +91,11 @@ class PeerComparison(BaseModel):
     peers_used: List[str] = Field(default_factory=list)
     scores: Dict[str, Optional[float]] = Field(default_factory=dict)
     key_stats: Dict[str, PeerMetricStat] = Field(default_factory=dict)
-    summary: List[str] = Field(default_factory=list)
+
+class PricingAssessment(BaseModel):
+    market_expectation: str
+    variant_outcome: str
+    valuation_sensitivity: str
 
 # ----------------------------
 # Output schema (upgraded)
@@ -96,16 +103,16 @@ class PeerComparison(BaseModel):
 class AnalysisReport(BaseModel):
     # Keep existing fields
     symbol: str
-    key_insights: List[KeyInsight] = Field(description="Critical fundamental highlights")
-    current_performance: str = Field(description="Technical and price action analysis")
-    stock_overflow_risks: List[str] = Field(description="Red flags and assessment of risks")
-    price_outlook: str = Field(description="Deeply reasoned AI outlook balancing bull/bear cases")
+    key_insights: List[KeyInsight] = Field(description="Critical fundamental highlights", min_items=3, max_items=3)
+    current_performance: TextBlock = Field(description="Technical and price action analysis")
+    key_risks: List[str] = Field(description="Red flags and assessment of risks", min_items=5, max_items=5)
+    price_outlook: TextBlock = Field(description="Deeply reasoned AI outlook balancing bull/bear cases")
     recommendation: Literal["Buy", "Hold", "Sell"]
     confidence: float = Field(ge=0.0, le=1.0)
     is_priced_in: bool = False
 
     # New pro-grade fields
-    unified_thesis: str = Field(description="A single coherent view: what drives the stock and why now.")
+    unified_thesis: TextBlock = Field(description="A single coherent view: what drives the stock and why now.")
 
     thesis_points: List[ThesisPoint] = Field(
         default_factory=list,
@@ -122,10 +129,6 @@ class AnalysisReport(BaseModel):
         description="Base/Bull/Bear scenario narratives (no price targets)."
     )
 
-    market_expectations: List[str] = Field(
-        default_factory=list,
-        description="What the current setup/valuation seems to imply the market expects."
-    )
     key_debates: List[DebateItem] = Field(
         default_factory=list,
         description="2–4 disagreements investors have + what would settle them."
@@ -146,14 +149,9 @@ class AnalysisReport(BaseModel):
         description="Where is the market likely wrong? Consensus vs variant view."
     )
 
-    pricing_assessment: Optional[Dict[str, str]] = Field(
+    pricing_assessment: Optional[PricingAssessment] = Field(
         default=None,
         description="What is priced in vs not priced in."
-    )
-
-    peer_comparison: Optional[PeerComparison] = Field(
-        default=None,
-        description="Peer and sector benchmarking summary (compact)."
     )
 
 

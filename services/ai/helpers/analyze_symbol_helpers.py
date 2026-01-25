@@ -493,8 +493,8 @@ def validate_report(report: Dict[str, Any], *, next_earnings_date: str, finnhub_
                 issues.append(f"key_insight #{i} implication must be string or null.")
 
     # --- risks ---
-    if len(_as_list(report.get("stock_overflow_risks"))) < 2:
-        issues.append("stock_overflow_risks should have at least 2 items.")
+    if len(_as_list(report.get("key_risks"))) < 3:
+        issues.append("key_risks should have at least 3 items.")
 
     # --- scenarios ---
     scenarios = _as_list(report.get("scenarios"))

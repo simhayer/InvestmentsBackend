@@ -19,7 +19,7 @@ except Exception:
     compact_tavily = None  # type: ignore
 
 from services.finnhub.finnhub_fundamentals import fetch_fundamentals_cached
-from services.finnhub.peer_benchmark_service import fetch_peer_benchmark_cached
+from services.finnhub.peer_benchmark_service import fetch_peer_benchmark_cached, build_peer_summary, build_peer_positioning, build_peer_comparison_ready
 from services.cache.cache_backend import cache_set
 from services.ai.technicals_pack import build_technical_pack, compact_tech_pack
 from services.finnhub.finnhub_news_service import get_company_news_cached, shrink_news_items
@@ -76,24 +76,6 @@ async def _sem_run(sem: asyncio.Semaphore, coro):
 def _safe_sorted_earnings(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(items or [], key=lambda x: x.get("date") or "9999-99-99")
 
-
-def _build_peer_comparison_ready(peer_benchmark: Dict[str, Any]) -> Dict[str, Any]:
-    peer_benchmark = peer_benchmark or {}
-    bench = peer_benchmark.get("benchmarks") or {}
-
-    key_stats = {}
-    for k in ("pe_ttm", "revenue_growth_yoy", "operating_margin", "debt_to_equity", "gross_margin"):
-        if k in bench and bench.get(k) is not None:
-            key_stats[k] = bench.get(k)
-
-    return {
-        "peers_used": (peer_benchmark.get("peers_used") or [])[:12],
-        "scores": peer_benchmark.get("scores") or {},
-        "key_stats": key_stats,
-        "summary": peer_benchmark.get("summary") or [],
-    }
-
-
 async def _build_technicals(symbol: str) -> str:
     # deterministic technicals text (still needs history IO)
     price_points, bench_points = await asyncio.gather(
@@ -141,7 +123,9 @@ def _trim_inputs_for_structured(state: AgentState) -> Dict[str, Any]:
 
     peer_ready = state.get("peer_comparison_ready") or {}
     if not peer_ready:
-        peer_ready = _build_peer_comparison_ready(state.get("peer_benchmark", {}) or {})
+        peer_ready = build_peer_comparison_ready(state.get("peer_benchmark", {}) or {})
+
+    peer_positioning = build_peer_positioning(peer_ready)
 
     technicals_text = shorten_text(state.get("technicals", "") or "", 650)
 
@@ -168,6 +152,7 @@ def _trim_inputs_for_structured(state: AgentState) -> Dict[str, Any]:
         "peer_ready": peer_ready,
         "data_quality_notes": data_quality_notes,
         "critique_block": critique_block,
+        "peer_positioning": peer_positioning,
     }
 
 
@@ -176,117 +161,92 @@ def _build_structured_prompt(trimmed: Dict[str, Any]) -> str:
     next_date = trimmed["next_date"]
     critique_block = trimmed["critique_block"]
 
-    # NOTE: Your schema allows catalysts 3–8, but your earlier rules enforced EXACTLY 3.
-    # This keeps EXACTLY 3 for consistency + speed.
     return f"""
 Return a JSON object that matches the AnalysisReport schema EXACTLY.
+Do not include any fields not defined in the schema.
 
 Definitive truth: next earnings date is {next_date}.
 
 ====================
-NON-NEGOTIABLE RULES
+CORE RULES
 ====================
 
-GENERAL
-- Write like a buy-side analyst, not a summary bot.
-- Avoid generic language. Every claim must earn its place.
+STYLE
+- Write like a buy-side analyst.
+- Be specific. Avoid filler and generic statements.
 
-BREVITY (SPEED)
-- unified_thesis: max 6 sentences.
-- current_performance: max 6 sentences.
-- price_outlook: max 8 sentences.
-- recommendation: max 5 sentences.
+STRUCTURE (STRICT)
+- key_insights: EXACTLY 3 items.
+- key_risks: EXACTLY 5 items.
+- thesis_points: EXACTLY 3 items.
+- upcoming_catalysts: EXACTLY 3 items.
+- scenarios: EXACTLY 3 (Base, Bull, Bear).
 
-METRICS & DATA
-- Company exact metrics must come from FINNHUB NORMALIZED.
-- Peer exact metrics (median/percentiles) must come from PEER BENCHMARK (trimmed below).
-- Interpret metrics; don’t just repeat them.
-
-KEY INSIGHTS
-- 3–5 insights (not 6).
-- Each insight MUST include at least one metric AND one valuation/expectations implication.
-- At least ONE insight MUST reference peer benchmark percentile/median.
-
-UNIFIED THESIS + THESIS POINTS
-- unified_thesis required.
-- thesis_points: 3–5 items, each with a falsifier.
-
-MARKET EDGE
+CONTENT RULES
+- Each key_insight MUST include: (1) a metric, (2) evidence, (3) implication.
+- unified_thesis MUST be concise and coherent.
+- is_priced_in must be boolean.
+- pricing_assessment MUST be present and non-empty.
 - If confidence ≥ 0.6, market_edge MUST be present.
-- At least one key_insight MUST reference the same gap as market_edge.
 
-IS_PRICED_IN
-- is_priced_in is boolean.
-- pricing_assessment MUST be present with keys:
-  market_expectation, variant_outcome, valuation_sensitivity (all non-empty).
-
-SCENARIOS
-- EXACTLY 3: Base, Bull, Bear.
+PEERS
+- You may reference peer positioning qualitatively (cheap/expensive, strong/weak).
+- DO NOT restate or reproduce numerical peer metrics.
 
 CATALYSTS
-- upcoming_catalysts MUST contain EXACTLY 3 items.
 - If earnings-related, window MUST be "{next_date}".
-
-LIST SIZES (SPEED)
-- market_expectations: 3–5 bullets.
-- key_debates: 2–3 items.
-- what_to_watch_next: 5–7 bullets.
-- stock_overflow_risks: 5–7 bullets.
-
-PEER COMPARISON
-- If peers_used non-empty, peer_comparison MUST be present.
-- Copy peers_used/scores/key_stats from PEER BENCHMARK exactly.
 
 CONFIDENCE
 - Must be defensible.
-- If data_quality_notes non-empty, generally keep confidence < 0.8 unless justified.
+- If data_quality_notes are non-empty, confidence should generally be < 0.8.
 
 {critique_block}
 
 ====================
-INPUTS (TRIMMED)
+INPUTS
 ====================
 
-SYMBOL: {symbol}
+SYMBOL:
+{symbol}
 
 FINNHUB NORMALIZED:
 {json_dumps(trimmed["normalized"])}
 
-PROFILE (trimmed):
+PROFILE:
 {json_dumps(trimmed["profile_small"])}
 
-QUOTE (trimmed):
+QUOTE:
 {json_dumps(trimmed["quote_small"])}
 
-MARKET SNAPSHOT (trimmed):
+MARKET SNAPSHOT:
 {json_dumps(trimmed["market_snapshot_small"])}
 
-EARNINGS (trimmed):
+EARNINGS:
 {json_dumps(trimmed["earnings_small"])}
 
-SEC BUSINESS SNIP:
+SEC BUSINESS:
 {json_dumps(trimmed["sec_bus_small"])}
 
-SEC RISK SNIP:
+SEC RISKS:
 {json_dumps(trimmed["sec_risks_small"])}
 
-SEC MD&A SNIP:
+SEC MD&A:
 {json_dumps(trimmed["sec_mda_small"])}
 
-NEWS (trimmed):
+NEWS:
 {json_dumps(trimmed["news_small"])}
 
-MARKET PERFORMANCE (deterministic):
+TECHNICALS (deterministic):
 {trimmed["technicals_text"]}
 
-PEER BENCHMARK (trimmed):
-{json_dumps(trimmed["peer_ready"])}
+PEER POSITIONING (qualitative only):
+{json_dumps(trimmed["peer_positioning"])}
 
-DATA QUALITY NOTES (copy verbatim into report.data_quality_notes):
+DATA QUALITY NOTES (copy verbatim):
 {json_dumps(trimmed["data_quality_notes"])}
 
 IMPORTANT:
-If any section violates rules above, rewrite it BEFORE finalizing the JSON.
+If any rule above is violated, rewrite the JSON before finalizing.
 """.strip()
 
 
@@ -389,7 +349,7 @@ async def research_node(state: AgentState):
     )
 
     market_snapshot = compute_market_snapshot(finnhub_data)
-    peer_ready = _build_peer_comparison_ready(peer_benchmark)
+    peer_ready = build_peer_comparison_ready(peer_benchmark)
 
     debug = {
         "symbol": symbol,
@@ -442,16 +402,10 @@ async def analyst_structured_node(state: AgentState):
 
     # Force canonical peer_comparison copy if peers exist
     peer_ready = trimmed.get("peer_ready") or {}
-    if (peer_ready.get("peers_used") or []) and not report_obj.get("peer_comparison"):
+
+    if peer_ready.get("peers_used"):
         report_obj["peer_comparison"] = peer_ready
-    elif report_obj.get("peer_comparison") and (peer_ready.get("peers_used") or []):
-        pc = report_obj["peer_comparison"] or {}
-        pc["peers_used"] = peer_ready.get("peers_used") or []
-        pc["scores"] = peer_ready.get("scores") or {}
-        pc["key_stats"] = peer_ready.get("key_stats") or {}
-        if not pc.get("summary"):
-            pc["summary"] = peer_ready.get("summary") or []
-        report_obj["peer_comparison"] = pc
+        report_obj["peer_comparison_summary"] = build_peer_summary(peer_ready)
 
     iters = int(state.get("iterations", 0)) + 1
     return {"report": report_obj, "iterations": iters}
