@@ -1,14 +1,6 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, TypedDict
-from pydantic import BaseModel, Field
-
-
-class IntentResult(BaseModel):
-    intent: str = Field(description="stock_analysis, portfolio, crypto, market_news, education, off_topic")
-    symbols: List[str] = Field(default_factory=list, description="Tickers or crypto symbols")
-    needs_portfolio: bool = False
-    needs_user_profile: bool = True
 
 
 class ChatState(TypedDict, total=False):

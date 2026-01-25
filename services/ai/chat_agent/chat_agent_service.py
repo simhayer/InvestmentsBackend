@@ -4,7 +4,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 from typing import Any, Dict, List, Tuple
 
 from langgraph.graph import StateGraph, END
@@ -14,7 +13,7 @@ from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from services.cache.cache_backend import cache_get, cache_set
-from services.holding_service import get_all_holdings
+from services.holding_service import get_holdings_with_live_prices
 from services.ai.chat_agent.tools import (
     TOOL_REGISTRY,
     ToolContext,
@@ -23,7 +22,7 @@ from services.ai.chat_agent.tools import (
     render_tool_manifest,
     validate_tool_args,
 )
-from .types import ChatState, IntentResult
+from .types import ChatState
 
 logger = logging.getLogger("chat_agent")
 if not logger.handlers:
@@ -44,28 +43,6 @@ CHAT_HISTORY_TTL_SEC = int(os.getenv("CHAT_HISTORY_TTL_SEC", "21600"))  # 6h
 CHAT_MAX_HISTORY = int(os.getenv("CHAT_MAX_HISTORY", "14"))
 MAX_SYMBOLS = int(os.getenv("CHAT_MAX_SYMBOLS", "3"))
 MAX_HOLDINGS = int(os.getenv("CHAT_MAX_HOLDINGS", "25"))
-
-_EXPLICIT_SYMBOL_RE = re.compile(r"\$([A-Za-z]{1,6})\b")
-_HOLDINGS_Q_RE = re.compile(r"\b(what|which)\b.*\b(own|hold|holdings|positions)\b", re.IGNORECASE)
-_OWN_RE = re.compile(r"\b(?:do i|do we|do you|i|we)\s+(?:own|have|hold)\b", re.IGNORECASE)
-_LIST_RE = re.compile(r"\b(?:what|which|list|show)\b.*\b(holdings|positions|stocks|portfolio)\b", re.IGNORECASE)
-_SYMBOL_AFTER_OWN_RE = re.compile(r"\b(?:own|have|hold)\s+([A-Za-z]{1,12})\b", re.IGNORECASE)
-_STOPWORDS = {
-    "any",
-    "some",
-    "stocks",
-    "stock",
-    "holdings",
-    "positions",
-    "portfolio",
-    "shares",
-    "etf",
-    "etfs",
-    "crypto",
-    "cryptos",
-    "already",
-    "currently",
-}
 
 
 class ToolPlan(BaseModel):
@@ -115,11 +92,6 @@ def _format_history(history: List[Dict[str, str]]) -> str:
     return "\n".join(lines)
 
 
-def _explicit_symbols_from_text(text: str) -> List[str]:
-    raw = _EXPLICIT_SYMBOL_RE.findall(text or "")
-    return [s.upper() for s in raw if s]
-
-
 def _json_safe(value: Any) -> Any:
     if isinstance(value, BaseModel):
         return value.model_dump()
@@ -133,13 +105,26 @@ def _json_safe(value: Any) -> Any:
 def _build_answer_messages(
     state: ChatState,
     tool_results: List[Dict[str, Any]],
+    tool_errors: List[Dict[str, Any]] | None = None,
 ) -> List[Any]:
-    intent = state.get("intent") or ""
+    intent = (state.get("intent") or "").strip()
     message = state.get("message") or ""
-    history = state.get("history") or []
     symbols = state.get("symbols") or []
 
-    history_block = _format_history(history)
+    history_block = ""
+    for item in tool_results or []:
+        if item.get("name") != "get_chat_history":
+            continue
+        data = item.get("data") or {}
+        if isinstance(data, dict):
+            text = (data.get("text") or "").strip()
+            if text:
+                history_block = text
+                break
+            messages = data.get("messages")
+            if isinstance(messages, list):
+                history_block = _format_history(messages)
+                break
     system_content = """
 You are a senior financial analyst and stock expert.
 Stay strictly within stocks, ETFs, crypto, portfolio, and market analysis.
@@ -167,18 +152,26 @@ Response style:
 - End with a short prompt for follow-up if needed.
 """.strip()
 
-    user_content = f"""
-CHAT HISTORY:
-{history_block}
+    error_lines: List[str] = []
+    for err in tool_errors or []:
+        if not isinstance(err, dict):
+            continue
+        name = (err.get("name") or "").strip()
+        detail = (err.get("error") or "").strip()
+        if not name:
+            continue
+        error_lines.append(f"{name}: {detail}" if detail else name)
+    errors_block = "\n".join(error_lines) if error_lines else "None"
 
-USER MESSAGE:
+    history_section = f"CHAT HISTORY:\n{history_block}\n\n" if history_block else ""
+    intent_section = f"INTENT:\n{intent}\n\n" if intent else ""
+    symbols_section = f"SYMBOLS:\n{symbols}\n\n" if symbols else ""
+
+    user_content = f"""{history_section}USER MESSAGE:
 {message}
 
-INTENT:
-{intent}
-
-SYMBOLS:
-{symbols}
+{intent_section}{symbols_section}TOOL ERRORS:
+{errors_block}
 """.strip()
 
     tool_calls = []
@@ -201,209 +194,21 @@ SYMBOLS:
     return messages
 
 
-def _is_holdings_list_question(text: str) -> bool:
-    t = text or ""
-    if _LIST_RE.search(t):
-        return True
-    t_low = t.lower()
-    if "own" in t_low and ("stock" in t_low or "stocks" in t_low or "holdings" in t_low or "positions" in t_low):
-        return True
-    return False
-
-
-def _extract_symbol_candidate(text: str) -> str | None:
-    if not text:
-        return None
-    hit = _EXPLICIT_SYMBOL_RE.search(text)
-    if hit:
-        return hit.group(1).upper()
-    hit = _SYMBOL_AFTER_OWN_RE.search(text)
-    if hit:
-        cand = hit.group(1).strip()
-        if cand and cand.lower() not in _STOPWORDS:
-            return cand.upper()
-    caps = re.findall(r"\b[A-Z]{2,6}\b", text)
-    for c in caps:
-        if c.lower() not in _STOPWORDS:
-            return c.upper()
-    return None
-
-
-def _aggregate_holdings(rows: List[Any]) -> List[Dict[str, Any]]:
-    out: Dict[str, Dict[str, Any]] = {}
-    for row in rows:
-        sym = (getattr(row, "symbol", "") or "").strip().upper()
-        if not sym:
-            continue
-        rec = out.get(sym)
-        if not rec:
-            rec = {"symbol": sym, "name": getattr(row, "name", None), "quantity": 0.0}
-            out[sym] = rec
-        qty = getattr(row, "quantity", None)
-        try:
-            rec["quantity"] += float(qty or 0.0)
-        except (TypeError, ValueError):
-            pass
-    return list(out.values())
-
-
-def _render_holdings_list(rows: List[Any]) -> str:
-    holdings = _aggregate_holdings(rows)
-    if not holdings:
-        return "I couldn't find any holdings on your account."
-    lines = ["Here are the holdings I can see:"]
-    for h in holdings:
-        sym = h.get("symbol") or "Unknown"
-        name = h.get("name")
-        qty = h.get("quantity")
-        label = f"{sym}"
-        if name:
-            label = f"{sym} ({name})"
-        if qty:
-            lines.append(f"- {label}, qty {qty}")
-        else:
-            lines.append(f"- {label}")
-    lines.append("Want a breakdown by performance or sector?")
-    return "\n".join(lines)
-
-
-def _render_ownership_answer(rows: List[Any], candidate: str) -> str:
-    if not rows:
-        return "I couldn't find any holdings on your account."
-    sym = candidate.strip().upper()
-    matched = []
-    for row in rows:
-        row_sym = (getattr(row, "symbol", "") or "").strip().upper()
-        row_name = (getattr(row, "name", "") or "").strip().lower()
-        if sym == row_sym or sym.lower() in row_name:
-            matched.append(row)
-    if matched:
-        qty = sum(float(getattr(r, "quantity", 0.0) or 0.0) for r in matched)
-        if qty:
-            return f"Yes — you own {sym}. Total quantity: {qty}."
-        return f"Yes — you own {sym}."
-    return f"I don't see {sym} in your holdings. If you meant a ticker, try using the ticker symbol (e.g., $TSLA)."
-
-
-async def fast_path_node(state: ChatState) -> Dict[str, Any]:
-    message = (state.get("message") or "").strip()
-    db: Session = state.get("db")
-    user_id = state.get("user_id")
-
-    if not message or db is None or user_id is None:
-        return {"short_circuit": False}
-
-    if _is_holdings_list_question(message):
-        rows = get_all_holdings(str(user_id), db)
-        return {
-            "answer": _render_holdings_list(rows),
-            "short_circuit": True,
-            "fast_path_reason": "holdings_list",
-            "debug": {"fast_path": "holdings_list"},
-        }
-
-    if _OWN_RE.search(message):
-        candidate = _extract_symbol_candidate(message)
-        if not candidate:
-            return {"short_circuit": False}
-        rows = get_all_holdings(str(user_id), db)
-        return {
-            "answer": _render_ownership_answer(rows, candidate),
-            "short_circuit": True,
-            "fast_path_reason": "holdings_check",
-            "debug": {"fast_path": "holdings_check", "symbol": candidate},
-        }
-
-    return {"short_circuit": False}
-
-
-def _render_holdings_answer(holdings: List[Dict[str, Any]]) -> str:
-    if not holdings:
-        return "I could not find any holdings on your account."
-    lines = ["Here are the current holdings I can see:"]
-    for h in holdings:
-        sym = h.get("symbol") or "Unknown"
-        name = h.get("name")
-        qty = h.get("quantity")
-        val = h.get("value")
-        cur = h.get("currency") or "USD"
-        label = f"{sym}"
-        if name:
-            label = f"{sym} ({name})"
-        parts = [label]
-        if qty is not None:
-            parts.append(f"qty {qty}")
-        if val is not None:
-            parts.append(f"value {val} {cur}")
-        lines.append("- " + ", ".join(parts))
-    lines.append("Want a breakdown by sector or performance?")
-    return "\n".join(lines)
-
-
-async def route_node(state: ChatState) -> Dict[str, Any]:
-    message = (state.get("message") or "").strip()
-    history = state.get("history") or []
-    history_block = _format_history(history)
-    explicit = _explicit_symbols_from_text(message)
-
-    structured_llm = llm.with_structured_output(IntentResult, method="function_calling")
-    prompt = f"""
-        You are a router for a finance assistant.
-
-        Decide if the user request is related to stocks, ETFs, crypto, portfolio, market news, or investing education.
-        If it is NOT related, set intent to "off_topic".
-
-        Only include symbols that the user explicitly typed (tickers like AAPL, TSLA, or crypto like BTC).
-        Do NOT guess tickers from company names.
-
-        Provide:
-        - intent: stock_analysis | portfolio | crypto | market_news | education | off_topic
-        - symbols: list of explicit tickers/crypto symbols
-        - needs_portfolio: true if the user references "my portfolio", "my holdings", or "my positions"
-        - needs_user_profile: true if personalization would help
-
-        CHAT HISTORY:
-        {history_block}
-
-        USER MESSAGE:
-        {message}
-        """
-
-    res = await structured_llm.ainvoke(prompt)
-    symbols = [s.strip().upper() for s in res.symbols if s and isinstance(s, str)]
-    if explicit:
-        symbols = list(dict.fromkeys(explicit + symbols))
-
-    needs_portfolio = res.needs_portfolio or ("portfolio" in message.lower() or "holdings" in message.lower())
-
-    return {
-        "intent": res.intent,
-        "symbols": symbols[:MAX_SYMBOLS],
-        "needs_portfolio": needs_portfolio,
-        "needs_user_profile": res.needs_user_profile,
-    }
-
-
-def _default_tool_caps(symbols: List[str]) -> Dict[str, Any]:
-    sec_max_calls = 4 if symbols else 0
+def _default_tool_caps() -> Dict[str, Any]:
     return {
         "get_user_profile": {"max_calls": 1},
         "get_portfolio_summary": {"max_calls": 1, "top_n": 5},
         "get_holdings": {"max_calls": 1, "max_items": MAX_HOLDINGS},
         "get_fundamentals": {"max_calls": 1, "max_symbols": MAX_SYMBOLS},
-        "get_sec_snippets": {"max_calls": sec_max_calls, "max_snippets": 6},
+        "get_sec_snippets": {"max_calls": 2, "max_snippets": 6},
         "get_news": {"max_calls": 1, "max_results": 6},
+        "get_chat_history": {"max_calls": 1, "max_items": CHAT_MAX_HISTORY},
     }
 
 
 async def plan_node(state: ChatState) -> Dict[str, Any]:
     message = (state.get("message") or "").strip()
-    intent = (state.get("intent") or "").strip()
-    symbols = state.get("symbols") or []
-    needs_portfolio = bool(state.get("needs_portfolio"))
-    needs_user_profile = bool(state.get("needs_user_profile"))
 
-    history_block = _format_history(state.get("history") or [])
     tool_manifest = render_tool_manifest(list(TOOL_REGISTRY.keys()))
 
     structured_llm = planner_llm.with_structured_output(ToolPlan, method="function_calling")
@@ -414,25 +219,17 @@ async def plan_node(state: ChatState) -> Dict[str, Any]:
         - Only choose tools from TOOL LIST.
         - Choose only tools needed to answer the user's request.
         - If no tools are needed, return an empty list.
-        - If the user asks about their portfolio or holdings, allow portfolio tools.
-        - If the user asks for company analysis with explicit tickers, allow fundamentals/SEC tools.
-        - If the user asks for market or company news, allow the news tool.
-        - If personalization would help, allow the user profile tool.
+        - Avoid portfolio tools unless the user asks about their own holdings or portfolio.
+        - Allow fundamentals/SEC tools only for company or ticker-specific requests.
+        - Allow the news tool for market or company news requests.
+        - Allow the user profile tool when personalization would help.
+        - Allow the chat history tool only when the user asks to recap or references earlier context.
 
         TOOL LIST:
         {tool_manifest}
 
-        CHAT HISTORY:
-        {history_block}
-
         USER MESSAGE:
         {message}
-
-        INTENT:
-        {intent}
-
-        SYMBOLS:
-        {symbols}
 
         """
 
@@ -442,24 +239,9 @@ async def plan_node(state: ChatState) -> Dict[str, Any]:
     except Exception as exc:
         logger.warning("planner failed: %s", exc)
         allowed_tools = []
-        if needs_user_profile:
-            allowed_tools.append("get_user_profile")
-        if needs_portfolio or intent == "portfolio":
-            allowed_tools.append("get_portfolio_summary")
-            allowed_tools.append("get_holdings")
-        if symbols:
-            allowed_tools.append("get_fundamentals")
-            allowed_tools.append("get_sec_snippets")
-        if intent == "market_news":
-            allowed_tools.append("get_news")
 
-    if not symbols:
-        allowed_tools = [t for t in allowed_tools if t not in {"get_fundamentals", "get_sec_snippets"}]
-
-    tool_caps = _default_tool_caps(symbols)
+    tool_caps = _default_tool_caps()
     debug = {
-        "symbols": symbols,
-        "intent": intent,
         "allowed_tools": allowed_tools,
         "tool_caps": tool_caps,
     }
@@ -510,9 +292,6 @@ async def tool_select_node(state: ChatState) -> Dict[str, Any]:
         return {"tool_calls": [], "debug": merged_debug}
 
     message = (state.get("message") or "").strip()
-    intent = (state.get("intent") or "").strip()
-    symbols = state.get("symbols") or []
-    history_block = _format_history(state.get("history") or [])
     tool_caps = state.get("tool_caps") or {}
     tool_manifest = render_tool_manifest(allowed_tools)
 
@@ -526,6 +305,10 @@ async def tool_select_node(state: ChatState) -> Dict[str, Any]:
         - Respect tool caps; do not exceed max_calls.
         - Return a JSON object with: {{ "calls": [{{"name": "...", "arguments": {{...}}}}] }}.
         - If no tools are needed, return {{ "calls": [] }}.
+        - Use get_chat_history only when the user asks for recap or refers to earlier context.
+        - When calling get_fundamentals, include "symbols": ["TICKER", ...].
+        - When calling get_sec_snippets, include "symbol" and "section".
+        - When calling get_news, include a short "query" if the user asks for news.
 
         ALLOWED TOOLS:
         {tool_manifest}
@@ -533,21 +316,16 @@ async def tool_select_node(state: ChatState) -> Dict[str, Any]:
         TOOL CAPS:
         {json.dumps(tool_caps, separators=(",", ":"))}
 
-        CHAT HISTORY:
-        {history_block}
-
         USER MESSAGE:
         {message}
-
-        INTENT:
-        {intent}
-
-        SYMBOLS:
-        {symbols}
         """
 
-    res = await structured_llm.ainvoke(prompt)
-    calls = _filter_tool_calls(res.calls, allowed_tools, tool_caps)
+    try:
+        res = await structured_llm.ainvoke(prompt)
+        calls = _filter_tool_calls(res.calls, allowed_tools, tool_caps)
+    except Exception as exc:
+        logger.warning("tool_select failed: %s", exc)
+        calls = []
     merged_debug = dict(state.get("debug") or {})
     merged_debug.update({"tool_calls": len(calls)})
     return {
@@ -561,18 +339,10 @@ async def tool_exec_node(state: ChatState) -> Dict[str, Any]:
     tool_calls = state.get("tool_calls") or []
     tool_caps = state.get("tool_caps") or {}
 
-    ctx = ToolContext(
-        db=state.get("db"),
-        finnhub=state.get("finnhub"),
-        user_id=state.get("user_id"),
-        user_currency=state.get("user_currency") or "USD",
-        message=state.get("message") or "",
-        symbols=state.get("symbols") or [],
-    )
-
     tasks: List[asyncio.Task[Any]] = []
     meta: List[Dict[str, Any]] = []
     errors: List[Dict[str, Any]] = []
+    prepared_calls: List[Dict[str, Any]] = []
 
     for call in tool_calls:
         name = (call.get("name") or "").strip()
@@ -589,8 +359,56 @@ async def tool_exec_node(state: ChatState) -> Dict[str, Any]:
         if not validated_args:
             errors.append({"name": name, "error": "invalid_args", "arguments": prepared_args})
             continue
-        tasks.append(asyncio.create_task(spec.run(validated_args, ctx)))
-        meta.append({"name": name, "arguments": prepared_args})
+        prepared_calls.append(
+            {
+                "name": name,
+                "arguments": prepared_args,
+                "validated": validated_args,
+                "spec": spec,
+            }
+        )
+
+    holdings_snapshot = None
+    if any(c.get("name") in {"get_holdings", "get_portfolio_summary"} for c in prepared_calls):
+        if state.get("db") is not None and state.get("finnhub") is not None and state.get("user_id") is not None:
+            top_n = 0
+            for call in prepared_calls:
+                if call.get("name") != "get_portfolio_summary":
+                    continue
+                try:
+                    top_n = max(top_n, int(call.get("arguments", {}).get("top_n", 0) or 0))
+                except (TypeError, ValueError):
+                    continue
+            try:
+                holdings_snapshot = await get_holdings_with_live_prices(
+                    user_id=str(state.get("user_id")),
+                    db=state.get("db"),
+                    finnhub=state.get("finnhub"),
+                    currency=state.get("user_currency") or "USD",
+                    top_only=False,
+                    top_n=top_n,
+                    include_weights=True,
+                )
+            except Exception as exc:
+                logger.warning("holdings snapshot failed: %s", exc)
+
+    ctx = ToolContext(
+        db=state.get("db"),
+        finnhub=state.get("finnhub"),
+        user_id=state.get("user_id"),
+        user_currency=state.get("user_currency") or "USD",
+        message=state.get("message") or "",
+        symbols=state.get("symbols") or [],
+        history=state.get("history") or [],
+        holdings_snapshot=holdings_snapshot,
+    )
+
+    for call in prepared_calls:
+        spec = call.get("spec")
+        if not spec:
+            continue
+        tasks.append(asyncio.create_task(spec.run(call.get("validated"), ctx)))
+        meta.append({"name": call.get("name"), "arguments": call.get("arguments")})
 
     results: List[Dict[str, Any]] = []
     if tasks:
@@ -616,116 +434,28 @@ async def tool_exec_node(state: ChatState) -> Dict[str, Any]:
     }
 
 
-def _aggregate_tool_results(tool_results: List[Dict[str, Any]]) -> Dict[str, Any]:
-    profile: Dict[str, Any] = {}
-    portfolio_summary: Dict[str, Any] = {}
-    holdings: List[Dict[str, Any]] = []
-    fundamentals: Dict[str, Any] = {}
-    fundamentals_gaps: Dict[str, List[str]] = {}
-    sec_snippets: Dict[str, List[Dict[str, Any]]] = {"general": [], "business": [], "risk": [], "mda": []}
-    news_items: List[Dict[str, Any]] = []
-
-    for item in tool_results or []:
-        name = item.get("name")
-        data = item.get("data") or {}
-        if name == "get_user_profile":
-            if isinstance(data, dict):
-                profile = data
-        elif name == "get_portfolio_summary":
-            if isinstance(data, dict):
-                portfolio_summary = data
-        elif name == "get_holdings":
-            if isinstance(data, list):
-                holdings = data
-        elif name == "get_fundamentals":
-            if isinstance(data, dict):
-                fundamentals.update(data.get("fundamentals") or {})
-                fundamentals_gaps.update(data.get("gaps") or {})
-        elif name == "get_sec_snippets":
-            if isinstance(data, dict):
-                section = (data.get("section") or "general").strip().lower()
-                snippets = data.get("snippets") or []
-                if isinstance(snippets, list) and section in sec_snippets:
-                    sec_snippets[section].extend(snippets)
-        elif name == "get_news":
-            if isinstance(data, dict):
-                query = data.get("query") or ""
-                items = data.get("items") or []
-                if isinstance(items, list):
-                    for entry in items:
-                        if not isinstance(entry, dict):
-                            continue
-                        payload = dict(entry)
-                        if query:
-                            payload["query"] = query
-                        news_items.append(payload)
-
-    return {
-        "user_profile": profile,
-        "portfolio_summary": portfolio_summary,
-        "holdings": holdings,
-        "fundamentals": fundamentals,
-        "fundamentals_gaps": fundamentals_gaps,
-        "sec_snippets": sec_snippets,
-        "news_items": news_items,
-    }
-
-
 async def answer_node(state: ChatState) -> Dict[str, Any]:
     tool_results = state.get("tool_results") or []
+    tool_errors = state.get("tool_errors") or []
 
-    intent = state.get("intent") or ""
-    message = state.get("message") or ""
-
-    if intent == "off_topic":
-        return {
-            "answer": "I can only help with stocks, crypto, portfolio questions, and market analysis. "
-                      "If you have a finance question, ask away.",
-        }
-
-    tool_data = _aggregate_tool_results(tool_results)
-    holdings = tool_data.get("holdings") or []
-    if intent == "portfolio" and holdings and _HOLDINGS_Q_RE.search(message):
-        return {
-            "answer": _render_holdings_answer(holdings),
-        }
-
-    messages = _build_answer_messages(state, tool_results)
+    messages = _build_answer_messages(state, tool_results, tool_errors)
     res = await llm.ainvoke(messages)
     return {
         "answer": (res.content or "").strip(),
     }
 
 
-def _route_next(state: ChatState) -> str:
-    if (state.get("intent") or "").strip().lower() == "off_topic":
-        return "off_topic"
-    return "plan"
-
-
-def _fast_next(state: ChatState) -> str:
-    if state.get("short_circuit"):
-        return "end"
-    return "route"
-
-
 workflow = StateGraph(ChatState)
-workflow.add_node("fast_path", fast_path_node)
-workflow.add_node("route", route_node)
 workflow.add_node("plan", plan_node)
 workflow.add_node("tool_select", tool_select_node)
 workflow.add_node("tool_exec", tool_exec_node)
 workflow.add_node("answer", answer_node)
-workflow.add_node("off_topic", answer_node)
 
-workflow.set_entry_point("fast_path")
-workflow.add_conditional_edges("fast_path", _fast_next, {"route": "route", "end": END})
-workflow.add_conditional_edges("route", _route_next, {"plan": "plan", "off_topic": "off_topic"})
+workflow.set_entry_point("plan")
 workflow.add_edge("plan", "tool_select")
 workflow.add_edge("tool_select", "tool_exec")
 workflow.add_edge("tool_exec", "answer")
 workflow.add_edge("answer", END)
-workflow.add_edge("off_topic", END)
 
 app_graph = workflow.compile()
 
@@ -776,36 +506,15 @@ async def run_chat_turn_stream(
         "finnhub": finnhub,
     }
 
-    state.update(await fast_path_node(state))
-    if state.get("short_circuit"):
-        answer = state.get("answer") or ""
-        if answer:
-            yield answer
-        return
-
-    state.update(await route_node(state))
-    if (state.get("intent") or "").strip().lower() == "off_topic":
-        answer = (
-            "I can only help with stocks, crypto, portfolio questions, and market analysis. "
-            "If you have a finance question, ask away."
-        )
-        if answer:
-            yield answer
-        return
-
     state.update(await plan_node(state))
     state.update(await tool_select_node(state))
     state.update(await tool_exec_node(state))
 
-    tool_data = _aggregate_tool_results(state.get("tool_results") or [])
-    holdings = tool_data.get("holdings") or []
-    if (state.get("intent") or "") == "portfolio" and holdings and _HOLDINGS_Q_RE.search(message):
-        answer = _render_holdings_answer(holdings)
-        if answer:
-            yield answer
-        return
-
-    messages = _build_answer_messages(state, state.get("tool_results") or [])
+    messages = _build_answer_messages(
+        state,
+        state.get("tool_results") or [],
+        state.get("tool_errors") or [],
+    )
     answer_parts: List[str] = []
     async for chunk in llm_stream.astream(messages):
         text = (chunk.content or "")

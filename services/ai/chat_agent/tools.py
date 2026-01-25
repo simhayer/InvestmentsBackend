@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import logging
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Dict, List, Literal
 
 from pydantic import BaseModel, Field, ValidationError
@@ -64,6 +64,10 @@ class NewsInput(BaseModel):
     max_results: int = Field(default=6, ge=1, le=10)
 
 
+class ChatHistoryInput(BaseModel):
+    max_items: int = Field(default=10, ge=1, le=50)
+
+
 @dataclass(frozen=True)
 class ToolContext:
     db: Any
@@ -72,6 +76,8 @@ class ToolContext:
     user_currency: str
     message: str
     symbols: List[str]
+    history: List[Dict[str, str]] = field(default_factory=list)
+    holdings_snapshot: Dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -209,6 +215,17 @@ def _sec_snippet_payload(chunk: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
+def _history_as_text(history: List[Dict[str, str]], max_items: int) -> str:
+    lines: List[str] = []
+    for msg in history[-max_items:]:
+        role = (msg.get("role") or "").strip()
+        content = (msg.get("content") or "").strip()
+        if not content:
+            continue
+        lines.append(f"{role}: {content}")
+    return "\n".join(lines)
+
+
 async def tool_get_user_profile(_args: NoArgs, ctx: ToolContext) -> Dict[str, Any]:
     if ctx.db is None or ctx.user_id is None:
         return {}
@@ -230,6 +247,7 @@ async def tool_get_portfolio_summary(args: PortfolioSummaryInput, ctx: ToolConte
             finnhub=ctx.finnhub,
             currency=ctx.user_currency or "USD",
             top_n=args.top_n,
+            holdings_payload=ctx.holdings_snapshot,
         )
     except Exception as exc:
         logger.warning("tool_get_portfolio_summary failed: %s", exc)
@@ -240,15 +258,17 @@ async def tool_get_holdings(args: HoldingsInput, ctx: ToolContext) -> List[Dict[
     if ctx.db is None or ctx.user_id is None or ctx.finnhub is None:
         return []
     try:
-        payload = await get_holdings_with_live_prices(
-            user_id=str(ctx.user_id),
-            db=ctx.db,
-            finnhub=ctx.finnhub,
-            currency=ctx.user_currency or "USD",
-            top_only=False,
-            top_n=0,
-            include_weights=True,
-        )
+        payload = ctx.holdings_snapshot
+        if payload is None:
+            payload = await get_holdings_with_live_prices(
+                user_id=str(ctx.user_id),
+                db=ctx.db,
+                finnhub=ctx.finnhub,
+                currency=ctx.user_currency or "USD",
+                top_only=False,
+                top_n=0,
+                include_weights=True,
+            )
         items = (payload or {}).get("items") or []
         holdings = [_holding_brief(it) for it in items if it]
         holdings = [h for h in holdings if h.get("symbol")]
@@ -334,6 +354,16 @@ async def tool_get_news(args: NewsInput, ctx: ToolContext) -> Dict[str, Any]:
         return {"query": query, "items": []}
 
 
+async def tool_get_chat_history(args: ChatHistoryInput, ctx: ToolContext) -> Dict[str, Any]:
+    history = ctx.history or []
+    max_items = _clamp_int(args.max_items, 10, 1, 50)
+    trimmed = history[-max_items:] if history else []
+    return {
+        "messages": trimmed,
+        "text": _history_as_text(trimmed, max_items),
+    }
+
+
 TOOL_REGISTRY: Dict[str, ToolSpec] = {
     "get_user_profile": ToolSpec(
         name="get_user_profile",
@@ -370,6 +400,12 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         description="Fetches recent finance news for a query.",
         input_model=NewsInput,
         run=tool_get_news,
+    ),
+    "get_chat_history": ToolSpec(
+        name="get_chat_history",
+        description="Fetches recent chat history for context or recap.",
+        input_model=ChatHistoryInput,
+        run=tool_get_chat_history,
     ),
 }
 
@@ -444,6 +480,9 @@ def prepare_tool_args(
             "query": _clamp_text(query, MAX_QUERY_CHARS),
             "max_results": max_results,
         }
+    if tool_name == "get_chat_history":
+        max_items_cap = _clamp_int(caps.get("max_items"), 10, 1, 50)
+        return {"max_items": _clamp_int(args.get("max_items"), max_items_cap, 1, max_items_cap)}
     return args
 
 

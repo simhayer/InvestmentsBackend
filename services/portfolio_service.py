@@ -31,19 +31,23 @@ async def get_portfolio_summary(
     finnhub: FinnhubService,
     currency: str = "USD",
     top_n: int = 5,
+    holdings_payload: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """
     Aggregates portfolio summary from holdings enriched with live prices.
     """
-    enriched = await get_holdings_with_live_prices(
-        user_id,
-        db,
-        finnhub,
-        currency=currency,
-        top_only=False,
-        top_n=top_n,
-        include_weights=True,
-    )
+    if holdings_payload is None:
+        enriched = await get_holdings_with_live_prices(
+            user_id,
+            db,
+            finnhub,
+            currency=currency,
+            top_only=False,
+            top_n=top_n,
+            include_weights=True,
+        )
+    else:
+        enriched = holdings_payload
 
     items: List[HoldingOut] = enriched.get("items", [])
     # Route-level price status (live/mixed/unavailable)
