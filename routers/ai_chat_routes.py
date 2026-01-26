@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from typing import Any, AsyncGenerator, Dict, List
+from typing import Any, AsyncGenerator, Dict
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -13,12 +13,7 @@ from models.user import User
 from routers.finnhub_routes import get_finnhub_service
 from services.finnhub.finnhub_service import FinnhubService
 from services.supabase_auth import get_current_db_user
-from services.ai.chat_agent.chat_agent_service import (
-    run_chat_turn,
-    run_chat_turn_stream,
-    load_chat_history,
-    append_chat_history,
-)
+from services.ai.chat_agent.chat_agent_service import run_chat_turn, run_chat_turn_stream
 
 router = APIRouter()
 
@@ -54,28 +49,16 @@ async def chat_endpoint(
         raise HTTPException(status_code=400, detail="Message is required")
 
     session_id = (req.session_id or "").strip() or _make_session_id(user.id)
-    history = load_chat_history(user.id, session_id)
-
     t0 = time.perf_counter()
     answer, debug = await run_chat_turn(
         message=message,
         user_id=user.id,
         user_currency=user.currency or "USD",
         session_id=session_id,
-        history=history,
         db=db,
         finnhub=finnhub,
     )
     response_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-
-    append_chat_history(
-        user.id,
-        session_id,
-        [
-            {"role": "user", "content": message},
-            {"role": "assistant", "content": answer},
-        ],
-    )
 
     return {
         "session_id": session_id,
@@ -97,41 +80,24 @@ async def chat_stream_endpoint(
         raise HTTPException(status_code=400, detail="Message is required")
 
     session_id = (req.session_id or "").strip() or _make_session_id(user.id)
-    history = load_chat_history(user.id, session_id)
-
     async def event_stream() -> AsyncGenerator[str, None]:
-        yield _sse_pack("meta", {"session_id": session_id})
-        t0 = time.perf_counter()
         try:
-            answer_parts: List[str] = []
             async for chunk in run_chat_turn_stream(
                 message=message,
                 user_id=user.id,
                 user_currency=user.currency or "USD",
                 session_id=session_id,
-                history=history,
                 db=db,
                 finnhub=finnhub,
             ):
-                if chunk:
-                    answer_parts.append(chunk)
-                    yield _sse_pack("delta", chunk)
+                if not chunk:
+                    continue
+                event = chunk.get("event") or ""
+                data = chunk.get("data")
+                yield _sse_pack(event, data)
         except Exception as exc:
             yield _sse_pack("error", {"error": str(exc)})
             return
-        response_ms = round((time.perf_counter() - t0) * 1000.0, 2)
-        answer = "".join(answer_parts).strip()
-
-        append_chat_history(
-            user.id,
-            session_id,
-            [
-                {"role": "user", "content": message},
-                {"role": "assistant", "content": answer},
-            ],
-        )
-
-        yield _sse_pack("done", {"status": "ok", "response_ms": response_ms})
 
     headers = {
         "Cache-Control": "no-cache",

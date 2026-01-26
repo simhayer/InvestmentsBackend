@@ -20,6 +20,7 @@ from services.vector.vector_store_service import VectorStoreService
 logger = logging.getLogger("chat_agent.tools")
 
 TTL_TAVILY_SEC = int(os.getenv("TTL_TAVILY_SEC", "900"))
+TTL_WEB_SEARCH_SEC = int(os.getenv("TTL_WEB_SEARCH_SEC", str(TTL_TAVILY_SEC)))
 MAX_NEWS_RESULTS = int(os.getenv("CHAT_MAX_NEWS_RESULTS", "6"))
 MAX_SNIPPET_CHARS = int(os.getenv("CHAT_MAX_SEC_SNIPPET_CHARS", "360"))
 MAX_QUERY_CHARS = int(os.getenv("CHAT_MAX_QUERY_CHARS", "240"))
@@ -62,6 +63,11 @@ class SecSnippetsInput(BaseModel):
 class NewsInput(BaseModel):
     query: str | None = None
     max_results: int = Field(default=6, ge=1, le=10)
+
+
+class WebSearchInput(BaseModel):
+    query: str | None = None
+    max_results: int = Field(default=5, ge=1, le=10)
 
 
 class ChatHistoryInput(BaseModel):
@@ -161,6 +167,11 @@ def _news_cache_key(query: str) -> str:
     return f"CHAT:NEWS:{digest}"
 
 
+def _web_search_cache_key(query: str) -> str:
+    digest = hashlib.sha256((query or "").strip().lower().encode("utf-8")).hexdigest()[:16]
+    return f"CHAT:WEB:{digest}"
+
+
 def _normalize_news_results(results: Any, limit: int) -> List[Dict[str, Any]]:
     items = []
     if isinstance(results, dict):
@@ -189,6 +200,35 @@ def _normalize_news_results(results: Any, limit: int) -> List[Dict[str, Any]]:
         published = item.get("published_date") or item.get("published_at")
         if published:
             payload["published_at"] = published
+        out.append(payload)
+    return out
+
+
+def _normalize_search_results(results: Any, limit: int) -> List[Dict[str, Any]]:
+    items = []
+    if isinstance(results, dict):
+        raw_items = results.get("results") or results.get("data") or []
+        if isinstance(raw_items, list):
+            items = raw_items
+    if not items:
+        return []
+    out: List[Dict[str, Any]] = []
+    for item in items[: max(1, limit)]:
+        if not isinstance(item, dict):
+            continue
+        title = (item.get("title") or "").strip()
+        url = (item.get("url") or "").strip()
+        content = (item.get("content") or item.get("snippet") or "").strip()
+        if content:
+            content = content.replace("\n", " ").strip()
+        payload = {
+            "title": title,
+            "url": url,
+            "summary": _clamp_text(content, 280),
+        }
+        source = (item.get("source") or "").strip()
+        if source:
+            payload["source"] = source
         out.append(payload)
     return out
 
@@ -354,6 +394,36 @@ async def tool_get_news(args: NewsInput, ctx: ToolContext) -> Dict[str, Any]:
         return {"query": query, "items": []}
 
 
+async def tool_get_web_search(args: WebSearchInput, ctx: ToolContext) -> Dict[str, Any]:
+    query = (args.query or "").strip()
+    if not query:
+        if ctx.symbols:
+            query = f"{ctx.symbols[0]} overview"
+        else:
+            query = ctx.message or ""
+    query = _clamp_text(query, MAX_QUERY_CHARS)
+    if not query:
+        return {"query": "", "items": []}
+    cache_key = _web_search_cache_key(query)
+    cached = cache_get(cache_key)
+    if isinstance(cached, list):
+        return {"query": query, "items": cached[: args.max_results]}
+    try:
+        results = await tavily_search(
+            query=query,
+            max_results=args.max_results,
+            include_answer=False,
+            include_raw_content=False,
+            search_depth="basic",
+        )
+        items = _normalize_search_results(results, args.max_results)
+        cache_set(cache_key, items, ttl_seconds=TTL_WEB_SEARCH_SEC)
+        return {"query": query, "items": items}
+    except Exception as exc:
+        logger.warning("tool_get_web_search failed: %s", exc)
+        return {"query": query, "items": []}
+
+
 async def tool_get_chat_history(args: ChatHistoryInput, ctx: ToolContext) -> Dict[str, Any]:
     history = ctx.history or []
     max_items = _clamp_int(args.max_items, 10, 1, 50)
@@ -400,6 +470,12 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         description="Fetches recent finance news for a query.",
         input_model=NewsInput,
         run=tool_get_news,
+    ),
+    "get_web_search": ToolSpec(
+        name="get_web_search",
+        description="Searches the web for general financial context beyond internal data.",
+        input_model=WebSearchInput,
+        run=tool_get_web_search,
     ),
     "get_chat_history": ToolSpec(
         name="get_chat_history",
@@ -475,6 +551,16 @@ def prepare_tool_args(
             else:
                 query = (state.get("message") or "").strip()
         max_results_cap = _clamp_int(caps.get("max_results"), MAX_NEWS_RESULTS, 1, 10)
+        max_results = _clamp_int(args.get("max_results"), max_results_cap, 1, max_results_cap)
+        return {
+            "query": _clamp_text(query, MAX_QUERY_CHARS),
+            "max_results": max_results,
+        }
+    if tool_name == "get_web_search":
+        query = (args.get("query") or "").strip()
+        if not query:
+            query = (state.get("message") or "").strip()
+        max_results_cap = _clamp_int(caps.get("max_results"), 5, 1, 10)
         max_results = _clamp_int(args.get("max_results"), max_results_cap, 1, max_results_cap)
         return {
             "query": _clamp_text(query, MAX_QUERY_CHARS),
