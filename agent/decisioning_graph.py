@@ -32,9 +32,9 @@ from .state_models import (
     GraphState,
     GraphStateDict,
     IntentType,
-    IntentRefinementOutput,
     MemorySnapshot,
     RequestContext,
+    SmalltalkOutput,
     SynthesisOutput,
     ToolBudget,
     ToolError,
@@ -47,11 +47,13 @@ if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
 PROMPT_DIR = Path(__file__).resolve().parent / "prompts"
-INTENT_PROMPT_PATH = PROMPT_DIR / "intent_v1.txt"
+SMALLTALK_PROMPT_PATH = PROMPT_DIR / "smalltalk_v1.txt"
+INGEST_PROMPT_PATH = PROMPT_DIR / "ingest_v1.txt"
 PLANNER_PROMPT_PATH = PROMPT_DIR / "planner_v1.txt"
 SYNTHESIS_PROMPT_PATH = PROMPT_DIR / "synthesis_v1.txt"
 
-INTENT_MODEL = os.getenv("OPENAI_INTENT_MODEL", os.getenv("OPENAI_PLANNER_MODEL", "gpt-4.1-mini"))
+INGEST_MODEL = os.getenv("OPENAI_INGEST_MODEL", os.getenv("OPENAI_PLANNER_MODEL", "gpt-4.1-mini"))
+SMALLTALK_MODEL = os.getenv("OPENAI_SMALLTALK_MODEL", os.getenv("OPENAI_PLANNER_MODEL", "gpt-4.1-mini"))
 PLANNER_MODEL = os.getenv("OPENAI_PLANNER_MODEL", "gpt-4.1-mini")
 SYNTHESIS_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o")
 
@@ -125,6 +127,22 @@ def _normalize_list(values: List[str]) -> List[str]:
     return out
 
 
+def _normalize_request_context(ctx: RequestContext) -> RequestContext:
+    tickers = _normalize_list([t.upper() for t in (ctx.tickers or []) if isinstance(t, str)])
+    sections = _normalize_list(ctx.requested_sections or [])
+    return RequestContext(
+        intent=ctx.intent,
+        tickers=tickers,
+        needs_portfolio=ctx.needs_portfolio,
+        needs_recency=ctx.needs_recency,
+        requested_sections=sections or None,
+        output_style=ctx.output_style,
+        risk_flags=set(ctx.risk_flags or []),
+        timeframe=ctx.timeframe,
+        user_constraints=ctx.user_constraints,
+    )
+
+
 def _as_request_context(value: Any) -> RequestContext:
     if isinstance(value, RequestContext):
         return value
@@ -168,30 +186,6 @@ def _as_tool_results(value: Any) -> List[ToolResult]:
         if isinstance(item, dict):
             results.append(ToolResult.model_validate(item))
     return results
-
-
-def _merge_request_context(base: RequestContext, refined: IntentRefinementOutput) -> RequestContext:
-    intent = refined.intent or base.intent
-    needs_portfolio = refined.needs_portfolio if refined.needs_portfolio is not None else base.needs_portfolio
-    needs_recency = refined.needs_recency if refined.needs_recency is not None else base.needs_recency
-    if needs_portfolio and intent != "portfolio_q":
-        intent = "portfolio_q"
-    sections = _normalize_list((base.requested_sections or []) + (refined.requested_sections or []))
-    output_style = refined.output_style or base.output_style
-    risk_flags = set(base.risk_flags)
-    if refined.risk_flags:
-        risk_flags.update(refined.risk_flags)
-    return RequestContext(
-        intent=intent,
-        tickers=base.tickers,
-        needs_portfolio=needs_portfolio,
-        needs_recency=needs_recency,
-        requested_sections=sections or None,
-        output_style=output_style,
-        risk_flags=risk_flags,
-        timeframe=base.timeframe,
-        user_constraints=base.user_constraints,
-    )
 
 
 def parse_request_context(message: str) -> RequestContext:
@@ -365,6 +359,19 @@ def _maybe_add_web_search(
     return plan
 
 
+def _strip_ticker_dependent_data(plan: DataRequirementsPlan, ctx: RequestContext) -> DataRequirementsPlan:
+    if ctx.tickers:
+        return plan
+    required = [item for item in plan.required_data if item not in {"fundamentals", "sec_snippets"}]
+    optional = [item for item in plan.optional_data if item not in {"fundamentals", "sec_snippets"}]
+    return DataRequirementsPlan(
+        required_data=required,
+        optional_data=optional,
+        sec_sections=plan.sec_sections,
+        notes=plan.notes,
+    )
+
+
 def _enforce_portfolio_requirements(
     plan: DataRequirementsPlan, ctx: RequestContext, allowed: List[str]
 ) -> DataRequirementsPlan:
@@ -498,6 +505,20 @@ def _build_missing_note(missing: List[str], recency_insufficient: bool) -> str:
     return " ".join(notes).strip()
 
 
+def _unescape_json_char(ch: str) -> str:
+    if ch == "n":
+        return "\n"
+    if ch == "t":
+        return "\t"
+    if ch == "r":
+        return "\r"
+    if ch == '"':
+        return '"'
+    if ch == "\\":
+        return "\\"
+    return ch
+
+
 def _answer_mentions_web(answer: str, web_items: List[Dict[str, Any]]) -> bool:
     text = (answer or "").lower()
     if not text:
@@ -552,12 +573,15 @@ def _plan_payload(state: GraphState) -> Dict[str, Any]:
 
 class DecisioningGraph:
     def __init__(self) -> None:
-        self._intent_prompt = _load_prompt(INTENT_PROMPT_PATH)
+        self._smalltalk_prompt = _load_prompt(SMALLTALK_PROMPT_PATH)
+        self._ingest_prompt = _load_prompt(INGEST_PROMPT_PATH)
         self._planner_prompt = _load_prompt(PLANNER_PROMPT_PATH)
         self._synthesis_prompt = _load_prompt(SYNTHESIS_PROMPT_PATH)
-        self._intent_llm = ChatOpenAI(model=INTENT_MODEL, temperature=0.0)
+        self._smalltalk_llm = ChatOpenAI(model=SMALLTALK_MODEL, temperature=0.0)
+        self._ingest_llm = ChatOpenAI(model=INGEST_MODEL, temperature=0.0)
         self._planner_llm = ChatOpenAI(model=PLANNER_MODEL, temperature=0.0)
         self._synthesis_llm = ChatOpenAI(model=SYNTHESIS_MODEL, temperature=0.2)
+        self._synthesis_llm_stream = ChatOpenAI(model=SYNTHESIS_MODEL, temperature=0.2, streaming=True)
         self._graph = self._build_graph(full_graph=True)
         self._pre_synthesis_graph = self._build_graph(full_graph=False)
         self._tool_executor = ToolExecutor()
@@ -573,14 +597,51 @@ class DecisioningGraph:
     async def ingest_request(self, state: Dict[str, Any]) -> Dict[str, Any]:
         _log_step("node_start", "ingest_request", state)
         start = time.perf_counter()
-        ctx = parse_request_context(state.get("message") or "")
+        message = state.get("message") or ""
+        memory = _as_memory(state.get("memory"))
+        recent_turns = memory.recent_turns[-4:] if memory.recent_turns else []
+        payload = {
+            "message": message,
+            "thread_summary": memory.thread_summary,
+            "recent_entities": memory.recent_entities,
+            "recent_turns": recent_turns,
+        }
+        structured_llm = self._ingest_llm.with_structured_output(RequestContext, method="function_calling")
+        messages = [
+            SystemMessage(content=self._ingest_prompt),
+            HumanMessage(content=json.dumps(payload, separators=(",", ":"))),
+        ]
+        token_usage = None
+        try:
+            ctx = await structured_llm.ainvoke(messages)
+            token_usage = getattr(ctx, "usage_metadata", None)
+        except Exception as exc:
+            logger.warning("ingest_request failed: %s", exc)
+            ctx = RequestContext()
+        ctx = _normalize_request_context(ctx)
         _log_json(
             {
-                "event": "node_span",
+                "event": "llm_call",
                 "node": "ingest_request",
+                "model": INGEST_MODEL,
+                "prompt_version": "ingest_v1",
                 "duration_ms": _elapsed_ms(start),
+                "token_usage": token_usage,
                 "trace_id": state.get("trace_id"),
                 "turn_id": state.get("turn_id"),
+            }
+        )
+        _log_json(
+            {
+                "event": "ingest_context",
+                "trace_id": state.get("trace_id"),
+                "turn_id": state.get("turn_id"),
+                "intent": ctx.intent,
+                "tickers": ctx.tickers,
+                "needs_portfolio": ctx.needs_portfolio,
+                "needs_recency": ctx.needs_recency,
+                "requested_sections": ctx.requested_sections,
+                "output_style": ctx.output_style,
             }
         )
         return {"request_context": ctx}
@@ -592,6 +653,13 @@ class DecisioningGraph:
         session_id = state.get("session_id")
         memory = load_memory_snapshot(user_id, session_id, max_turns=CHAT_MAX_HISTORY)
         memory.user_profile = _load_user_profile(state.get("db"), user_id)
+        recent_turns = memory.recent_turns or []
+        last_roles = []
+        for item in recent_turns[-2:]:
+            if isinstance(item, dict):
+                role = item.get("role")
+                if isinstance(role, str):
+                    last_roles.append(role)
         _log_json(
             {
                 "event": "node_span",
@@ -601,57 +669,66 @@ class DecisioningGraph:
                 "turn_id": state.get("turn_id"),
             }
         )
+        _log_json(
+            {
+                "event": "memory_snapshot",
+                "trace_id": state.get("trace_id"),
+                "turn_id": state.get("turn_id"),
+                "summary_len": len(memory.thread_summary or ""),
+                "recent_entities_count": len(memory.recent_entities or []),
+                "recent_turns_count": len(recent_turns),
+                "last_roles": last_roles,
+            }
+        )
         return {"memory": memory}
 
-    async def intent_refinement(self, state: Dict[str, Any]) -> Dict[str, Any]:
-        _log_step("node_start", "intent_refinement", state)
+    async def smalltalk_handler(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        _log_step("node_start", "smalltalk_handler", state)
         start = time.perf_counter()
         ctx = _as_request_context(state.get("request_context"))
-        memory = _as_memory(state.get("memory"))
         payload = {
             "message": state.get("message") or "",
-            "request_context": ctx.model_dump(mode="json"),
-            "thread_summary": memory.thread_summary,
-            "recent_entities": memory.recent_entities,
+            "intent": ctx.intent,
         }
-        structured_llm = self._intent_llm.with_structured_output(
-            IntentRefinementOutput, method="function_calling"
+        structured_llm = self._smalltalk_llm.with_structured_output(
+            SmalltalkOutput, method="function_calling"
         )
         messages = [
-            SystemMessage(content=self._intent_prompt),
+            SystemMessage(content=self._smalltalk_prompt),
             HumanMessage(content=json.dumps(payload, separators=(",", ":"))),
         ]
         token_usage = None
+        handled = False
+        answer = ""
+        notes = ""
         try:
             res = await structured_llm.ainvoke(messages)
             token_usage = getattr(res, "usage_metadata", None)
-            merged = _merge_request_context(ctx, res)
+            handled = bool(res.handled)
+            answer = (res.answer or "").strip()
+            notes = res.notes or ""
         except Exception as exc:
-            logger.warning("intent_refinement failed: %s", exc)
-            merged = ctx
-        _log_json(
-            {
-                "event": "intent_refined",
-                "trace_id": state.get("trace_id"),
-                "turn_id": state.get("turn_id"),
-                "intent": merged.intent,
-                "needs_portfolio": merged.needs_portfolio,
-                "needs_recency": merged.needs_recency,
-            }
-        )
+            logger.warning("smalltalk_handler failed: %s", exc)
         _log_json(
             {
                 "event": "llm_call",
-                "node": "intent_refinement",
-                "model": INTENT_MODEL,
-                "prompt_version": "intent_v1",
+                "node": "smalltalk_handler",
+                "model": SMALLTALK_MODEL,
+                "prompt_version": "smalltalk_v1",
                 "duration_ms": _elapsed_ms(start),
                 "token_usage": token_usage,
                 "trace_id": state.get("trace_id"),
                 "turn_id": state.get("turn_id"),
             }
         )
-        return {"request_context": merged}
+        if handled and answer:
+            return {
+                "answer": _ensure_disclaimer(answer),
+                "handled": True,
+                "handled_reason": "smalltalk",
+                "debug": {"smalltalk_notes": notes} if notes else {},
+            }
+        return {"handled": False}
 
     async def policy_and_budget(self, state: Dict[str, Any]) -> Dict[str, Any]:
         _log_step("node_start", "policy_and_budget", state)
@@ -737,6 +814,7 @@ class DecisioningGraph:
         allowed = _as_budgets(state.get("budgets")).allowed_data_types
         plan = _sanitize_data_requirements(plan, allowed)
         plan = _maybe_add_web_search(plan, ctx, allowed)
+        plan = _strip_ticker_dependent_data(plan, ctx)
         plan = _enforce_portfolio_requirements(plan, ctx, allowed)
         _log_json(
             {
@@ -1033,6 +1111,158 @@ class DecisioningGraph:
         )
         return {"answer": answer}
 
+    async def stream_synthesis(self, state: GraphState):
+        ctx = _as_request_context(state.request_context)
+        memory = _as_memory(state.memory)
+        tool_results = _as_tool_results(state.tool_results)
+        missing_sources = _missing_sources(tool_results)
+        web_items = _web_search_items(tool_results)
+
+        if state.handled:
+            answer = state.answer or ""
+            if answer:
+                yield answer
+            return
+
+        if tool_results and not any(res.ok for res in tool_results):
+            note = _build_missing_note(missing_sources, state.recency_insufficient)
+            answer = "I couldn't retrieve the requested data right now."
+            if note:
+                answer = f"{answer} {note}"
+            answer = _ensure_disclaimer(answer)
+            yield answer
+            return
+
+        payload = {
+            "message": state.message or "",
+            "request_context": ctx.model_dump(mode="json"),
+            "user_profile": memory.user_profile,
+            "thread_summary": memory.thread_summary,
+            "recent_entities": memory.recent_entities,
+            "recency_insufficient": state.recency_insufficient,
+            "tool_results": [tr.model_dump(mode="json") for tr in tool_results],
+            "web_search_items": web_items,
+        }
+        messages = [
+            SystemMessage(content=self._synthesis_prompt),
+            HumanMessage(content=json.dumps(payload, separators=(",", ":"))),
+        ]
+
+        raw_buffer = ""
+        raw_response = ""
+        parse_pos = 0
+        found_answer = False
+        in_answer = False
+        escape = False
+        pending_sentence = ""
+        emitted = ""
+        removed = False
+
+        def flush_sentence(force: bool = False) -> str:
+            nonlocal pending_sentence, removed
+            if not pending_sentence:
+                return ""
+            if not force and not re.search(r"[.!?]$", pending_sentence.strip()):
+                return ""
+            sentence = pending_sentence
+            pending_sentence = ""
+            if "get_fundamentals" in missing_sources:
+                if any(term in sentence.lower() for term in FUNDAMENTAL_TERMS):
+                    removed = True
+                    return ""
+            return sentence
+
+        def emit_text(text: str) -> None:
+            nonlocal emitted
+            if not text:
+                return
+            emitted += text
+            yield_texts.append(text)
+
+        async for chunk in self._synthesis_llm_stream.astream(messages):
+            text = (chunk.content or "")
+            if not text:
+                continue
+            raw_buffer += text
+            raw_response += text
+
+            if not found_answer:
+                match = re.search(r'"answer"\s*:\s*"', raw_buffer)
+                if match:
+                    found_answer = True
+                    in_answer = True
+                    parse_pos = match.end()
+
+            if not in_answer:
+                continue
+
+            yield_texts: List[str] = []
+            while parse_pos < len(raw_buffer):
+                ch = raw_buffer[parse_pos]
+                parse_pos += 1
+                if escape:
+                    ch = _unescape_json_char(ch)
+                    escape = False
+                else:
+                    if ch == "\\":
+                        escape = True
+                        continue
+                    if ch == '"':
+                        in_answer = False
+                        break
+                if "get_fundamentals" in missing_sources:
+                    pending_sentence += ch
+                    flushed = flush_sentence(force=False)
+                    if flushed:
+                        emit_text(flushed)
+                else:
+                    emit_text(ch)
+
+            if parse_pos > 4096:
+                raw_buffer = raw_buffer[parse_pos:]
+                parse_pos = 0
+
+            for out in yield_texts:
+                if out:
+                    yield out
+
+        if not emitted and raw_response:
+            try:
+                parsed = json.loads(raw_response)
+                candidate = (parsed.get("answer") or "").strip()
+            except Exception:
+                candidate = raw_response.strip()
+            if candidate:
+                emitted = candidate
+                yield candidate
+
+        if "get_fundamentals" in missing_sources:
+            flushed = flush_sentence(force=True)
+            if flushed:
+                yield flushed
+                emitted += flushed
+
+        limitation_note = _build_missing_note(missing_sources, state.recency_insufficient)
+        if limitation_note:
+            note_block = f"\n\nData limitations: {limitation_note}"
+            yield note_block
+            emitted += note_block
+        if removed and "get_fundamentals" in missing_sources:
+            add_block = "\n\nFundamental metrics are not available at the moment."
+            yield add_block
+            emitted += add_block
+        if web_items and not _answer_mentions_web(emitted, web_items):
+            appended = _append_web_context("", web_items)
+            if appended:
+                yield "\n\n" + appended.lstrip()
+                emitted += "\n\n" + appended.lstrip()
+        if "financial advice" not in emitted.lower():
+            disclaimer = "\n\nThis is not financial advice."
+            yield disclaimer
+            emitted += disclaimer
+
+        state.answer = emitted.strip()
+
     async def postprocess_and_store(self, state: Dict[str, Any]) -> Dict[str, Any]:
         _log_step("node_start", "postprocess_and_store", state)
         start = time.perf_counter()
@@ -1092,9 +1322,9 @@ class DecisioningGraph:
 
     def _build_graph(self, full_graph: bool) -> Any:
         workflow: StateGraph = StateGraph(GraphStateDict)
-        workflow.add_node("ingest_request", self.ingest_request)
         workflow.add_node("load_memory", self.load_memory)
-        workflow.add_node("intent_refinement", self.intent_refinement)
+        workflow.add_node("ingest_request", self.ingest_request)
+        workflow.add_node("smalltalk_handler", self.smalltalk_handler)
         workflow.add_node("policy_and_budget", self.policy_and_budget)
         workflow.add_node("data_requirements_planner", self.data_requirements_planner)
         workflow.add_node("tool_exec_parallel", self.tool_exec_parallel)
@@ -1103,10 +1333,27 @@ class DecisioningGraph:
             workflow.add_node("synthesis", self.synthesis)
             workflow.add_node("postprocess_and_store", self.postprocess_and_store)
 
-        workflow.set_entry_point("ingest_request")
-        workflow.add_edge("ingest_request", "load_memory")
-        workflow.add_edge("load_memory", "intent_refinement")
-        workflow.add_edge("intent_refinement", "policy_and_budget")
+        workflow.set_entry_point("load_memory")
+        workflow.add_edge("load_memory", "ingest_request")
+        workflow.add_edge("ingest_request", "smalltalk_handler")
+        if full_graph:
+            workflow.add_conditional_edges(
+                "smalltalk_handler",
+                lambda state: "handled" if state.get("handled") else "continue",
+                {
+                    "handled": "postprocess_and_store",
+                    "continue": "policy_and_budget",
+                },
+            )
+        else:
+            workflow.add_conditional_edges(
+                "smalltalk_handler",
+                lambda state: "handled" if state.get("handled") else "continue",
+                {
+                    "handled": END,
+                    "continue": "policy_and_budget",
+                },
+            )
         workflow.add_edge("policy_and_budget", "data_requirements_planner")
         workflow.add_edge("data_requirements_planner", "tool_exec_parallel")
         workflow.add_edge("tool_exec_parallel", "recency_guard")
@@ -1162,6 +1409,8 @@ class DecisioningGraph:
         return GraphState.model_validate(merged)
 
     async def run_synthesis(self, state: GraphState) -> GraphState:
+        if state.handled:
+            return state
         update = await self.synthesis(state.model_dump())
         state.answer = update.get("answer") or ""
         return state

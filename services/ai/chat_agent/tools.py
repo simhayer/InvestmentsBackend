@@ -21,6 +21,13 @@ logger = logging.getLogger("chat_agent.tools")
 
 TTL_TAVILY_SEC = int(os.getenv("TTL_TAVILY_SEC", "900"))
 TTL_WEB_SEARCH_SEC = int(os.getenv("TTL_WEB_SEARCH_SEC", str(TTL_TAVILY_SEC)))
+TAVILY_WEB_SEARCH_DAYS = int(os.getenv("TAVILY_WEB_SEARCH_DAYS", "30"))
+TAVILY_NEWS_DAYS = int(os.getenv("TAVILY_NEWS_DAYS", "7"))
+TAVILY_WEB_DOMAINS = [
+    d.strip()
+    for d in (os.getenv("TAVILY_WEB_DOMAINS") or "").split(",")
+    if d.strip()
+]
 MAX_NEWS_RESULTS = int(os.getenv("CHAT_MAX_NEWS_RESULTS", "6"))
 MAX_SNIPPET_CHARS = int(os.getenv("CHAT_MAX_SEC_SNIPPET_CHARS", "360"))
 MAX_QUERY_CHARS = int(os.getenv("CHAT_MAX_QUERY_CHARS", "240"))
@@ -385,6 +392,7 @@ async def tool_get_news(args: NewsInput, ctx: ToolContext) -> Dict[str, Any]:
             include_answer=False,
             include_raw_content=False,
             search_depth="advanced",
+            days=TAVILY_NEWS_DAYS,
         )
         items = _normalize_news_results(results, args.max_results)
         cache_set(cache_key, items, ttl_seconds=TTL_TAVILY_SEC)
@@ -414,7 +422,9 @@ async def tool_get_web_search(args: WebSearchInput, ctx: ToolContext) -> Dict[st
             max_results=args.max_results,
             include_answer=False,
             include_raw_content=False,
-            search_depth="basic",
+            search_depth="advanced",
+            include_domains=TAVILY_WEB_DOMAINS or None,
+            days=TAVILY_WEB_SEARCH_DAYS,
         )
         items = _normalize_search_results(results, args.max_results)
         cache_set(cache_key, items, ttl_seconds=TTL_WEB_SEARCH_SEC)

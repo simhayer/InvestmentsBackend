@@ -89,14 +89,9 @@ class BudgetConfig(BaseModel):
 class SynthesisOutput(BaseModel):
     answer: str
 
-
-class IntentRefinementOutput(BaseModel):
-    intent: Optional[IntentType] = None
-    needs_portfolio: Optional[bool] = None
-    needs_recency: Optional[bool] = None
-    requested_sections: List[SecSection] = Field(default_factory=list)
-    output_style: Optional[OutputStyle] = None
-    risk_flags: List[RiskFlag] = Field(default_factory=list)
+class SmalltalkOutput(BaseModel):
+    handled: bool = False
+    answer: str = ""
     notes: str = ""
 
 
@@ -117,6 +112,8 @@ class GraphState(BaseModel):
     tool_statuses: List[Dict[str, Any]] = Field(default_factory=list)
     recency_insufficient: bool = False
     answer: str = ""
+    handled: bool = False
+    handled_reason: str = ""
     db: Any = None
     finnhub: Any = None
     debug: Dict[str, Any] = Field(default_factory=dict)
@@ -137,6 +134,8 @@ class GraphStateDict(TypedDict, total=False):
     tool_statuses: List[Dict[str, Any]]
     recency_insufficient: bool
     answer: str
+    handled: bool
+    handled_reason: str
     db: Any
     finnhub: Any
     debug: Dict[str, Any]

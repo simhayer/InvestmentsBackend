@@ -3,9 +3,9 @@
 This package implements the LangGraph-based Decisioning Graph for the AI stock/portfolio assistant.
 
 ## Nodes and Responsibilities
-- ingest_request: Deterministic request normalization (intent, tickers, recency, output style, risk flags).
+- ingest_request: Small-model request normalization (intent, tickers, recency, output style, risk flags), using recent memory for coreference.
 - load_memory: Cache-only memory load (thread summary, recent entities, recent turns, user profile).
-- intent_refinement: Small-model intent refinement with strict JSON output (optional override).
+- smalltalk_handler: Small-model node that short-circuits greetings/thanks to avoid tool calls.
 - policy_and_budget: Deterministic budgets/caps and allowed data types per intent.
 - data_requirements_planner (planner_v1): Small-model planner that selects required/optional DATA TYPES only.
 - tool_exec_parallel: Parallel tool execution via ToolExecutor, with caps/timeouts and ToolResult envelopes.
@@ -31,6 +31,11 @@ Tool caps per turn:
 - get_fundamentals: up to 5 tickers
 - get_web_search: 1 (max_results=5)
 
+Web search tuning (env):
+- `TAVILY_WEB_SEARCH_DAYS` (default 30)
+- `TAVILY_NEWS_DAYS` (default 7)
+- `TAVILY_WEB_DOMAINS` (comma-separated allowlist)
+
 ## Memory
 Cache-only memory (same TTL as CHAT:SESSION):
 - CHAT:SUMMARY:{user_id}:{session_id}
@@ -45,3 +50,7 @@ Events:
 
 ## Observability
 Structured logs include trace_id/turn_id, node spans, tool metrics, and eval artifacts.
+
+## Model Env
+- `OPENAI_INGEST_MODEL` for ingest_request
+- `OPENAI_SMALLTALK_MODEL` for smalltalk_handler

@@ -28,7 +28,9 @@ async def search(
     max_results: int,
     include_answer: bool = False,
     include_raw_content: bool = False,
-    search_depth: str = "advanced"
+    search_depth: str = "advanced",
+    include_domains: List[str] | None = None,
+    days: int | None = None,
 ) -> Dict[str, Any]:
     if not TAVILY_API_KEY:
         raise TavilyClientError("Missing TAVILY_API_KEY")
@@ -42,6 +44,10 @@ async def search(
         "search_depth": search_depth if search_depth in {"basic", "advanced"} else "advanced",
         "topic": "finance",
     }
+    if include_domains:
+        payload["include_domains"] = include_domains
+    if days is not None and int(days) > 0:
+        payload["days"] = int(days)
 
     timeout = httpx.Timeout(TAVILY_TIMEOUT_SEC)
     last_exc: Exception | None = None
