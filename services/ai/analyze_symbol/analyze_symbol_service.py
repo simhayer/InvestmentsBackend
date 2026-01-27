@@ -1,4 +1,4 @@
-# services/ai/analyze_symbol_service.py
+# services/ai/analyze_symbol/analyze_symbol_service.py
 import os
 import time
 import json
@@ -8,22 +8,20 @@ from typing import Any, Dict, List
 
 from langgraph.graph import StateGraph, END
 
-from services.openai.client import llm, llm_mini  # llm = gpt-4o, llm_mini = gpt-4o-mini
+from services.openai.client import llm
 from services.vector.vector_store_service import VectorStoreService
+from services.cache.cache_backend import cache_set
 from utils.common_helpers import timed
 
-try:
-    from services.tavily.client import search as tavily_search, compact_results as compact_tavily
-except Exception:
-    tavily_search = None  # type: ignore
-    compact_tavily = None  # type: ignore
-
 from services.finnhub.finnhub_fundamentals import fetch_fundamentals_cached
-from services.finnhub.peer_benchmark_service import fetch_peer_benchmark_cached, build_peer_summary, build_peer_positioning, build_peer_comparison_ready
-from services.cache.cache_backend import cache_set
-from services.ai.technicals_pack import build_technical_pack, compact_tech_pack
-from services.finnhub.finnhub_news_service import get_company_news_cached, shrink_news_items
+from services.finnhub.peer_benchmark_service import (
+    fetch_peer_benchmark_cached,
+    build_peer_summary,
+    build_peer_comparison_ready,
+)
+from services.finnhub.finnhub_news_service import get_company_news_cached
 from services.finnhub.finnhub_calender_service import get_earnings_calendar_compact_cached
+from services.ai.technicals_pack import build_technical_pack, compact_tech_pack
 
 from services.ai.helpers.analyze_symbol_helpers import (
     compute_market_snapshot,
@@ -31,38 +29,42 @@ from services.ai.helpers.analyze_symbol_helpers import (
     normalize_symbol,
     ck_task,
     ck_report,
-    format_sec_chunks,
     get_fundamentals_with_cache,
     get_news_with_optional_tavily_fallback,
     get_sec_routed_context,
     json_dumps,
-    trim_quote,
-    trim_profile,
-    trim_market_snapshot,
-    trim_earnings_calendar,
-    trim_sec_chunks,
-    trim_news_items,
-    shorten_text,
-    build_technicals_text_from_pack,
     validate_report,
     compute_data_quality,
 )
 
-from .types import AnalysisReport, AgentState
+from .types import AgentState, CoreAnalysis
+from .facts_pack_service import (
+    build_facts_pack,
+    build_key_risks,
+    build_current_performance,
+    build_price_outlook,
+    build_watch_list,
+)
+
+try:
+    from services.tavily.client import search as tavily_search, compact_results as compact_tavily
+except Exception:
+    tavily_search = None  # type: ignore
+    compact_tavily = None  # type: ignore
+
 
 logger = logging.getLogger("analysis_timing")
 if not logger.handlers:
     logging.basicConfig(level=logging.INFO)
 
-TTL_FUNDAMENTALS_SEC = int(os.getenv("TTL_FUNDAMENTALS_SEC", "600"))  # 10m
-TTL_TAVILY_SEC = int(os.getenv("TTL_TAVILY_SEC", "900"))  # 15m
-TTL_TASK_RESULT_SEC = int(os.getenv("TTL_TASK_RESULT_SEC", "3600"))  # 1h
-TTL_ANALYSIS_REPORT_SEC = int(os.getenv("TTL_ANALYSIS_REPORT_SEC", "1800"))  # 30m per symbol
+TTL_FUNDAMENTALS_SEC = int(os.getenv("TTL_FUNDAMENTALS_SEC", "600"))
+TTL_TAVILY_SEC = int(os.getenv("TTL_TAVILY_SEC", "900"))
+TTL_TASK_RESULT_SEC = int(os.getenv("TTL_TASK_RESULT_SEC", "3600"))
+TTL_ANALYSIS_REPORT_SEC = int(os.getenv("TTL_ANALYSIS_REPORT_SEC", "1800"))
 
 # Heavy clients ONCE
 VS = VectorStoreService()
 
-# Optional: limit fan-out so you don’t get throttled under load
 FINNHUB_SEM = asyncio.Semaphore(int(os.getenv("FINNHUB_CONCURRENCY", "5")))
 SEC_SEM = asyncio.Semaphore(int(os.getenv("SEC_CONCURRENCY", "2")))
 TAVILY_SEM = asyncio.Semaphore(int(os.getenv("TAVILY_CONCURRENCY", "2")))
@@ -76,8 +78,8 @@ async def _sem_run(sem: asyncio.Semaphore, coro):
 def _safe_sorted_earnings(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return sorted(items or [], key=lambda x: x.get("date") or "9999-99-99")
 
+
 async def _build_technicals(symbol: str) -> str:
-    # deterministic technicals text (still needs history IO)
     price_points, bench_points = await asyncio.gather(
         fetch_history_points(symbol, "2y", "1d"),
         fetch_history_points("SPY", "2y", "1d"),
@@ -90,192 +92,9 @@ async def _build_technicals(symbol: str) -> str:
             benchmark_points=bench_points,
         )
     )
+    # Keep deterministic text builder where it currently lives
+    from services.ai.helpers.analyze_symbol_helpers import build_technicals_text_from_pack
     return build_technicals_text_from_pack(symbol, tech_pack)
-
-
-def _trim_inputs_for_structured(state: AgentState) -> Dict[str, Any]:
-    finnhub_data = state.get("finnhub_data", {}) or {}
-    normalized = finnhub_data.get("normalized") or {}
-
-    profile_small = trim_profile(finnhub_data.get("profile") or {})
-    quote_small = trim_quote(finnhub_data.get("quote") or {})
-    market_snapshot_small = trim_market_snapshot(state.get("market_snapshot", {}) or {})
-
-    earnings_calendar = _safe_sorted_earnings(state.get("earnings_calendar", []) or [])
-    earnings_small = trim_earnings_calendar(earnings_calendar, max_items=2)
-    next_date = earnings_small[0].get("date") if earnings_small else "Unknown"
-
-    # Reduce SEC further for speed (you can tune this)
-    sec_bus_small = trim_sec_chunks(state.get("sec_business", []) or [], max_chunks=1, max_chars_each=650)
-    sec_risks_small = trim_sec_chunks(state.get("sec_risks", []) or [], max_chunks=1, max_chars_each=650)
-    sec_mda_small = trim_sec_chunks(state.get("sec_mda", []) or [], max_chunks=1, max_chars_each=650)
-
-    news_items = state.get("news_items", []) or []
-    news_small = trim_news_items(news_items, max_items=4, max_chars_each=200)
-
-    finnhub_gaps = state.get("finnhub_gaps", []) or []
-    data_quality_notes = compute_data_quality(
-        finnhub_data=finnhub_data,
-        finnhub_gaps=finnhub_gaps,
-        sec_context=state.get("sec_context", "") or "",
-        news_count=len(news_items),
-    )
-
-    peer_ready = state.get("peer_comparison_ready") or {}
-    if not peer_ready:
-        peer_ready = build_peer_comparison_ready(state.get("peer_benchmark", {}) or {})
-
-    peer_positioning = build_peer_positioning(peer_ready)
-
-    technicals_text = shorten_text(state.get("technicals", "") or "", 650)
-
-    critique = (state.get("critique") or "").strip()
-    critique_block = (
-        f"\nCRITIQUE FIXES:\n{shorten_text(critique, 900)}\n"
-        if critique and critique.upper() != "CLEAR"
-        else ""
-    )
-
-    return {
-        "symbol": (state.get("symbol") or "").strip().upper(),
-        "normalized": normalized,
-        "profile_small": profile_small,
-        "quote_small": quote_small,
-        "market_snapshot_small": market_snapshot_small,
-        "earnings_small": earnings_small,
-        "next_date": str(next_date) if next_date else "Unknown",
-        "sec_bus_small": sec_bus_small,
-        "sec_risks_small": sec_risks_small,
-        "sec_mda_small": sec_mda_small,
-        "news_small": news_small,
-        "technicals_text": technicals_text,
-        "peer_ready": peer_ready,
-        "data_quality_notes": data_quality_notes,
-        "critique_block": critique_block,
-        "peer_positioning": peer_positioning,
-    }
-
-
-def _build_structured_prompt(trimmed: Dict[str, Any]) -> str:
-    symbol = trimmed["symbol"]
-    next_date = trimmed["next_date"]
-    critique_block = trimmed["critique_block"]
-
-    return f"""
-Return a JSON object that matches the AnalysisReport schema EXACTLY.
-Do not include any fields not defined in the schema.
-
-Definitive truth: next earnings date is {next_date}.
-
-====================
-CORE RULES
-====================
-
-STYLE
-- Write like a buy-side analyst.
-- Be specific. Avoid filler and generic statements.
-
-STRUCTURE (STRICT)
-- key_insights: EXACTLY 3 items.
-- key_risks: EXACTLY 5 items.
-- thesis_points: EXACTLY 3 items.
-- upcoming_catalysts: EXACTLY 3 items.
-- scenarios: EXACTLY 3 (Base, Bull, Bear).
-
-CONTENT RULES
-- Each key_insight MUST include: (1) a metric, (2) evidence, (3) implication.
-- unified_thesis MUST be concise and coherent.
-- is_priced_in must be boolean.
-- pricing_assessment MUST be present and non-empty.
-- If confidence ≥ 0.6, market_edge MUST be present.
-
-PEERS
-- You may reference peer positioning qualitatively (cheap/expensive, strong/weak).
-- DO NOT restate or reproduce numerical peer metrics.
-
-CATALYSTS
-- If earnings-related, window MUST be "{next_date}".
-
-CONFIDENCE
-- Must be defensible.
-- If data_quality_notes are non-empty, confidence should generally be < 0.8.
-
-{critique_block}
-
-====================
-INPUTS
-====================
-
-SYMBOL:
-{symbol}
-
-FINNHUB NORMALIZED:
-{json_dumps(trimmed["normalized"])}
-
-PROFILE:
-{json_dumps(trimmed["profile_small"])}
-
-QUOTE:
-{json_dumps(trimmed["quote_small"])}
-
-MARKET SNAPSHOT:
-{json_dumps(trimmed["market_snapshot_small"])}
-
-EARNINGS:
-{json_dumps(trimmed["earnings_small"])}
-
-SEC BUSINESS:
-{json_dumps(trimmed["sec_bus_small"])}
-
-SEC RISKS:
-{json_dumps(trimmed["sec_risks_small"])}
-
-SEC MD&A:
-{json_dumps(trimmed["sec_mda_small"])}
-
-NEWS:
-{json_dumps(trimmed["news_small"])}
-
-TECHNICALS (deterministic):
-{trimmed["technicals_text"]}
-
-PEER POSITIONING (qualitative only):
-{json_dumps(trimmed["peer_positioning"])}
-
-DATA QUALITY NOTES (copy verbatim):
-{json_dumps(trimmed["data_quality_notes"])}
-
-IMPORTANT:
-If any rule above is violated, rewrite the JSON before finalizing.
-""".strip()
-
-
-def _build_critic_prompt(issues: List[str], report_obj: Dict[str, Any]) -> str:
-    small_payload = {
-        "issues": issues,
-        "recommendation": report_obj.get("recommendation"),
-        "confidence": report_obj.get("confidence"),
-        "is_priced_in": report_obj.get("is_priced_in"),
-        "pricing_assessment": report_obj.get("pricing_assessment"),
-        "upcoming_catalysts": report_obj.get("upcoming_catalysts"),
-        "scenarios": report_obj.get("scenarios"),
-        "market_edge": report_obj.get("market_edge"),
-        "thesis_points": report_obj.get("thesis_points"),
-        "key_insights": report_obj.get("key_insights"),
-    }
-
-    return f"""
-You are a strict reviewer. Fix the report by addressing ONLY the listed issues.
-Return 3–7 specific fix instructions. Do not add new sections.
-
-ISSUES:
-{json.dumps(issues, ensure_ascii=False)}
-
-PAYLOAD:
-{json.dumps(small_payload, ensure_ascii=False)}
-
-If everything is fixed already, respond exactly: CLEAR
-""".strip()
 
 
 # ----------------------------
@@ -313,7 +132,6 @@ async def research_node(state: AgentState):
         return (res.data or {}), (res.gaps or [])
 
     async def get_news():
-        # Tavily fallback is inside helper; helper should be caching tavily results already
         with timed("finnhub_news", logger, state=state):
             return await get_news_with_optional_tavily_fallback(
                 symbol=symbol,
@@ -326,19 +144,21 @@ async def research_node(state: AgentState):
 
     async def get_sec():
         with timed("sec_vector_routing", logger, state=state):
-            return await _sem_run(SEC_SEM, asyncio.to_thread(
-                get_sec_routed_context,
-                symbol=symbol,
-                state=state,
-                task_id=task_id,
-                vs=VS,
-            ))
+            return await _sem_run(
+                SEC_SEM,
+                asyncio.to_thread(
+                    get_sec_routed_context,
+                    symbol=symbol,
+                    state=state,
+                    task_id=task_id,
+                    vs=VS,
+                ),
+            )
 
     async def get_tech():
         with timed("technicals_pack", logger, state=state):
             return await _build_technicals(symbol)
 
-    # Fan-out research + technicals (these are all IO-bound)
     (finnhub_data, finnhub_gaps), earnings_calendar, (peer_benchmark, peer_gaps), (news_items, raw_str, used_tavily), (sec_context, sec_business, sec_risks, sec_mda, sec_debug), technicals_text = await asyncio.gather(
         get_fund(),
         get_earnings(),
@@ -380,77 +200,95 @@ async def research_node(state: AgentState):
     }
 
 
-async def analyst_structured_node(state: AgentState):
-    """
-    Produces AnalysisReport (structured).
-    No drafts node: this is now the main thinking step.
-    """
-    structured_llm = llm.with_structured_output(AnalysisReport, method="function_calling").bind(temperature=0.2)
+async def facts_pack_node(state: AgentState):
+    facts_pack = build_facts_pack(
+        market_snapshot=state.get("market_snapshot") or {},
+        quote=(state.get("finnhub_data", {}).get("quote") or {}),
+        peer_ready=(state.get("peer_comparison_ready") or {}),
+        earnings_small=_safe_sorted_earnings(state.get("earnings_calendar", []))[:1],
+        news_items=state.get("news_items", []),
+        sec_risks=state.get("sec_risks", []),
+        data_quality_notes=compute_data_quality(
+            finnhub_data=state.get("finnhub_data", {}),
+            finnhub_gaps=state.get("finnhub_gaps", []),
+            sec_context=state.get("sec_context", ""),
+            news_count=len(state.get("news_items", [])),
+        ),
+    )
+    return {"facts_pack": facts_pack.model_dump()}
 
-    trimmed = _trim_inputs_for_structured(state)
-    prompt = _build_structured_prompt(trimmed)
+async def analyst_core_node(state: AgentState):
+    llm_core = llm.with_structured_output(CoreAnalysis).bind(temperature=0.2)
 
-    with timed(
-        "llm_analyst_structured",
-        logger,
-        state=state,
-        tags={"prompt_kb": round(len(prompt) / 1024, 1)},
-    ):
-        report = await structured_llm.ainvoke(prompt)
+    facts = state["facts_pack"]
 
-    report_obj = report.model_dump()
+    prompt = f"""
+    You are given a FACTS PACK. Treat it as correct.
 
-    # Force canonical peer_comparison copy if peers exist
-    peer_ready = trimmed.get("peer_ready") or {}
+    Your job:
+    - Decide what matters (no filler)
+    - Decide what is priced in
+    - Explain one place the market may be wrong
 
-    if peer_ready.get("peers_used"):
-        report_obj["peer_comparison"] = peer_ready
-        report_obj["peer_comparison_summary"] = build_peer_summary(peer_ready)
+    OUTPUT RULES (STRICT)
+    - key_insights: EXACTLY 3
+    - thesis_points: EXACTLY 3
+    - upcoming_catalysts: EXACTLY 3 and distinct
+    - Only ONE catalyst may be earnings-related (use facts.events.next_earnings as the window)
+    - scenarios: EXACTLY 3 with names: Base, Bull, Bear
 
-    iters = int(state.get("iterations", 0)) + 1
-    return {"report": report_obj, "iterations": iters}
+    QUALITY RULES
+    - Every key_insight must include a real metric or a concrete label from the pack (price levels, YoY %, margin %, leverage flag, trend label, etc.)
+    - Evidence MUST be a short plain-English sentence.
+
+    FACTS PACK:
+    {json_dumps(facts)}
+    """.strip()
+
+    core = await llm_core.ainvoke(prompt)
+    return {"core_analysis": core.model_dump()}
 
 
-async def critic_node(state: AgentState):
-    report_obj = state.get("report", {}) or {}
+def assemble_report_node(state: AgentState):
+    core = state["core_analysis"]
+    facts = state["facts_pack"]
 
-    earnings_calendar = _safe_sorted_earnings(state.get("earnings_calendar", []) or [])
-    raw_next = earnings_calendar[0].get("date") if earnings_calendar else None
-    next_date = str(raw_next) if raw_next else "Unknown"
+    peer_ready = state.get("peer_comparison_ready") or {}
 
-    finnhub_gaps = state.get("finnhub_gaps", []) or []
-    issues = validate_report(report_obj, next_earnings_date=next_date, finnhub_gaps=finnhub_gaps)
+    report = {
+        **core,
+        "symbol": state["symbol"],
 
-    if not issues:
-        return {"is_valid": True, "critique": "CLEAR"}
+        # Python-owned fields
+        "current_performance": build_current_performance(facts),
+        "key_risks": build_key_risks(facts),
+        "price_outlook": build_price_outlook(facts, core),
+        "what_to_watch_next": build_watch_list(facts, core),
 
-    logger.info("Report validation found %d issues for %s", len(issues), state.get("symbol", ""))
+        # Peer: include raw + computed summary (optional)
+        "peer_comparison": peer_ready if peer_ready.get("peers_used") else None,
+        "peer_comparison_summary": build_peer_summary(peer_ready) if peer_ready.get("peers_used") else [],
 
-    prompt = _build_critic_prompt(issues, report_obj)
-    with timed("llm_critic_mini", logger, state=state, tags={"prompt_kb": round(len(prompt) / 1024, 1)}):
-        res = await llm_mini.ainvoke(prompt)
+        "data_quality_notes": facts.get("data_quality_notes", []),
+    }
 
-    txt = (res.content or "").strip()
-    return {"is_valid": txt.upper() == "CLEAR", "critique": "" if txt.upper() == "CLEAR" else txt}
+    return {"report": report}
 
 
 # ----------------------------
-# Build Graph (drafts removed)
+# Build Graph
 # ----------------------------
 workflow = StateGraph(AgentState)
 workflow.add_node("research", research_node)
-workflow.add_node("analyst", analyst_structured_node)
-workflow.add_node("critic", critic_node)
+workflow.add_node("facts_pack", facts_pack_node)
+workflow.add_node("analyst_core", analyst_core_node)
+workflow.add_node("assemble", assemble_report_node)
 
 workflow.set_entry_point("research")
-workflow.add_edge("research", "analyst")
-workflow.add_edge("analyst", "critic")
-
-workflow.add_conditional_edges(
-    "critic",
-    lambda x: "end" if x.get("is_valid") else "revise",
-    {"revise": "analyst", "end": END},
-)
+workflow.add_edge("research", "facts_pack")
+workflow.add_edge("facts_pack", "analyst_core")
+workflow.add_edge("analyst_core", "assemble")
+workflow.add_edge("assemble", END)
 
 app_graph = workflow.compile()
 
@@ -459,11 +297,6 @@ app_graph = workflow.compile()
 # Task runner (Redis-backed)
 # ----------------------------
 async def run_analysis_task(symbol: str, task_id: str):
-    """
-    Stores task status + final structured report in Redis.
-    API contract:
-    { status, data: { report, total_seconds }, debug }
-    """
     t0_total = time.perf_counter()
     symbol = normalize_symbol(symbol)
     task_key = ck_task(task_id)
@@ -483,7 +316,6 @@ async def run_analysis_task(symbol: str, task_id: str):
 
         cache_set(task_key, payload, ttl_seconds=TTL_TASK_RESULT_SEC)
 
-        # Optional symbol-level cache
         try:
             cache_set(ck_report(symbol), report_obj, ttl_seconds=TTL_ANALYSIS_REPORT_SEC)
         except Exception:

@@ -1,173 +1,126 @@
 from typing import Any, Dict, List, Optional, Literal, TypedDict
 from pydantic import BaseModel, Field
 
-
-# ----------------------------
-# Pro-grade sub-schemas
-# ----------------------------
 Magnitude = Literal["Low", "Medium", "High", "Unknown"]
 PricedIn = Literal["Low", "Partial", "High", "Unknown"]
-CatalystWindow = str  # keep flexible: "Next 30–60 days", "Q2 2026", "Next earnings", etc.
+
 
 class TextBlock(BaseModel):
-    bullets: List[str] = Field(min_items=3, max_items=5)
+    bullets: List[str] = Field(default_factory=list, min_items=1, max_items=6)
+
 
 class ThesisPoint(BaseModel):
-    """
-    One claim + why it matters + what could disprove it.
-    This makes the thesis feel like a real analyst note.
-    """
     claim: str
     why_it_matters: str
     what_would_change_my_mind: str = Field(default="Not available")
 
 class Catalyst(BaseModel):
-    """
-    Catalyst = trigger + mechanism + expected impact.
-    Ensures dates from earnings_calendar are prioritized.
-    """
-    name: str = Field(description="Short name of the event, e.g., 'Q1 Earnings Release'")
-    
-    # Updated window field to force date formatting
+    name: str
     window: str = Field(
-        description=(
-            "The specific date or timeframe. "
-            "STRICT RULE: If a date is provided in the earnings_calendar, "
-            "you MUST use the YYYY-MM-DD format here. Otherwise, use 'Q# YYYY'."
-        ),
-        examples=["2026-01-29", "2026-04-29"]
+        description="YYYY-MM-DD if from earnings_calendar; otherwise use 'Q# YYYY' or timeframe."
     )
-    
-    trigger: str = Field(description="Specific event or data point release.")
-    mechanism: str = Field(description="How the event affects valuation (e.g., 'beat leads to multiple expansion').")
-    likely_market_reaction: str = Field(description="Expected direction + reasoning (no price targets).")
-    
-    impact_channels: List[str] = Field(
-        default_factory=list,
-        description="Pick from: revenue, margins, guidance, multiple, risk_premium, liquidity, sentiment, regulation"
-    )
-    
+    trigger: str
+    mechanism: str
+    likely_market_reaction: str
+    impact_channels: List[str] = Field(default_factory=list)
     probability: float = Field(ge=0.0, le=1.0, default=0.5)
     magnitude: Magnitude = "Unknown"
     priced_in: PricedIn = "Unknown"
-    key_watch_items: List[str] = Field(default_factory=list, description="Concrete metrics to watch.")
+    key_watch_items: List[str] = Field(default_factory=list)
+
 
 class Scenario(BaseModel):
-    """
-    Scenario framing without numeric price targets.
-    """
     name: Literal["Base", "Bull", "Bear"]
-    narrative: str = Field(description="What happens and why.")
+    narrative: str
     key_drivers: List[str] = Field(default_factory=list)
     watch_items: List[str] = Field(default_factory=list)
 
 
 class DebateItem(BaseModel):
-    """
-    Real analyst notes include the 2–4 things the market disagrees about.
-    """
-    debate: str = Field(description="e.g., 'Margin durability vs competitive pressure'")
+    debate: str
     what_to_watch: List[str] = Field(default_factory=list)
 
+
 class MarketEdge(BaseModel):
-    consensus_view: str = Field(description="What the market currently assumes.")
-    variant_view: str = Field(description="Why that assumption may be wrong or fragile.")
-    why_it_matters: str = Field(description="Implications if the variant view is correct.")
+    consensus_view: str
+    variant_view: str
+    why_it_matters: str
+
 
 class KeyInsight(BaseModel):
     insight: str
-    evidence: Optional[str]
-    implication: Optional[str]
+    evidence: Optional[str] = None
+    implication: Optional[str] = None
+
 
 class PeerMetricStat(BaseModel):
     company: Optional[float] = None
     peer_median: Optional[float] = None
     company_percentile: Optional[float] = Field(default=None, ge=0.0, le=100.0)
-
     peer_count: Optional[int] = None
     higher_is_better: Optional[bool] = None
+
 
 class PeerComparison(BaseModel):
     peers_used: List[str] = Field(default_factory=list)
     scores: Dict[str, Optional[float]] = Field(default_factory=dict)
     key_stats: Dict[str, PeerMetricStat] = Field(default_factory=dict)
 
+
 class PricingAssessment(BaseModel):
     market_expectation: str
     variant_outcome: str
     valuation_sensitivity: str
 
-# ----------------------------
-# Output schema (upgraded)
-# ----------------------------
+
 class AnalysisReport(BaseModel):
-    # Keep existing fields
     symbol: str
-    key_insights: List[KeyInsight] = Field(description="Critical fundamental highlights", min_items=3, max_items=3)
-    current_performance: TextBlock = Field(description="Technical and price action analysis")
-    key_risks: List[str] = Field(description="Red flags and assessment of risks", min_items=5, max_items=5)
-    price_outlook: TextBlock = Field(description="Deeply reasoned AI outlook balancing bull/bear cases")
+
+    key_insights: List[KeyInsight] = Field(min_items=3, max_items=3)
+    unified_thesis: TextBlock
+
+    current_performance: TextBlock
+    key_risks: List[str] = Field(min_items=2, max_items=5)
+    price_outlook: TextBlock
+    what_to_watch_next: List[str] = Field(default_factory=list, min_items=3, max_items=10)
+
+    thesis_points: List[ThesisPoint] = Field(min_items=3, max_items=3)
+    upcoming_catalysts: List[Catalyst] = Field(min_items=3, max_items=3)
+    scenarios: List[Scenario] = Field(min_items=3, max_items=3)
+
+    key_debates: List[DebateItem] = Field(default_factory=list)
+
+    market_edge: Optional[MarketEdge] = None
+    pricing_assessment: PricingAssessment
+
     recommendation: Literal["Buy", "Hold", "Sell"]
+    is_priced_in: bool
     confidence: float = Field(ge=0.0, le=1.0)
-    is_priced_in: bool = False
 
-    # New pro-grade fields
-    unified_thesis: TextBlock = Field(description="A single coherent view: what drives the stock and why now.")
+    data_quality_notes: List[str] = Field(default_factory=list)
 
-    thesis_points: List[ThesisPoint] = Field(
-        default_factory=list,
-        description="3–6 structured thesis claims with falsifiers."
-    )
-
-    upcoming_catalysts: List[Catalyst] = Field(
-        default_factory=list,
-        description="3–8 catalysts with trigger → mechanism → impact."
-    )
-
-    scenarios: List[Scenario] = Field(
-        default_factory=list,
-        description="Base/Bull/Bear scenario narratives (no price targets)."
-    )
-
-    key_debates: List[DebateItem] = Field(
-        default_factory=list,
-        description="2–4 disagreements investors have + what would settle them."
-    )
-
-    what_to_watch_next: List[str] = Field(
-        default_factory=list,
-        description="5–10 concrete watch items (metrics, events, statements)."
-    )
-
-    data_quality_notes: List[str] = Field(
-        default_factory=list,
-        description="Call out missing fundamentals/weak news/empty SEC context."
-    )
-
-    market_edge: Optional[MarketEdge] = Field(
-        default=None,
-        description="Where is the market likely wrong? Consensus vs variant view."
-    )
-
-    pricing_assessment: Optional[PricingAssessment] = Field(
-        default=None,
-        description="What is priced in vs not priced in."
-    )
+    peer_comparison: Optional[PeerComparison] = None
+    peer_comparison_summary: List[str] = Field(default_factory=list)
 
 
 # ----------------------------
-# Graph state (upgraded)
+# Graph state
 # ----------------------------
 class BaseAgentState(TypedDict):
     symbol: str
     iterations: int
 
+
 class AgentState(BaseAgentState, total=False):
     task_id: str
     raw_data: str
+
     finnhub_data: Dict[str, Any]
     finnhub_gaps: List[str]
+    market_snapshot: Dict[str, Any]
+
     peer_benchmark: Dict[str, Any]
+    peer_comparison_ready: Dict[str, Any]
     peer_gaps: List[str]
 
     sec_context: str
@@ -176,13 +129,27 @@ class AgentState(BaseAgentState, total=False):
     sec_mda: List[Dict[str, Any]]
 
     earnings_calendar: List[Dict[str, Any]]
-    news_items: List[Dict[str, Any]]  # <-- add this if not already present
+    news_items: List[Dict[str, Any]]
 
-    fundamentals: str
-    technicals: str  # now deterministic text
-    risks: str
+    technicals: str
 
+    facts_pack: Dict[str, Any]
+    core_analysis: Dict[str, Any]
     report: Dict[str, Any]
+
     critique: str
     is_valid: bool
     debug: Dict[str, Any]
+
+
+class CoreAnalysis(BaseModel):
+    key_insights: List[KeyInsight] = Field(min_items=3, max_items=3)
+    unified_thesis: TextBlock
+    thesis_points: List[ThesisPoint] = Field(min_items=3, max_items=3)
+    upcoming_catalysts: List[Catalyst] = Field(min_items=3, max_items=3)
+    scenarios: List[Scenario] = Field(min_items=3, max_items=3)
+    market_edge: Optional[MarketEdge] = None
+    pricing_assessment: PricingAssessment
+    recommendation: Literal["Buy", "Hold", "Sell"]
+    is_priced_in: bool
+    confidence: float = Field(ge=0.0, le=1.0)

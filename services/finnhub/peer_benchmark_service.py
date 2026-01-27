@@ -444,13 +444,13 @@ def _line(label, company, median, pctile, higher_is_better):
     if p is None:
         return f"{label}: {company_f:.2f} vs peer median {median_f:.2f}."
 
-    # Interpret percentile correctly
+    p = max(0.0, min(100.0, p))
+
     if higher_is_better is False:
-        # lower is better → convert to "better-than" framing
-        better = 100.0 - p
+        # Your percentile already behaves like "better-than %" for lower-is-better metrics
         return (
             f"{label} (lower is better): {company_f:.2f} vs {median_f:.2f} "
-            f"(cheaper than ~{better:.0f}% of peers)."
+            f"(better than ~{p:.0f}% of peers)."
         )
 
     return (
