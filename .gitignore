@@ -16,6 +16,7 @@
 
 # local virtual env
 /venv/
+.venv/
 
 # local documentation scratch
 /readme.node_modules

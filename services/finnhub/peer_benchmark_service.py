@@ -10,7 +10,7 @@ from services.cache.cache_backend import cache_get, cache_set
 from services.finnhub.client import FINNHUB_CLIENT
 from services.finnhub.finnhub_service import FinnhubService, FinnhubServiceError
 from services.finnhub.finnhub_fundamentals import fetch_fundamentals_cached
-from utils.common_helpers import median, safe_float
+from utils.common_helpers import median, safe_float, fmt_pct, to_float
 
 logger = logging.getLogger(__name__)
 
@@ -431,3 +431,90 @@ async def fetch_peer_benchmark_cached(
     out = PeerBenchmarkResult(data=data, gaps=gaps)
     cache_set(key, {"data": out.data, "gaps": out.gaps}, ttl_seconds=ttl_seconds)
     return out
+
+def _line(label, company, median, pctile, higher_is_better):
+    company_f = to_float(company)
+    median_f = to_float(median)
+    p = to_float(pctile)
+
+    if company_f is None or median_f is None:
+        return None
+
+    # No percentile available → simple comparison
+    if p is None:
+        return f"{label}: {company_f:.2f} vs peer median {median_f:.2f}."
+
+    p = max(0.0, min(100.0, p))
+
+    if higher_is_better is False:
+        # Your percentile already behaves like "better-than %" for lower-is-better metrics
+        return (
+            f"{label} (lower is better): {company_f:.2f} vs {median_f:.2f} "
+            f"(better than ~{p:.0f}% of peers)."
+        )
+
+    return (
+        f"{label}: {company_f:.2f} vs {median_f:.2f} "
+        f"(better than ~{p:.0f}% of peers)."
+    )
+
+
+def build_peer_summary(pc):
+    ks = (pc or {}).get("key_stats") or {}
+    out = []
+
+    pe = ks.get("pe_ttm") or {}
+    s = _line("Valuation P/E", pe.get("company"), pe.get("peer_median"),
+              pe.get("company_percentile"), pe.get("higher_is_better"))
+    if s: out.append(s)
+
+    g = ks.get("revenue_growth_yoy") or {}
+    s = _line("Growth YoY", g.get("company"), g.get("peer_median"),
+              g.get("company_percentile"), g.get("higher_is_better"))
+    if s: out.append(s)
+
+    om = ks.get("operating_margin") or {}
+    s = _line("Operating margin", om.get("company"), om.get("peer_median"),
+              om.get("company_percentile"), om.get("higher_is_better"))
+    if s: out.append(s)
+
+    d = ks.get("debt_to_equity") or {}
+    s = _line("Leverage D/E", d.get("company"), d.get("peer_median"),
+              d.get("company_percentile"), d.get("higher_is_better"))
+    if s: out.append(s)
+
+    return out[:4]
+
+def build_peer_positioning(peer_ready: Dict[str, Any]) -> Dict[str, str]:
+    ks = peer_ready.get("key_stats", {})
+    out = {}
+
+    pe = ks.get("pe_ttm", {})
+    if pe:
+        out["valuation"] = "cheaper than most peers" if pe.get("company") < pe.get("peer_median") else "more expensive than peers"
+
+    g = ks.get("revenue_growth_yoy", {})
+    if g:
+        out["growth"] = "bottom-quintile growth vs peers" if g.get("company_percentile", 50) < 25 else "above-average growth"
+
+    om = ks.get("operating_margin", {})
+    if om:
+        out["profitability"] = "above-median margins" if om.get("company") > om.get("peer_median") else "below-median margins"
+
+    return out
+
+
+def build_peer_comparison_ready(peer_benchmark: Dict[str, Any]) -> Dict[str, Any]:
+    peer_benchmark = peer_benchmark or {}
+    bench = peer_benchmark.get("benchmarks") or {}
+
+    key_stats = {}
+    for k in ("pe_ttm", "revenue_growth_yoy", "operating_margin", "debt_to_equity", "gross_margin"):
+        if k in bench and bench.get(k) is not None:
+            key_stats[k] = bench.get(k)
+
+    return {
+        "peers_used": (peer_benchmark.get("peers_used") or [])[:12],
+        "scores": peer_benchmark.get("scores") or {},
+        "key_stats": key_stats,
+    }
