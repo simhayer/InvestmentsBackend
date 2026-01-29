@@ -1,4 +1,7 @@
-from typing import Dict, List, Any
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
 from services.ai.analyze_symbol.facts_pack_schema import (
     ValuationFacts,
     GrowthFacts,
@@ -18,8 +21,8 @@ def build_price_facts(
     ma_50 = market_snapshot.get("ma_50")
     ma_200 = market_snapshot.get("ma_200")
 
-    vs_50 = "above" if ma_50 and price > ma_50 else "below"
-    vs_200 = "above" if ma_200 and price > ma_200 else "below"
+    vs_50 = "above" if (ma_50 and price is not None and price > ma_50) else "below"
+    vs_200 = "above" if (ma_200 and price is not None and price > ma_200) else "below"
 
     if vs_50 == "above" and vs_200 == "above":
         regime = "strong_uptrend"
@@ -39,8 +42,8 @@ def build_price_facts(
     }
 
 
-def build_valuation_facts(peer_ready: Dict[str, any]) -> ValuationFacts:
-    pe = peer_ready.get("key_stats", {}).get("pe_ttm", {})
+def build_valuation_facts(peer_ready: Dict[str, Any]) -> ValuationFacts:
+    pe = (peer_ready.get("key_stats") or {}).get("pe_ttm", {})
     company = pe.get("company")
     median = pe.get("peer_median")
 
@@ -55,12 +58,12 @@ def build_valuation_facts(peer_ready: Dict[str, any]) -> ValuationFacts:
 
     return ValuationFacts(
         relative_position=rel,
-        sensitivity="growth_driven",  # default; LLM will reason on impact
+        sensitivity="growth_driven",  # ok as a default; LLM can reason about it later
     )
 
 
-def build_growth_facts(peer_ready: Dict[str, any]) -> GrowthFacts:
-    g = peer_ready.get("key_stats", {}).get("revenue_growth_yoy", {})
+def build_growth_facts(peer_ready: Dict[str, Any]) -> GrowthFacts:
+    g = (peer_ready.get("key_stats") or {}).get("revenue_growth_yoy", {})
     pct = g.get("company_percentile")
 
     if pct is None:
@@ -82,8 +85,9 @@ def build_growth_facts(peer_ready: Dict[str, any]) -> GrowthFacts:
         trend="decelerating" if rank in {"below_average", "bottom_quintile"} else "stable",
     )
 
-def build_profitability_facts(peer_ready: Dict[str, any]) -> ProfitabilityFacts:
-    om = peer_ready.get("key_stats", {}).get("operating_margin", {})
+
+def build_profitability_facts(peer_ready: Dict[str, Any]) -> ProfitabilityFacts:
+    om = (peer_ready.get("key_stats") or {}).get("operating_margin", {})
     company = om.get("company")
     median = om.get("peer_median")
 
@@ -100,8 +104,9 @@ def build_profitability_facts(peer_ready: Dict[str, any]) -> ProfitabilityFacts:
         trend="stable",
     )
 
-def build_leverage_facts(peer_ready: Dict[str, any]) -> LeverageFacts:
-    d2e = peer_ready.get("key_stats", {}).get("debt_to_equity", {})
+
+def build_leverage_facts(peer_ready: Dict[str, Any]) -> LeverageFacts:
+    d2e = (peer_ready.get("key_stats") or {}).get("debt_to_equity", {})
     company = d2e.get("company")
 
     if company is None:
@@ -118,46 +123,27 @@ def build_leverage_facts(peer_ready: Dict[str, any]) -> LeverageFacts:
         note="Equity may be distorted by buybacks; assess leverage via cash flow coverage.",
     )
 
-def build_event_facts(earnings_small: List[Dict[str, any]]) -> EventFacts:
-    next_date = earnings_small[0]["date"] if earnings_small else "Unknown"
+
+def build_event_facts(earnings_small: List[Dict[str, Any]]) -> EventFacts:
+    next_date = earnings_small[0].get("date") if earnings_small else "Unknown"
     return EventFacts(
-        next_earnings=next_date,
+        next_earnings=str(next_date) if next_date else "Unknown",
         importance="high",
     )
 
 
-def build_news_flags(news_items: List[Dict[str, any]]) -> List[str]:
-    flags = []
-    for n in news_items:
-        txt = (n.get("headline", "") + n.get("summary", "")).lower()
-        if "regulat" in txt:
-            flags.append("regulatory_pressure")
-        if "china" in txt:
-            flags.append("china_exposure")
-    return list(set(flags))
-
-
-def build_sec_flags(sec_risks: List[Dict[str, any]]) -> List[str]:
-    flags = []
-    for r in sec_risks:
-        txt = (r.get("text", "")).lower()
-        if "supply" in txt:
-            flags.append("supply_chain_dependency")
-        if "services" in txt:
-            flags.append("services_growth_focus")
-    return list(set(flags))
-
-
 def build_facts_pack(
-    market_snapshot,
-    quote,
-    peer_ready,
-    earnings_small,
-    news_items,
-    sec_risks,
-    data_quality_notes,
+    market_snapshot: Dict[str, Any],
+    quote: Dict[str, Any],
+    peer_ready: Dict[str, Any],
+    earnings_small: List[Dict[str, Any]],
+    data_quality_notes: List[str],
 ) -> FactsPack:
-
+    """
+    Deterministic FactsPack only.
+    We intentionally removed news/sec keyword flags and all risk/watch logic
+    because risks/watch are now handled by LLM materiality (risk_research_node).
+    """
     return FactsPack(
         price=build_price_facts(quote, market_snapshot),
         valuation=build_valuation_facts(peer_ready),
@@ -165,20 +151,28 @@ def build_facts_pack(
         profitability=build_profitability_facts(peer_ready),
         leverage=build_leverage_facts(peer_ready),
         events=build_event_facts(earnings_small),
-        news_flags=build_news_flags(news_items),
-        sec_flags=build_sec_flags(sec_risks),
+        # keep these empty for backward compatibility with the schema
+        news_flags=[],
+        sec_flags=[],
         data_quality_notes=data_quality_notes,
     )
 
+
+# ----------------------------
+# Small deterministic text blocks for UI
+# ----------------------------
+
 def build_current_performance(facts: dict) -> dict:
     price = facts["price"]
+    bullets: List[str] = []
 
-    bullets = []
+    last = price.get("last")
+    chg = price.get("change_1d_pct", 0.0)
 
-    bullets.append(
-        f"Shares last traded at {price['last']:.2f}, "
-        f"{price['change_1d_pct']:+.2f}% on the day."
-    )
+    if isinstance(last, (int, float)):
+        bullets.append(f"Shares last traded at {last:.2f}, {chg:+.2f}% on the day.")
+    else:
+        bullets.append(f"Latest price unavailable; {chg:+.2f}% on the day.")
 
     bullets.append(
         f"Price is {price['vs_50dma']} the 50-day average and "
@@ -192,91 +186,34 @@ def build_current_performance(facts: dict) -> dict:
         "range_bound": "Price action remains range-bound with no clear trend.",
         "downtrend": "Momentum is negative across timeframes.",
     }
-
     bullets.append(regime_map.get(price["trend_regime"], "Trend signals are mixed."))
 
     return {"bullets": bullets}
 
-def build_key_risks(facts: dict) -> list[str]:
-    risks = []
-
-    growth = facts["growth"]
-    if growth["peer_rank"] in {"below_average", "bottom_quintile"}:
-        risks.append("Revenue growth trails peers, limiting valuation expansion.")
-
-    leverage = facts["leverage"]
-    if leverage["flag"] == "elevated":
-        risks.append("Leverage appears elevated, increasing sensitivity to cash flow pressure.")
-
-    if "regulatory_pressure" in facts["news_flags"]:
-        risks.append("Regulatory scrutiny could impact operating flexibility or margins.")
-
-    if "china_exposure" in facts["news_flags"]:
-        risks.append("Exposure to China-related demand or supply chains adds geopolitical risk.")
-
-    if "supply_chain_dependency" in facts["sec_flags"]:
-        risks.append("Supply chain concentration could disrupt production or delivery timelines.")
-
-    if len(risks) <= 2:
-        risks.append(
-            "Overall risk profile is concentrated in a small number of identifiable factors."
-        )
-    return risks[:5]
 
 def build_price_outlook(facts: dict, core: dict) -> dict:
-    bullets = []
+    """
+    Keeps only the general, non-news-specific outlook logic.
+    (Your LLM synthesis can add the more specific narrative.)
+    """
+    bullets: List[str] = []
 
     valuation = facts["valuation"]["relative_position"]
     growth_rank = facts["growth"]["peer_rank"]
     regime = facts["price"]["trend_regime"]
 
     if valuation == "cheaper_than_peers":
-        bullets.append(
-            "Valuation appears supportive relative to peers, reducing downside from multiple compression."
-        )
+        bullets.append("Valuation appears supportive relative to peers, reducing downside from multiple compression.")
     elif valuation == "more_expensive_than_peers":
-        bullets.append(
-            "Premium valuation leaves shares more sensitive to earnings or guidance disappointment."
-        )
+        bullets.append("Premium valuation leaves shares more sensitive to earnings or guidance disappointment.")
 
     if growth_rank in {"below_average", "bottom_quintile"}:
-        bullets.append(
-            "Slower growth profile may cap near-term upside unless momentum improves."
-        )
+        bullets.append("Slower growth profile may cap near-term upside unless momentum improves.")
 
     if regime == "compression":
-        bullets.append(
-            "Price action suggests a consolidation phase ahead of a potential catalyst."
-        )
+        bullets.append("Price action suggests a consolidation phase ahead of a potential catalyst.")
     elif regime == "strong_uptrend":
-        bullets.append(
-            "Positive momentum supports continuation if fundamentals remain intact."
-        )
+        bullets.append("Positive momentum supports continuation if fundamentals remain intact.")
 
-    bullets.append(
-        "Near-term direction is likely to be driven by upcoming company-specific catalysts."
-    )
-
+    bullets.append("Near-term direction is likely to be driven by upcoming company-specific catalysts.")
     return {"bullets": bullets[:5]}
-
-def build_watch_list(facts: dict, core: dict) -> list[str]:
-    watch = []
-
-    # Earnings
-    if facts["events"]["next_earnings"] != "Unknown":
-        watch.append(f"Upcoming earnings on {facts['events']['next_earnings']}")
-
-    # Growth
-    watch.append("Revenue growth trajectory vs prior quarters")
-
-    # Margins
-    watch.append("Operating margin stability and cost discipline")
-
-    # Risks from flags
-    if "regulatory_pressure" in facts["news_flags"]:
-        watch.append("Regulatory updates affecting platform or pricing")
-
-    if "china_exposure" in facts["news_flags"]:
-        watch.append("China demand trends and supply chain developments")
-
-    return watch[:5]

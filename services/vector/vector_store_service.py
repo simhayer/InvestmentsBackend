@@ -40,6 +40,13 @@ class VectorStoreService:
             input=cleaned_texts
         )
         return [data.embedding for data in response.data]
+
+    def has_symbol(self, db: Session, symbol: str) -> bool:
+        symbol = (symbol or "").strip().upper()
+        if not symbol:
+            return False
+        stmt = text("SELECT 1 FROM sec_filing_chunks WHERE symbol = :s LIMIT 1")
+        return db.execute(stmt, {"s": symbol}).first() is not None
     
     def get_embedding(self, text: str) -> List[float]:
         """Fetch a single embedding."""
