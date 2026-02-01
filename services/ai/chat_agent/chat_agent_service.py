@@ -119,6 +119,7 @@ async def run_chat_turn_stream(
     finnhub: Any,
 ) -> AsyncGenerator[Dict[str, Any], None]:
     graph = _get_graph()
+
     state = DecisioningGraph.new_state(
         message=message,
         user_id=user_id,
@@ -127,39 +128,67 @@ async def run_chat_turn_stream(
         db=db,
         finnhub=finnhub,
     )
+
     t0 = time.perf_counter()
+
     try:
         pre_state = await graph.run_pre_synthesis(state)
+
         plan_payload = DecisioningGraph.build_plan_event(pre_state)
         plan_payload["session_id"] = session_id
         yield {"event": "plan", "data": plan_payload}
 
-        for status in pre_state.tool_statuses:
+        for status in (pre_state.tool_statuses or []):
             payload = dict(status)
             payload["trace_id"] = pre_state.trace_id
             payload["turn_id"] = pre_state.turn_id
             yield {"event": "tool_status", "data": payload}
 
         answer_parts: List[str] = []
-        async for delta in graph.stream_synthesis(pre_state):
-            if not delta:
-                continue
-            answer_parts.append(delta)
-            yield {"event": "delta", "data": delta}
+
+        route_mode = (pre_state.debug or {}).get("route_mode") or "light_tools"
+
+        if pre_state.handled:
+            answer = (pre_state.answer or "").strip()
+            if not answer:
+                answer = "Sorry — I couldn’t answer that right now."
+            answer_parts.append(answer)
+            yield {"event": "delta", "data": answer}
+
+        elif route_mode == "no_tools":
+            async for delta in graph.stream_no_tools_synthesis(pre_state):
+                if not delta:
+                    continue
+                answer_parts.append(delta)
+                yield {"event": "delta", "data": delta}
+
+        else:
+            async for delta in graph.stream_synthesis(pre_state):
+                if not delta:
+                    continue
+                answer_parts.append(delta)
+                yield {"event": "delta", "data": delta}
 
         pre_state.answer = "".join(answer_parts).strip()
+
         await graph.run_postprocess(pre_state)
+
         response_ms = round((time.perf_counter() - t0) * 1000.0, 2)
+
         yield {
             "event": "final",
             "data": {
                 "trace_id": pre_state.trace_id,
                 "turn_id": pre_state.turn_id,
-                "recency_insufficient": pre_state.recency_insufficient,
+                "session_id": session_id,
+                "route_mode": route_mode,
+                "handled": bool(pre_state.handled),
+                "recency_insufficient": bool(pre_state.recency_insufficient),
                 "tools_used": _tools_used(pre_state.tool_results),
                 "response_ms": response_ms,
             },
         }
+
     except Exception as exc:
         logger.exception("streaming chat turn failed")
         yield {"event": "final", "data": {"error": str(exc)}}

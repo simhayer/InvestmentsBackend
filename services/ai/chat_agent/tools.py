@@ -4,8 +4,9 @@ import asyncio
 import hashlib
 import logging
 import os
+import time
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Dict, List, Literal
+from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional
 
 from pydantic import BaseModel, Field, ValidationError
 
@@ -68,9 +69,23 @@ class SecSnippetsInput(BaseModel):
 
 
 class NewsInput(BaseModel):
-    query: str | None = None
-    max_results: int = Field(default=6, ge=1, le=10)
+    symbols: Optional[List[str]] = None
+    topic: Optional[str] = None  # e.g. "markets", "inflation", "bank of canada"
+    query: Optional[str] = None  # override if you want exact
+    max_results: int = Field(default=5, ge=1, le=10)
+    days: int = Field(default=7, ge=1, le=30)
 
+class PortfolioContextInput(BaseModel):
+    top_n: int = Field(default=8, ge=1, le=15)
+    max_holdings: int = Field(default=25, ge=5, le=100)
+
+class PortfolioContextOutput(BaseModel):
+    as_of: Optional[int] = None
+    currency: str = "USD"
+    portfolio_summary: Dict[str, Any] = Field(default_factory=dict)
+    holdings: List[Dict[str, Any]] = Field(default_factory=list)
+    symbols_for_news: List[str] = Field(default_factory=list)
+    risk_flags: List[str] = Field(default_factory=list)
 
 class WebSearchInput(BaseModel):
     query: str | None = None
@@ -283,6 +298,113 @@ async def tool_get_user_profile(_args: NoArgs, ctx: ToolContext) -> Dict[str, An
     )
     return _serialize_onboarding(profile)
 
+async def tool_get_portfolio_context(args: PortfolioContextInput, ctx: ToolContext) -> Dict[str, Any]:
+    if ctx.db is None or ctx.user_id is None or ctx.finnhub is None:
+        return {
+            "as_of": int(time.time()),
+            "currency": (ctx.user_currency or "USD").upper(),
+            "portfolio_summary": {},
+            "holdings": [],
+            "symbols_for_news": [],
+            "risk_flags": [],
+        }
+
+    currency = (ctx.user_currency or "USD").upper()
+    as_of = int(time.time())
+
+    try:
+        # 1) One shared holdings snapshot (avoid double pricing calls)
+        holdings_payload = ctx.holdings_snapshot
+        if holdings_payload is None:
+            holdings_payload = await get_holdings_with_live_prices(
+                user_id=str(ctx.user_id),
+                db=ctx.db,
+                finnhub=ctx.finnhub,
+                currency=currency,
+                top_only=False,
+                top_n=0,
+                include_weights=True,
+            )
+
+        # 2) Summary from the same snapshot
+        summary = await get_portfolio_summary(
+            user_id=str(ctx.user_id),
+            db=ctx.db,
+            finnhub=ctx.finnhub,
+            currency=currency,
+            top_n=args.top_n,
+            holdings_payload=holdings_payload,
+        ) or {}
+
+        # 3) Holdings list (brief)
+        items = (holdings_payload or {}).get("items") or []
+        holdings = [_holding_brief(it) for it in items if it]
+        holdings = [h for h in holdings if h.get("symbol")]
+        holdings = holdings[: args.max_holdings]
+
+        # 4) Best symbols_for_news: from top_positions in summary
+        symbols_for_news: List[str] = []
+        top_positions = summary.get("top_positions") or []
+        if isinstance(top_positions, list):
+            for pos in top_positions:
+                if not isinstance(pos, dict):
+                    continue
+                sym = (pos.get("symbol") or "").strip().upper()
+                if sym and sym not in symbols_for_news:
+                    symbols_for_news.append(sym)
+                if len(symbols_for_news) >= 3:
+                    break
+
+        # Fallback: derive from holdings
+        if not symbols_for_news:
+            for h in holdings:
+                sym = (h.get("symbol") or "").strip().upper()
+                if sym and sym not in symbols_for_news:
+                    symbols_for_news.append(sym)
+                if len(symbols_for_news) >= 3:
+                    break
+
+        # 5) Optional quick risk flags (light heuristics; safe defaults)
+        risk_flags: List[str] = []
+        try:
+            # if top_positions includes weights like {"weight_pct": ...}
+            if top_positions and isinstance(top_positions, list):
+                w1 = None
+                w5 = 0.0
+                for i, pos in enumerate(top_positions[:5]):
+                    w = pos.get("weight_pct") or pos.get("weight") or None
+                    if w is None:
+                        continue
+                    w = float(w)
+                    if i == 0:
+                        w1 = w
+                    w5 += w
+                if w1 is not None and w1 >= 35:
+                    risk_flags.append("high_concentration_top1")
+                if w5 >= 80:
+                    risk_flags.append("high_concentration_top5")
+        except Exception:
+            pass
+
+        return {
+            "as_of": int(summary.get("as_of") or as_of),
+            "currency": (summary.get("currency") or currency).upper(),
+            "portfolio_summary": summary,
+            "holdings": holdings,
+            "symbols_for_news": symbols_for_news,
+            "risk_flags": risk_flags,
+        }
+
+    except Exception as exc:
+        logger.warning("tool_get_portfolio_context failed: %s", exc)
+        return {
+            "as_of": as_of,
+            "currency": currency,
+            "portfolio_summary": {},
+            "holdings": [],
+            "symbols_for_news": [],
+            "risk_flags": [],
+        }
 
 async def tool_get_portfolio_summary(args: PortfolioSummaryInput, ctx: ToolContext) -> Dict[str, Any]:
     if ctx.db is None or ctx.user_id is None or ctx.finnhub is None:
@@ -372,34 +494,58 @@ async def tool_get_sec_snippets(args: SecSnippetsInput, ctx: ToolContext) -> Dic
 
 
 async def tool_get_news(args: NewsInput, ctx: ToolContext) -> Dict[str, Any]:
+    # 1) Normalize
+    symbols = [s.upper().strip() for s in (args.symbols or []) if isinstance(s, str) and s.strip()]
+    if not symbols:
+        symbols = [s.upper().strip() for s in (ctx.symbols or []) if isinstance(s, str) and s.strip()]
+
+    topic = (args.topic or "").strip()
     query = (args.query or "").strip()
-    if not query:
-        if ctx.symbols:
-            query = f"latest news for {ctx.symbols[0]}"
+
+    # 2) Build query (priority: explicit query > symbols > topic > fallback)
+    if query:
+        final_query = query
+    elif symbols:
+        # if you pass multiple tickers, pick first 1–2 to keep Tavily query focused
+        pick = symbols[:2]
+        if len(pick) == 1:
+            final_query = f"{pick[0]} latest news"
         else:
-            query = ctx.message or ""
-    query = _clamp_text(query, MAX_QUERY_CHARS)
-    if not query:
+            final_query = f"{pick[0]} {pick[1]} latest news"
+    elif topic:
+        final_query = f"latest financial news {topic}"
+    else:
+        # last resort: still allow message, but keep it short and safe
+        msg = (ctx.message or "").strip()
+        final_query = msg if len(msg) >= 3 else "latest financial markets news"
+
+    final_query = _clamp_text(final_query, MAX_QUERY_CHARS)
+    if not final_query:
         return {"query": "", "items": []}
-    cache_key = _news_cache_key(query)
+
+    # 3) Cache by query (good)
+    cache_key = _news_cache_key(final_query)
     cached = cache_get(cache_key)
     if isinstance(cached, list):
-        return {"query": query, "items": cached[: args.max_results]}
+        return {"query": final_query, "items": cached[: args.max_results]}
+
+    # 4) Search
     try:
         results = await tavily_search(
-            query=query,
+            query=final_query,
             max_results=args.max_results,
             include_answer=False,
             include_raw_content=False,
             search_depth="advanced",
-            days=TAVILY_NEWS_DAYS,
+            days=args.days,  # use args.days instead of constant
         )
         items = _normalize_news_results(results, args.max_results)
         cache_set(cache_key, items, ttl_seconds=TTL_TAVILY_SEC)
-        return {"query": query, "items": items}
+        return {"query": final_query, "items": items}
     except Exception as exc:
         logger.warning("tool_get_news failed: %s", exc)
-        return {"query": query, "items": []}
+        return {"query": final_query, "items": []}
+
 
 
 async def tool_get_web_search(args: WebSearchInput, ctx: ToolContext) -> Dict[str, Any]:
@@ -451,17 +597,11 @@ TOOL_REGISTRY: Dict[str, ToolSpec] = {
         input_model=NoArgs,
         run=tool_get_user_profile,
     ),
-    "get_portfolio_summary": ToolSpec(
-        name="get_portfolio_summary",
-        description="Fetches portfolio summary metrics and top holdings overview.",
-        input_model=PortfolioSummaryInput,
-        run=tool_get_portfolio_summary,
-    ),
-    "get_holdings": ToolSpec(
-        name="get_holdings",
-        description="Fetches the user's holdings with live prices and weights.",
-        input_model=HoldingsInput,
-        run=tool_get_holdings,
+    "get_portfolio_context": ToolSpec(
+        name="get_portfolio_context",
+        description="Fetches comprehensive portfolio context including summary, holdings, and symbols for news.",
+        input_model=PortfolioContextInput,
+        run=tool_get_portfolio_context,
     ),
     "get_fundamentals": ToolSpec(
         name="get_fundamentals",
@@ -527,12 +667,13 @@ def prepare_tool_args(
     args = dict(raw_args or {})
     if tool_name == "get_user_profile":
         return {}
-    if tool_name == "get_portfolio_summary":
-        top_n_cap = _clamp_int(caps.get("top_n"), 5, 1, 10)
-        return {"top_n": _clamp_int(args.get("top_n"), top_n_cap, 1, top_n_cap)}
-    if tool_name == "get_holdings":
-        max_items_cap = _clamp_int(caps.get("max_items"), 25, 1, 100)
-        return {"max_items": _clamp_int(args.get("max_items"), max_items_cap, 1, max_items_cap)}
+    if tool_name == "get_portfolio_context":
+        top_n_cap = _clamp_int(caps.get("top_n"), 8, 1, 15)
+        max_holdings_cap = _clamp_int(caps.get("max_holdings"), 25, 5, 100)
+        return {
+            "top_n": _clamp_int(args.get("top_n"), top_n_cap,1, top_n_cap),
+            "max_holdings": _clamp_int(args.get("max_holdings"), max_holdings_cap, 5, max_holdings_cap),
+        }
     if tool_name == "get_fundamentals":
         symbols = _normalize_symbols(args.get("symbols") or state.get("symbols") or [])
         max_symbols = _clamp_int(caps.get("max_symbols"), 3, 1, 10)

@@ -8,6 +8,8 @@ Rules:
 - If the request can be answered without tools, return empty lists.
 - If SEC snippets are required, include sec_sections. Prefer RequestContext.requested_sections when present; otherwise use ["general"].
 - Use web_search only when internal tools are insufficient or the user explicitly asks for external sources.
+- If web_search is in required_data or optional_data, you MUST include web_search_query (3–15 words, include tickers if present).
+- If web_search is NOT selected, web_search_query must be null or omitted.
 - Prefer web_search as optional when RequestContext.needs_recency is true or the user asks for broad context.
 - If tickers are missing for ticker-specific data, omit those data types and note the gap in notes.
 - Do NOT output tool calls.

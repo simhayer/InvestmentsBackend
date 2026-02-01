@@ -15,8 +15,7 @@ IntentType = Literal[
 ]
 
 DataType = Literal[
-    "portfolio_summary",
-    "holdings",
+    "portfolio_context",
     "fundamentals",
     "news",
     "sec_snippets",
@@ -52,7 +51,7 @@ class DataRequirementsPlan(BaseModel):
     optional_data: List[DataType] = Field(default_factory=list)
     sec_sections: List[SecSection] = Field(default_factory=list)
     notes: str = ""
-
+    web_search_query: Optional[str] = None
 
 class ToolError(BaseModel):
     type: str
@@ -89,10 +88,17 @@ class BudgetConfig(BaseModel):
 class SynthesisOutput(BaseModel):
     answer: str
 
-class SmalltalkOutput(BaseModel):
+
+RouteMode = Literal["no_tools", "light_tools", "heavy_tools"]
+
+class RouterOutput(BaseModel):
     handled: bool = False
     answer: str = ""
-    notes: str = ""
+    handled_reason: str = ""  # "smalltalk" | "off_topic" | "meta" | ""
+    route_mode: RouteMode = "light_tools"
+    confidence: float = Field(0.7, ge=0.0, le=1.0)
+    request_context: RequestContext = Field(default_factory=RequestContext)
+    notes: str = ""  # optional debug notes
 
 
 class GraphState(BaseModel):

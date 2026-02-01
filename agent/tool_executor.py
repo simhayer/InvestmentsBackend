@@ -254,16 +254,11 @@ class ToolExecutor:
 
     def _apply_caps(self, call: ToolCallSpec, budget: ToolBudget) -> Tuple[Dict[str, Any], Optional[ToolResult]]:
         args = dict(call.arguments or {})
-        if call.name == "get_portfolio_summary":
-            top_n = args.get("top_n", 5)
+        if call.name == "get_portfolio_context":
+            top_n = args.get("top_n", 8)
             if budget.max_items is not None and int(top_n) > budget.max_items:
                 return args, self._cap_error(call.name, "top_n", budget.max_items)
             args["top_n"] = int(top_n)
-        elif call.name == "get_holdings":
-            max_items = args.get("max_items", budget.max_items or 25)
-            if budget.max_items is not None and int(max_items) > budget.max_items:
-                return args, self._cap_error(call.name, "max_items", budget.max_items)
-            args["max_items"] = int(max_items)
         elif call.name == "get_fundamentals":
             symbols = args.get("symbols") or []
             if budget.max_symbols is not None and len(symbols) > budget.max_symbols:
@@ -307,11 +302,11 @@ class ToolExecutor:
     ) -> Optional[Dict[str, Any]]:
         if ctx.db is None or ctx.finnhub is None or ctx.user_id is None:
             return None
-        if not any(call.name in {"get_holdings", "get_portfolio_summary"} for call in calls):
+        if not any(call.name == "get_portfolio_context" for call in calls):
             return None
         top_n = 0
         for call in calls:
-            if call.name != "get_portfolio_summary":
+            if call.name != "get_portfolio_context":
                 continue
             top_n = max(top_n, int(call.arguments.get("top_n", 0) or 0))
         try:
