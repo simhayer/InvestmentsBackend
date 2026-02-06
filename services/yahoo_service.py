@@ -1,15 +1,76 @@
 # services/yahoo_service.py
 from __future__ import annotations
 
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta, date
+import math
 from typing import Any, Dict, List, Optional
 from yahooquery import Ticker
-import pandas as pd
 from utils.common_helpers import safe_float as _fnum, retry
-from services.helpers.yahoo_helpers import pct, dist_pct, iso_utc_from_ts, to_epoch_utc, date_iso, parse_weird_cal_dt, quarter_label
-
-Number = Optional[float]
+from services.helpers.yahoo_helpers import pct, dist_pct, iso_utc_from_ts, date_iso, parse_weird_cal_dt, quarter_label
 Json = Dict[str, Any]
+
+def _to_records(obj: Any) -> List[Dict[str, Any]]:
+    if obj is None:
+        return []
+    if isinstance(obj, list):
+        return [r for r in obj if isinstance(r, dict)]
+    if isinstance(obj, dict):
+        return [obj]
+    to_dict = getattr(obj, "to_dict", None)
+    if callable(to_dict):
+        try:
+            recs = to_dict("records")
+            if isinstance(recs, list):
+                return [r for r in recs if isinstance(r, dict)]
+        except Exception:
+            pass
+        try:
+            d = to_dict()
+            if isinstance(d, dict):
+                return [d]
+        except Exception:
+            pass
+    return []
+
+
+def _parse_datetime(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, date):
+        return datetime(value.year, value.month, value.day, tzinfo=timezone.utc)
+    to_pydatetime = getattr(value, "to_pydatetime", None)
+    if callable(to_pydatetime):
+        try:
+            dt = to_pydatetime()
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            pass
+    if isinstance(value, (int, float)):
+        try:
+            return datetime.fromtimestamp(value, tz=timezone.utc)
+        except Exception:
+            return None
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        try:
+            if s.endswith("Z"):
+                s = s[:-1] + "+00:00"
+            dt = datetime.fromisoformat(s)
+            return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+        except Exception:
+            try:
+                return datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            except Exception:
+                return None
+    return None
+
+
+def _notna(v: Any) -> bool:
+    return v is not None and not (isinstance(v, float) and math.isnan(v))
 
 def _extract_stock_payload(sym: str, price: dict, sd: dict, fd: dict, ks: dict) -> Json:
     short_name = price.get("shortName") or price.get("longName")
@@ -132,32 +193,35 @@ def get_price_history(symbol: str, period: str = "1y", interval: str = "1d") -> 
         tq = Ticker(sym, asynchronous=False, formatted=False)
         df = tq.history(period=period, interval=interval)
 
-        if df is None or (hasattr(df, "empty") and df.empty):
+        records = _to_records(df)
+        if not records:
             return {"status": "ok", "symbol": sym, "points": []}
 
-        # Handle MultiIndex and flatten
-        df = df.reset_index()
-        if "symbol" in df.columns:
-            df = df[df["symbol"].str.upper() == sym]
-        
-        # Rename 'index' or 'asOfDate' to 'date' if necessary
-        date_col = next((c for c in df.columns if c in ["date", "index", "asOfDate"]), None)
-        if date_col and date_col != "date":
-            df = df.rename(columns={date_col: "date"})
+        if "symbol" in records[0]:
+            records = [r for r in records if str(r.get("symbol", "")).upper() == sym]
+            if not records:
+                return {"status": "ok", "symbol": sym, "points": []}
 
-        df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
-        df = df.dropna(subset=["date"]).sort_values("date")
+        date_key = None
+        for cand in ("date", "index", "asOfDate"):
+            if any(cand in r for r in records):
+                date_key = cand
+                break
 
         points = []
-        for row in df.itertuples():
+        for row in records:
+            raw_dt = row.get(date_key) if date_key else None
+            dt = _parse_datetime(raw_dt)
+            if not dt:
+                continue
             points.append({
-                "t": int(row.date.timestamp()) if isinstance(row.date, pd.Timestamp) else to_epoch_utc(row.date),
-                "o": _fnum(getattr(row, "open", None)),
-                "h": _fnum(getattr(row, "high", None)),
-                "l": _fnum(getattr(row, "low", None)),
-                "c": _fnum(getattr(row, "close", None)),
-                "v": _fnum(getattr(row, "volume", None)),
-                "adjclose": _fnum(getattr(row, "adjclose", None)),
+                "t": int(dt.timestamp()),
+                "o": _fnum(row.get("open")),
+                "h": _fnum(row.get("high")),
+                "l": _fnum(row.get("low")),
+                "c": _fnum(row.get("close")),
+                "v": _fnum(row.get("volume")),
+                "adjclose": _fnum(row.get("adjclose")),
             })
         return {"status": "ok", "symbol": sym, "points": points}
     except Exception as e:
@@ -173,37 +237,42 @@ def get_financials(symbol: str, period: str = "annual") -> Json:
     try:
         tq = Ticker(sym, asynchronous=False, formatted=False)
         afd = tq.all_financial_data()
-        
-        
-        if (
-            afd is None
-            or not isinstance(afd, pd.DataFrame)
-            or afd.empty
-            or not any(c in afd.columns for c in ("TotalRevenue", "OperatingRevenue"))
-            ):
+
+        records = _to_records(afd)
+        if not records:
             return _financials_df_fallback(sym, period)
 
-        df = pd.DataFrame(afd).reset_index()
-        if "symbol" in df.columns:
-            df = df[df["symbol"].str.upper() == sym]
-        
-        date_col = "asOfDate" if "asOfDate" in df.columns else "endDate"
-        df[date_col] = pd.to_datetime(df[date_col], utc=True)
-        
-        if "periodType" in df.columns:
-            df = df[df["periodType"].isin(acceptable)]
+        if "symbol" in records[0]:
+            records = [r for r in records if str(r.get("symbol", "")).upper() == sym]
 
-        df = df.sort_values(date_col, ascending=False)
+        if not any(
+            ("TotalRevenue" in r or "OperatingRevenue" in r)
+            for r in records
+        ):
+            return _financials_df_fallback(sym, period)
+
+        date_col = "asOfDate" if any("asOfDate" in r for r in records) else "endDate"
+
+        if any("periodType" in r for r in records):
+            records = [r for r in records if r.get("periodType") in acceptable]
 
         def _get(r, *keys):
             for k in keys:
-                if k in r and pd.notna(r[k]): return _fnum(r[k])
+                if k in r and _notna(r[k]):
+                    return _fnum(r[k])
             return None
 
         income, balance, cash = [], [], []
 
-        for _, r in df.iterrows():
-            iso = r[date_col].date().isoformat()
+        parsed = []
+        for r in records:
+            dt = _parse_datetime(r.get(date_col))
+            if dt:
+                parsed.append((dt, r))
+        parsed.sort(key=lambda x: x[0], reverse=True)
+
+        for dt, r in parsed:
+            iso = dt.date().isoformat()
 
             # --- Income statement ---
             income.append({
@@ -268,40 +337,38 @@ def _financials_df_fallback(sym: str, period: str) -> Json:
         freq = "q" if period == "quarterly" else "a"
         tq = Ticker(sym, asynchronous=False, formatted=False, validate=False)
 
-        def _prep_df(df: Any) -> pd.DataFrame:
-            if df is None:
-                return pd.DataFrame()
-            if isinstance(df, pd.Series):
-                df = df.to_frame().T
-            df = df.reset_index()
-            for cand in ("asOfDate", "endDate", "date"):
-                if cand in df.columns:
-                    if cand != "date":
-                        df = df.rename(columns={cand: "date"})
-                    break
-            if "date" not in df.columns:
-                if "index" in df.columns:
-                    df = df.rename(columns={"index": "date"})
-                else:
-                    return pd.DataFrame()
-            df["date"] = pd.to_datetime(df["date"], utc=True, errors="coerce")
-            df = df.dropna(subset=["date"]).sort_values("date", ascending=False)
-            return df
+        def _prep_records(obj: Any) -> List[Dict[str, Any]]:
+            records = _to_records(obj)
+            if not records:
+                return []
+            out = []
+            for r in records:
+                date_val = None
+                for cand in ("asOfDate", "endDate", "date", "index"):
+                    if cand in r:
+                        date_val = r.get(cand)
+                        break
+                dt = _parse_datetime(date_val)
+                if not dt:
+                    continue
+                out.append({"_dt": dt, **r})
+            out.sort(key=lambda x: x["_dt"], reverse=True)
+            return out
 
-        def _val(row: pd.Series, *keys: str) -> Optional[float]:
+        def _val(row: Dict[str, Any], *keys: str) -> Optional[float]:
             for k in keys:
-                if k in row:
+                if k in row and _notna(row[k]):
                     return _fnum(row[k])
             return None
 
-        inc_df = _prep_df(tq.income_statement(frequency=freq))
-        bal_df = _prep_df(tq.balance_sheet(frequency=freq))
-        cfs_df = _prep_df(tq.cash_flow(frequency=freq))
+        inc_df = _prep_records(tq.income_statement(frequency=freq))
+        bal_df = _prep_records(tq.balance_sheet(frequency=freq))
+        cfs_df = _prep_records(tq.cash_flow(frequency=freq))
 
         income = []
-        for _, r in inc_df.iterrows():
+        for r in inc_df:
             income.append({
-                "date": r["date"].date().isoformat(),
+                "date": r["_dt"].date().isoformat(),
                 "revenue":           _val(r, "totalRevenue", "revenue"),
                 "gross_profit":      _val(r, "grossProfit"),
                 "operating_income":  _val(r, "operatingIncome"),
@@ -310,9 +377,9 @@ def _financials_df_fallback(sym: str, period: str) -> Json:
             })
 
         balance = []
-        for _, r in bal_df.iterrows():
+        for r in bal_df:
             balance.append({
-                "date": r["date"].date().isoformat(),
+                "date": r["_dt"].date().isoformat(),
                 "total_assets":      _val(r, "totalAssets"),
                 "total_liabilities": _val(r, "totalLiab", "totalLiabilities"),
                 "total_equity":      _val(r, "totalStockholderEquity", "totalShareholderEquity"),
@@ -322,7 +389,7 @@ def _financials_df_fallback(sym: str, period: str) -> Json:
             })
 
         cash_flow = []
-        for _, r in cfs_df.iterrows():
+        for r in cfs_df:
             ocf = _val(r, "totalCashFromOperatingActivities", "operatingCashFlow")
             icf = _val(r, "totalCashflowsFromInvestingActivities", "investingCashFlow")
             fcf = _val(r, "freeCashflow", "freeCashFlow")
@@ -331,7 +398,7 @@ def _financials_df_fallback(sym: str, period: str) -> Json:
                 if ocf is not None and capex is not None:
                     fcf = ocf - capex
             cash_flow.append({
-                "date": r["date"].date().isoformat(),
+                "date": r["_dt"].date().isoformat(),
                 "operating_cash_flow":  ocf,
                 "investing_cash_flow":  icf,
                 "financing_cash_flow":  _val(r, "totalCashFromFinancingActivities", "financingCashFlow"),

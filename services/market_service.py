@@ -51,7 +51,7 @@ def _is_nonfinite_number(x: Any) -> bool:
 
 def sanitize_json(obj: Any) -> Any:
     """
-    Recursively replace NaN/±Inf -> None, convert numpy/pandas scalars,
+    Recursively replace NaN/±Inf -> None, convert numpy scalars,
     and make arrays JSON-safe. This ensures Postgres JSONB accepts the payload.
     """
     # Optional: numpy support without hard dependency
@@ -63,20 +63,6 @@ def sanitize_json(obj: Any) -> Any:
     #         obj = obj.tolist()
     # except Exception:
     #     pass
-
-    # Optional: pandas NA/NaT handling without hard dependency
-    try:
-        import pandas as pd  # type: ignore
-        if obj is pd.NaT:  # noqa: E721
-            return None
-        try:
-            # pd.isna works for many scalar types
-            if pd.isna(obj):  # type: ignore[attr-defined]
-                return None
-        except Exception:
-            pass
-    except Exception:
-        pass
 
     if isinstance(obj, float):
         return None if _is_nonfinite_number(obj) else obj
