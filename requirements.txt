@@ -8,7 +8,6 @@ redis==7.0.1
 SQLAlchemy==2.0.44
 yahooquery==2.4.1
 stripe==14.1.0
-psycopg2-binary==2.9.11
 python-jose==3.5.0
 pgvector==0.4.2
 sec-parser==0.58.1
