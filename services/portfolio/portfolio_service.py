@@ -1,6 +1,5 @@
 # services/portfolio_service.py
 from __future__ import annotations
-import heapq
 import time
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
@@ -13,8 +12,7 @@ from models.holding import HoldingOut
 from models.portfolio_analysis import PortfolioAnalysis
 from services.finnhub.finnhub_service import FinnhubService
 from services.holding_service import get_holdings_with_live_prices
-from services.plaid_service import get_connections
-from services.linkup.portfolio_pipeline import run_portfolio_pipeline
+from services.plaid.plaid_service import get_connections
 from utils.common_helpers import to_float
 
 Number = float | int | Decimal
@@ -177,12 +175,13 @@ async def get_or_compute_portfolio_analysis(
     if not items:
         return None, {"reason": "no_holdings"}
 
-    ai_layers = await run_portfolio_pipeline(
-        holdings_items=items,
-        base_currency=base_currency,
-        benchmark_ticker="SPY",
-        days_of_news=days_of_news,
-    )
+    # FIX - removed for cleanup; re-add when pipeline is ready
+    # ai_layers = await run_portfolio_pipeline(
+    #     holdings_items=items,
+    #     base_currency=base_currency,
+    #     benchmark_ticker="SPY",
+    #     days_of_news=days_of_news,
+    # )
 
     data = {
         "version": "v1",
@@ -192,7 +191,7 @@ async def get_or_compute_portfolio_analysis(
             "days_of_news": days_of_news,
             "targets": targets,
         },
-        "ai_layers": ai_layers,
+        "ai_layers": None,
     }
 
     stmt = insert(PortfolioAnalysis).values(user_id=user_id, data=data)

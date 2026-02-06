@@ -9,7 +9,6 @@ from typing import Any, Dict, List, Tuple, cast
 from datetime import datetime, timezone, timedelta
 import redis
 from sqlalchemy.orm import Session
-from services.linkup.agents.market_summary_agent import get_linkup_market_summary
 from models.market_summary import MarketSummary
 from . import yahoo_service as yq
 from services.helpers.market_db_service import (
@@ -17,7 +16,7 @@ from services.helpers.market_db_service import (
     db_upsert_latest,
     db_append_history,
 )
-from utils.common_helpers import safe_float, unwrap_linkup
+from utils.common_helpers import safe_float
 
 REDIS_URL = os.getenv("REDIS_URL")
 r = redis.from_url(REDIS_URL) if REDIS_URL else None
@@ -271,28 +270,3 @@ def refresh_market_overview(db: Session) -> Json:
     db_append_history(db, clean)
     _MEM[MEM_KEY] = (datetime.now(timezone.utc), clean)
     return clean
-
-# ---------------------------
-# Linkup market summary cache (unchanged logic)
-# ---------------------------
-def get_market_summary_cached(db: Session) -> Tuple[Json, datetime]:
-    latest = (
-        db.query(MarketSummary)
-        .order_by(MarketSummary.created_at.desc())
-        .limit(1)
-        .one_or_none()
-    )
-    if latest and (datetime.now(timezone.utc) - cast(datetime, latest.created_at)) < timedelta(seconds=TTL_SEC):
-        return latest.payload, cast(datetime, latest.created_at)
-
-    fresh = unwrap_linkup(get_linkup_market_summary())
-    rec = MarketSummary(
-        as_of=datetime.fromisoformat(fresh["as_of"]),
-        market=fresh["market"],
-        payload=fresh,
-    )
-    db.add(rec)
-    db.commit()
-    if r:
-        r.setex(CACHE_KEY, TTL_SEC, json.dumps(fresh))
-    return fresh, cast(datetime, rec.created_at)

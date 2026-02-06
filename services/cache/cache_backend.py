@@ -120,35 +120,6 @@ def cache_set(key: str, payload: JsonValue, ttl_seconds: int = DEFAULT_TTL_SEC) 
         pass
 
 
-def cache_set_json(key: str, payload: Any, ttl_seconds: int = DEFAULT_TTL_SEC) -> None:
-    """
-    Convenience: ensures payload is JSON-serializable by round-tripping.
-    (If it fails, it won't crash your request.)
-    """
-    try:
-        safe = json.loads(json.dumps(payload))
-    except Exception:
-        safe = {"error": "payload_not_json_serializable"}
-    cache_set(key, cast(JsonValue, safe), ttl_seconds=ttl_seconds)
-
-
-def cache_delete(key: str) -> None:
-    k = _norm_key(key)
-    if not k:
-        return
-
-    _LOCAL.pop(k, None)
-
-    r = get_redis_client()
-    if not r:
-        return
-
-    try:
-        r.delete(_redis_key(k))
-    except Exception:
-        pass
-
-
 def cache_get_many(keys: List[str]) -> Dict[str, Optional[JsonValue]]:
     out: Dict[str, Optional[JsonValue]] = {}
     misses: List[str] = []

@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from models.crypto_asset import CryptoAsset
-from cache.crypto_catalog import CryptoCoin, crypto_catalog
+from services.cache.crypto_catalog import CryptoCoin, crypto_catalog
 from utils.common_helpers import safe_json
 
 BINANCE_EXCHANGE_INFO_URL = "https://api.binance.com/api/v3/exchangeInfo"

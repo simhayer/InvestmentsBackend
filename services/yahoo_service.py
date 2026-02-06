@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 from yahooquery import Ticker
 import pandas as pd
 from utils.common_helpers import safe_float as _fnum, retry
@@ -515,47 +515,3 @@ def _get_symbol_node(res: Any, sym: str) -> Dict[str, Any]:
         # sometimes it's already the node (modules at top level)
         return res if any(isinstance(v, (dict, list)) for v in res.values()) else {}
     return {}
-
-def get_full_stock_data_many(symbols: Iterable[str]) -> Dict[str, Json]:
-    syms = sorted({s.upper().strip() for s in symbols if s and s.strip()})
-    if not syms:
-        return {}
-
-    out: Dict[str, Json] = {}
-
-    try:
-        tq = Ticker(syms, asynchronous=False, formatted=False)
-
-        raw = retry(lambda: tq.get_modules([
-            "price", "summaryDetail", "financialData", "defaultKeyStatistics"
-        ])) or {}
-
-        write_back: Dict[str, Json] = {}
-
-        for sym in syms:
-            try:
-                node = _get_symbol_node(raw, sym)
-
-                payload = _extract_stock_payload(
-                    sym,
-                    (node.get("price") or {}),
-                    (node.get("summaryDetail") or {}),
-                    (node.get("financialData") or {}),
-                    (node.get("defaultKeyStatistics") or {}),
-                )
-
-                out[sym] = payload
-                write_back[sym] = payload
-
-            except Exception as e:
-                out[sym] = {
-                    "status": "error",
-                    "symbol": sym,
-                    "error_code": "YQ_MANY_PARSE_FAILED",
-                    "message": str(e),
-                }
-
-        return out
-
-    except Exception as e:
-        return {s: {"status": "error", "symbol": s, "error_code": "YQ_MANY_FETCH_FAILED", "message": str(e)} for s in syms}

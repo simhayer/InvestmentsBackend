@@ -1,23 +1,11 @@
 from decimal import Decimal
 import math
-from typing import Any, Optional
-import json
-from typing import Any, Dict, List, Optional
-import httpx
 import time
-from typing import Callable, Tuple, Type, Mapping
+from typing import Any, Dict, List, Optional, Callable, Tuple, Type, Mapping
+import httpx
+
+
 import logging
-
-def fmt_pct(x: Optional[float]) -> str:
-    if x is None:
-        return "Unknown"
-    return f"{x:+.2f}%"
-
-def fmt_price(x: Optional[float]) -> str:
-    if x is None:
-        return "Unknown"
-    return f"{x:.2f}"
-
 def normalize_asset_type(typ: str | None) -> str | None:
     t = (typ or "").strip().lower()
     if not t:
@@ -68,26 +56,6 @@ def pct_change(cur: Optional[float], base: Optional[float]) -> Optional[float]:
 def round(x: Optional[float], d: int = 4) -> Optional[float]:
     return None if x is None else round(float(x), d)
 
-def parse_json_strict(maybe: Any) -> Dict[str, Any]:
-    import re
-    if isinstance(maybe, list):
-        maybe = "".join(str(p) for p in maybe if p is not None)
-    if maybe is None:
-        raise ValueError("Empty LLM response (None)")
-    if not isinstance(maybe, str):
-        maybe = str(maybe)
-    s = maybe.strip()
-    if not s:
-        raise ValueError("Empty LLM response (blank)")
-    try:
-        return json.loads(s)
-    except json.JSONDecodeError:
-        m = re.search(r"\{[\s\S]*\}\s*$", s)
-        if not m:
-            raise
-        return json.loads(m.group(0))
-    
-
 def safe_div(n, d):
     try:
         return (n / d) if (n is not None and d not in (None, 0)) else None
@@ -111,21 +79,6 @@ def canonical_key(symbol: Optional[str], typ: Optional[str]) -> str:
     s = (symbol or "").upper().strip()
     t = normalize_asset_type(typ)
     return f"{s}:{t}" if t else s
-
-def unwrap_linkup(result: dict) -> dict:
-    if isinstance(result, dict) and result.get("ok") and isinstance(result.get("data"), dict):
-        return result["data"]
-    raise RuntimeError(result.get("error") or "Linkup call failed")
-
-def unwrap_layers_for_ui(layers: dict) -> dict:
-    if not isinstance(layers, dict):
-        return layers
-
-    out = dict(layers)
-    for k in ("news_sentiment", "performance", "scenarios_rebalance", "summary"):
-        if k in out:
-            out[k] = unwrap_linkup(out[k])
-    return out
 
 def retry(
     fn: Callable[[], Any],

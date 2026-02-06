@@ -148,13 +148,3 @@ async def get_company_news_cached(symbol: str, *, days_back: int = 7, limit: int
     cache_set(ck, payload, ttl_seconds=ttl)
 
     return payload
-
-def shrink_news_items(items, max_items=8, max_snip=220):
-    out = []
-    for it in (items or [])[:max_items]:
-        it = dict(it)
-        s = (it.get("snippet") or "")
-        if len(s) > max_snip:
-            it["snippet"] = s[:max_snip] + "…"
-        out.append(it)
-    return out

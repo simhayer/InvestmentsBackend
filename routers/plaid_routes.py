@@ -14,12 +14,12 @@ from plaid.model.investments_holdings_get_request import InvestmentsHoldingsGetR
 from pydantic import BaseModel
 from models.holding import Holding
 from typing import List, Dict
-from services.plaid_service import get_connections
+from services.plaid.plaid_service import get_connections
 from utils.common_helpers import safe_div, num
 from models.user import User
 from services.supabase_auth import get_current_db_user
 from services.currency_service import maybe_auto_set_user_base_currency
-from plaid_config import client
+from services.plaid.plaid_config import client
 import logging
 logger = logging.getLogger(__name__)
 import traceback
