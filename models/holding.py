@@ -1,5 +1,4 @@
 
-from sqlalchemy.orm import relationship
 from database import Base
 from sqlalchemy.orm import  Mapped, mapped_column, relationship
 from sqlalchemy import ForeignKey
@@ -64,10 +63,4 @@ class HoldingOut(BaseModel):
     unrealized_pl_pct: float | None = None       # % P/L
     current_value: float | None = None           
 
-    # If you want, add derived fields via @computed_field in Pydantic v2
-
-def to_dto(h: Holding) -> HoldingOut:
-    # map ORM asset_type -> DTO type
-    dto = HoldingOut.model_validate(h)
-    dto.type = h.type
-    return dto
+# If you want, add derived fields via @computed_field in Pydantic v2

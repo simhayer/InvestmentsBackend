@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import json
-from typing import Dict, Any
 
 from services.openai.client import llm
 from schemas.portfolio_health_explain import (

@@ -3,7 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from database import get_db
 from services.finnhub.finnhub_service import FinnhubService
-from services.portfolio_service import get_portfolio_summary
+from services.portfolio.portfolio_service import get_portfolio_summary
 from services.supabase_auth import get_current_db_user
 from services.currency_service import resolve_currency
 from services.portfolio.portfolio_health_score_service import build_portfolio_health_score

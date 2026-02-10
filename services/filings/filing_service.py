@@ -2,7 +2,7 @@ import requests
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
 from services.finnhub.finnhub_service import FinnhubService
-from services.vector.vector_store_service import VectorStoreService
+from services.filings.vector_store_service import VectorStoreService
 from database import SessionLocal
 
 class FilingService:

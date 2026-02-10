@@ -1,16 +1,8 @@
-from typing import List, Dict, Optional, Any
+from typing import List, Dict, Optional
 from sqlalchemy.orm import Session
 from models.user import User
 import time
 import httpx
-
-SUPPORTED_CCY = {"USD", "CAD"}
-ALLOWED_TYPES = {"equity", "etf", "cryptocurrency"}
-
-def normalize_currency(iso_code: Optional[str], unofficial_code: Optional[str] = None) -> str:
-    ccy = (iso_code or unofficial_code or "USD").upper()
-    return ccy if ccy in SUPPORTED_CCY else "USD"
-
 
 def infer_base_currency_from_holdings(plaid_holdings: List[Dict]) -> str:
     """
