@@ -1,7 +1,9 @@
 from __future__ import annotations
 from datetime import datetime, timezone, date
 from typing import Any, Optional
+from utils.common_helpers import pct_change
 Number = Optional[float]
+import pandas as pd
 
 def pct(cur: Number, prev: Number) -> Number:
     try:
@@ -28,15 +30,21 @@ def iso_utc_from_ts(ts: Any) -> Optional[str]:
         return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
     except Exception:
         return None
-    
+
 
 import re
 _dt_suffix_pat = re.compile(r"(:S|[ T]S)$", re.IGNORECASE)
 
 def to_epoch_utc(x: Any) -> int | None:
-    """Coerce datetime / date / epoch / ISO string to epoch seconds (UTC)."""
+    """Coerce pandas Timestamp / datetime / date / epoch / ISO string to epoch seconds (UTC)."""
     if x is None:
         return None
+    try:
+        if isinstance(x, pd.Timestamp):
+            x = x.tz_localize("UTC") if x.tzinfo is None else x.tz_convert("UTC")
+            return int(x.timestamp())
+    except Exception:
+        pass
     if isinstance(x, datetime):
         x = x.astimezone(timezone.utc) if x.tzinfo else x.replace(tzinfo=timezone.utc)
         return int(x.timestamp())
@@ -48,21 +56,22 @@ def to_epoch_utc(x: Any) -> int | None:
         except Exception:
             return None
     if isinstance(x, str):
+        # try pandas parser; utc=True gives tz-aware UTC
         try:
-            s = x.strip()
-            if not s:
+            ts = pd.to_datetime(x, utc=True, errors="coerce")
+            if pd.isna(ts):
                 return None
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            dt = datetime.fromisoformat(s)
-            dt = dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-            return int(dt.timestamp())
+            return int(ts.timestamp())
+
+
+
+
         except Exception:
-            try:
-                dt = datetime.strptime(x.strip(), "%Y-%m-%d")
-                return int(dt.replace(tzinfo=timezone.utc).timestamp())
-            except Exception:
-                return None
+            return None
+
+
+
+
     return None
 
 def date_iso(d: Any) -> Optional[str]:
@@ -88,12 +97,12 @@ def parse_weird_cal_dt(val: Any) -> Optional[str]:
     # string with trailing ':S'
     if isinstance(val, str):
         s = _dt_suffix_pat.sub("", val.strip())  # drop weird suffix
-        try:
-            if s.endswith("Z"):
-                s = s[:-1] + "+00:00"
-            ts = datetime.fromisoformat(s)
-            ts = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
-        except Exception:
+        ts = pd.to_datetime(s, utc=True, errors="coerce")
+        if pd.isna(ts):
+
+
+
+
             return None
         return ts.date().isoformat()
     return None
