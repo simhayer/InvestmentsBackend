@@ -19,7 +19,8 @@ router = APIRouter()
 Json = Dict[str, Any]
 
 TTL_YAHOO_QUOTE_SEC = 60
-TTL_YAHOO_HISTORY_SEC = 15 * 60           # 15m
+# TTL_YAHOO_HISTORY_SEC = 15 * 60           # 15m
+TTL_YAHOO_HISTORY_SEC = 0       # 24h
 TTL_YAHOO_EARNINGS_SEC = 12 * 60 * 60     # 12h
 TTL_YAHOO_FINANCIALS_SEC = 48 * 60 * 60   # 48h
 TTL_YAHOO_PROFILE_SEC = 24 * 60 * 60      # 24h (overview + analyst)
