@@ -1,12 +1,27 @@
 # ai_stock_analysis.py
 from __future__ import annotations
 
-import os
 import json
-import asyncio
+import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
-from typing import Any, Dict, List, Optional, Protocol, Literal
+from typing import Any, Dict, List, Optional
+
+from services.ai.llm_service import get_llm_service
+from services.cache.cache_backend import cache_get, cache_set
+
+logger = logging.getLogger(__name__)
+
+# Cache TTL for symbol analysis (12 hours in seconds)
+SYMBOL_ANALYSIS_TTL_SEC = 12 * 3600
+SYMBOL_INLINE_TTL_SEC = 6 * 3600
+
+def _analysis_cache_key(symbol: str) -> str:
+    return f"analysis:full:{symbol.upper()}"
+
+def _inline_cache_key(symbol: str) -> str:
+    return f"analysis:inline:{symbol.upper()}"
 
 
 # ============================================================================
@@ -164,180 +179,6 @@ Respond with JSON:
 
 
 # ============================================================================
-# LLM CLIENT INTERFACE
-# ============================================================================
-
-class LLMClient(Protocol):
-    async def generate_json(self, *, system: str, user: str) -> str:
-        """Return raw text that should be JSON."""
-
-
-# ============================================================================
-# OPENAI CLIENT
-# ============================================================================
-
-class OpenAIClient:
-    def __init__(self, api_key: str, model: str, timeout_s: float = 60.0):
-        self.api_key = api_key
-        self.model = model
-        self.timeout_s = timeout_s
-
-    async def generate_json(self, *, system: str, user: str) -> str:
-        import httpx
-        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            r = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "temperature": 0.3,
-                    "response_format": {"type": "json_object"},
-                },
-            )
-            r.raise_for_status()
-            data = r.json()
-            return data["choices"][0]["message"]["content"]
-
-
-# ============================================================================
-# ANTHROPIC CLIENT
-# ============================================================================
-
-class AnthropicClient:
-    def __init__(self, api_key: str, model: str, timeout_s: float = 60.0):
-        self.api_key = api_key
-        self.model = model
-        self.timeout_s = timeout_s
-
-    async def generate_json(self, *, system: str, user: str) -> str:
-        import httpx
-        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            r = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": self.api_key,
-                    "Content-Type": "application/json",
-                    "anthropic-version": "2023-06-01",
-                },
-                json={
-                    "model": self.model,
-                    "max_tokens": 2000,
-                    "system": system,
-                    "messages": [{"role": "user", "content": user}],
-                },
-            )
-            r.raise_for_status()
-            data = r.json()
-            return data["content"][0]["text"]
-
-
-# ============================================================================
-# GEMINI CLIENT (optionally with web search)
-# ============================================================================
-
-GeminiThinking = Literal["LOW", "MEDIUM", "HIGH"]
-
-class GeminiClient:
-    def __init__(
-        self,
-        api_key: str,
-        model: str,
-        *,
-        use_web: bool = True,
-        thinking_level: GeminiThinking = "HIGH",
-        temperature: float = 0.3,
-    ):
-        self.api_key = api_key
-        self.model = model
-        self.use_web = use_web
-        self.thinking_level = thinking_level
-        self.temperature = temperature
-
-    def _normalize_thinking(self) -> str:
-        lvl = (self.thinking_level or "HIGH").upper()
-        m = (self.model or "").lower()
-
-        if "pro" in m:
-            return lvl if lvl in ("LOW", "HIGH") else "HIGH"
-        if "flash" in m:
-            return lvl if lvl in ("LOW", "MEDIUM", "HIGH") else "MEDIUM"
-        return lvl if lvl in ("LOW", "HIGH") else "HIGH"
-
-    async def generate_json(self, *, system: str, user: str) -> str:
-        return await asyncio.to_thread(self._sync_call, system, user)
-
-    def _sync_call(self, system: str, user: str) -> str:
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=self.api_key)
-
-        combined = f"{system}\n\n{user}"
-        contents = [
-            types.Content(role="user", parts=[types.Part.from_text(text=combined)])
-        ]
-
-        tools = None
-        if self.use_web:
-            tools = [types.Tool(googleSearch=types.GoogleSearch())]
-
-        config = types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(thinking_level=self._normalize_thinking()),
-            tools=tools,
-            temperature=self.temperature,
-        )
-
-        resp = client.models.generate_content(
-            model=self.model,
-            contents=contents,
-            config=config,
-        )
-
-        text = getattr(resp, "text", None)
-        return text if text else str(resp)
-
-
-# ============================================================================
-# (OPTIONAL) "CLOUD" CLIENT STUB
-# - For your own gateway / internal service later
-# - Caller doesn't change; only this resolver changes
-# ============================================================================
-
-class CloudLLMClient:
-    """
-    Example: call your own cloud gateway: POST /v1/llm/analyze
-    You can implement however you want later.
-    """
-    def __init__(self, base_url: str, api_key: str, timeout_s: float = 60.0):
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-        self.timeout_s = timeout_s
-
-    async def generate_json(self, *, system: str, user: str) -> str:
-        import httpx
-        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            r = await client.post(
-                f"{self.base_url}/v1/generate",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={"system": system, "user": user},
-            )
-            r.raise_for_status()
-            data = r.json()
-            # you decide your gateway shape; assume {"text": "..."}
-            return data["text"]
-
-
-# ============================================================================
 # SERVICE (CALLER NEVER CHOOSES PROVIDER)
 # ============================================================================
 
@@ -348,52 +189,10 @@ class AIAnalysisService:
     """
 
     def __init__(self):
-        self.client = self._resolve_client()
-
-    def _resolve_client(self) -> LLMClient:
-        """
-        Decide provider/model here only.
-        Callers never care.
-        """
-        provider = (os.getenv("AI_PROVIDER") or "gemini").lower()
-
-        if provider == "openai":
-            api_key = os.getenv("OPENAI_API_KEY", "")
-            if not api_key:
-                raise ValueError("Missing OPENAI_API_KEY")
-            model = os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-            return OpenAIClient(api_key=api_key, model=model)
-
-        if provider == "anthropic":
-            api_key = os.getenv("ANTHROPIC_API_KEY", "")
-            if not api_key:
-                raise ValueError("Missing ANTHROPIC_API_KEY")
-            model = os.getenv("ANTHROPIC_MODEL") or "claude-3-5-sonnet-latest"
-            return AnthropicClient(api_key=api_key, model=model)
-
-        if provider == "cloud":
-            base_url = os.getenv("CLOUD_LLM_BASE_URL", "")
-            api_key = os.getenv("CLOUD_LLM_API_KEY", "")
-            if not base_url or not api_key:
-                raise ValueError("Missing CLOUD_LLM_BASE_URL or CLOUD_LLM_API_KEY")
-            return CloudLLMClient(base_url=base_url, api_key=api_key)
-
-        # default: gemini
-        api_key = os.getenv("GEMINI_API_KEY", "")
-        if not api_key:
-            raise ValueError("Missing GEMINI_API_KEY")
-        model = os.getenv("GEMINI_MODEL") or "gemini-3-flash-preview"
-        use_web = (os.getenv("GEMINI_USE_WEB", "1") == "1")
-        thinking = (os.getenv("GEMINI_THINKING_LEVEL") or "HIGH").upper()
-        return GeminiClient(
-            api_key=api_key,
-            model=model,
-            use_web=use_web,
-            thinking_level=thinking,  # auto-normalized inside client
-            temperature=float(os.getenv("AI_TEMPERATURE", "0.3")),
-        )
+        self.llm = get_llm_service()
 
     def _parse_json(self, text: str) -> Dict[str, Any]:
+        # Keep this here to avoid changing other behavior/assumptions.
         text = (text or "").strip()
         if text.startswith("```"):
             lines = text.split("\n")
@@ -411,8 +210,13 @@ class AIAnalysisService:
             return default
 
     async def _ask(self, prompt: str) -> Dict[str, Any]:
-        raw = await self.client.generate_json(system=SYSTEM_PROMPT, user=prompt)
-        return self._parse_json(raw)
+        # New shared LLM service handles provider selection.
+        raw_obj = await self.llm.generate_json(system=SYSTEM_PROMPT, user=prompt)
+
+        # llm_service.generate_json returns dict already, but keep compatibility:
+        if isinstance(raw_obj, dict):
+            return raw_obj
+        return self._parse_json(str(raw_obj))
 
     async def generate_full_report(self, context: str, symbol: str) -> AnalysisReport:
         data = await self._ask(FULL_REPORT_PROMPT.format(context=context))
@@ -458,35 +262,90 @@ class AIAnalysisService:
 # CONVENIENCE FUNCTIONS (caller still doesn't choose provider)
 # ============================================================================
 
-async def analyze_stock(symbol: str, *, include_inline: bool = True) -> Dict[str, Any]:
+async def analyze_stock(
+    symbol: str,
+    *,
+    include_inline: bool = True,
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
+    """
+    Full stock analysis with Redis caching.
+    
+    Cache TTL: 12 hours. Symbol analysis is not user-specific,
+    so all users share the same cached result for a given ticker.
+    """
+    sym = symbol.upper()
+    cache_key = _analysis_cache_key(sym)
+
+    # Check cache first
+    if not force_refresh:
+        cached = cache_get(cache_key)
+        if cached and isinstance(cached, dict):
+            logger.info(f"[Symbol Analysis] cache hit for {sym}")
+            cached["cached"] = True
+            return cached
+
+    # Compute fresh analysis
     from services.ai.analyze_symbol.analyze_symbol_aggregator import aggregate_stock_data
 
-    bundle = await aggregate_stock_data(symbol)
+    bundle = await aggregate_stock_data(sym)
     context = bundle.to_ai_context()
 
     ai = AIAnalysisService()
-    report = await ai.generate_full_report(context, symbol)
+    report = await ai.generate_full_report(context, sym)
 
     result: Dict[str, Any] = {
-        "symbol": symbol,
+        "symbol": sym,
         "report": report.to_dict(),
         "dataGaps": bundle.gaps,
-        "rawData": bundle.to_dict(),
     }
 
     if include_inline:
         inline = await ai.generate_inline_insights(context)
         result["inline"] = inline.to_dict()
 
+    result["lastAnalyzedAt"] = datetime.now(timezone.utc).isoformat()
+
+    # Persist to Redis
+    try:
+        cache_set(cache_key, result, ttl_seconds=SYMBOL_ANALYSIS_TTL_SEC)
+        logger.info(f"[Symbol Analysis] cached result for {sym}")
+    except Exception as e:
+        logger.warning(f"[Symbol Analysis] failed to cache: {e}")
+
+    result["cached"] = False
     return result
 
 
-async def get_stock_insights(symbol: str) -> Dict[str, str]:
+async def get_stock_insights(
+    symbol: str,
+    *,
+    force_refresh: bool = False,
+) -> Dict[str, str]:
+    """
+    Inline insights with Redis caching (6h TTL).
+    """
+    sym = symbol.upper()
+    cache_key = _inline_cache_key(sym)
+
+    if not force_refresh:
+        cached = cache_get(cache_key)
+        if cached and isinstance(cached, dict):
+            logger.info(f"[Symbol Inline] cache hit for {sym}")
+            return cached
+
     from services.ai.analyze_symbol.analyze_symbol_aggregator import aggregate_stock_data
 
-    bundle = await aggregate_stock_data(symbol, include_news=False)
+    bundle = await aggregate_stock_data(sym, include_news=False)
     context = bundle.to_ai_context()
 
     ai = AIAnalysisService()
     inline = await ai.generate_inline_insights(context)
-    return inline.to_dict()
+    result = inline.to_dict()
+
+    try:
+        cache_set(cache_key, result, ttl_seconds=SYMBOL_INLINE_TTL_SEC)
+    except Exception as e:
+        logger.warning(f"[Symbol Inline] failed to cache: {e}")
+
+    return result
