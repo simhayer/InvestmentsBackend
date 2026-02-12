@@ -106,6 +106,8 @@ class FullPortfolioAnalysisResponse(BaseModel):
     portfolioSummary: PortfolioSummaryResponse
     riskMetrics: Optional[PortfolioRiskMetrics] = None
     dataGaps: List[str]
+    cached: Optional[bool] = None
+    lastAnalyzedAt: Optional[str] = None
 
 
 class QuickSummaryResponse(BaseModel):
@@ -121,12 +123,15 @@ class QuickSummaryResponse(BaseModel):
 async def get_full_portfolio_analysis(
     currency: str = Query("USD", description="Currency for values"),
     include_inline: bool = Query(True, description="Include inline insights"),
+    force_refresh: bool = Query(False, description="Bypass cache and recompute"),
     db: Session = Depends(get_db),
     user = Depends(get_current_db_user),
     finnhub: FinnhubService = Depends(get_finnhub_service),
 ):
     """
     Get comprehensive AI analysis of user's portfolio.
+    
+    Returns cached result if less than 24h old, unless force_refresh=true.
     
     Returns:
     - Full report with health assessment, SWOT analysis, recommendations
@@ -143,6 +148,7 @@ async def get_full_portfolio_analysis(
             finnhub,
             currency=currency.upper(),
             include_inline=include_inline,
+            force_refresh=force_refresh,
         )
         return result
     except Exception as e:

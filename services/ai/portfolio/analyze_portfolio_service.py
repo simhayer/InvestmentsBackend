@@ -6,11 +6,18 @@ Generates comprehensive portfolio reviews, risk assessments, and recommendations
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 from enum import Enum
 
 from services.ai.llm_service import get_llm_service
+
+logger = logging.getLogger(__name__)
+
+# Default TTL for cached portfolio analysis (24 hours)
+PORTFOLIO_ANALYSIS_TTL_HOURS = 24
 
 
 class PortfolioHealth(str, Enum):
@@ -312,17 +319,52 @@ async def analyze_portfolio(
     *,
     currency: str = "USD",
     include_inline: bool = True,
+    force_refresh: bool = False,
 ) -> Dict[str, Any]:
     """
-    Full portfolio analysis pipeline.
+    Full portfolio analysis pipeline with DB caching.
+
+    Caching strategy:
+    - Stores the full analysis result in the portfolio_analyses table (one row per user).
+    - Returns the cached result if it is less than PORTFOLIO_ANALYSIS_TTL_HOURS old.
+    - Pass force_refresh=True to bypass the cache and recompute.
 
     Usage:
         result = await analyze_portfolio(user_id, db, finnhub)
         print(result["report"]["summary"])
     """
+    from models.portfolio_analysis import PortfolioAnalysis
+
+    uid = int(user_id)
+
+    # ------------------------------------------------------------------
+    # 1. Check for a fresh cached result in the DB
+    # ------------------------------------------------------------------
+    if not force_refresh:
+        try:
+            cached_row = db.query(PortfolioAnalysis).filter(
+                PortfolioAnalysis.user_id == uid
+            ).first()
+
+            if cached_row and cached_row.data:
+                age_hours = (
+                    datetime.now(timezone.utc) - cached_row.created_at.replace(tzinfo=timezone.utc)
+                ).total_seconds() / 3600
+
+                if age_hours < PORTFOLIO_ANALYSIS_TTL_HOURS:
+                    logger.info(f"[Portfolio Analysis] cache hit for user {uid} (age {age_hours:.1f}h)")
+                    cached_data = cached_row.data
+                    cached_data["cached"] = True
+                    cached_data["lastAnalyzedAt"] = cached_row.created_at.isoformat()
+                    return cached_data
+        except Exception as e:
+            logger.warning(f"[Portfolio Analysis] cache check failed: {e}")
+
+    # ------------------------------------------------------------------
+    # 2. Compute fresh analysis
+    # ------------------------------------------------------------------
     from services.ai.portfolio.analyze_portfolio_aggregator import aggregate_portfolio_data
 
-    # Gather data
     bundle = await aggregate_portfolio_data(
         user_id, db, finnhub,
         currency=currency,
@@ -356,6 +398,29 @@ async def analyze_portfolio(
         inline = await ai.generate_inline_insights(context)
         result["inline"] = inline.to_dict()
 
+    # ------------------------------------------------------------------
+    # 3. Persist to DB (upsert — one row per user)
+    # ------------------------------------------------------------------
+    try:
+        now = datetime.now(timezone.utc)
+        existing = db.query(PortfolioAnalysis).filter(
+            PortfolioAnalysis.user_id == uid
+        ).first()
+
+        if existing:
+            existing.data = result
+            existing.created_at = now
+        else:
+            db.add(PortfolioAnalysis(user_id=uid, data=result, created_at=now))
+
+        db.commit()
+        logger.info(f"[Portfolio Analysis] cached result for user {uid}")
+    except Exception as e:
+        logger.warning(f"[Portfolio Analysis] failed to persist cache: {e}")
+        db.rollback()
+
+    result["cached"] = False
+    result["lastAnalyzedAt"] = datetime.now(timezone.utc).isoformat()
     return result
 
 

@@ -2,11 +2,26 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 from services.ai.llm_service import get_llm_service
+from services.cache.cache_backend import cache_get, cache_set
+
+logger = logging.getLogger(__name__)
+
+# Cache TTL for symbol analysis (12 hours in seconds)
+SYMBOL_ANALYSIS_TTL_SEC = 12 * 3600
+SYMBOL_INLINE_TTL_SEC = 6 * 3600
+
+def _analysis_cache_key(symbol: str) -> str:
+    return f"analysis:full:{symbol.upper()}"
+
+def _inline_cache_key(symbol: str) -> str:
+    return f"analysis:inline:{symbol.upper()}"
 
 
 # ============================================================================
@@ -247,35 +262,90 @@ class AIAnalysisService:
 # CONVENIENCE FUNCTIONS (caller still doesn't choose provider)
 # ============================================================================
 
-async def analyze_stock(symbol: str, *, include_inline: bool = True) -> Dict[str, Any]:
+async def analyze_stock(
+    symbol: str,
+    *,
+    include_inline: bool = True,
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
+    """
+    Full stock analysis with Redis caching.
+    
+    Cache TTL: 12 hours. Symbol analysis is not user-specific,
+    so all users share the same cached result for a given ticker.
+    """
+    sym = symbol.upper()
+    cache_key = _analysis_cache_key(sym)
+
+    # Check cache first
+    if not force_refresh:
+        cached = cache_get(cache_key)
+        if cached and isinstance(cached, dict):
+            logger.info(f"[Symbol Analysis] cache hit for {sym}")
+            cached["cached"] = True
+            return cached
+
+    # Compute fresh analysis
     from services.ai.analyze_symbol.analyze_symbol_aggregator import aggregate_stock_data
 
-    bundle = await aggregate_stock_data(symbol)
+    bundle = await aggregate_stock_data(sym)
     context = bundle.to_ai_context()
 
     ai = AIAnalysisService()
-    report = await ai.generate_full_report(context, symbol)
+    report = await ai.generate_full_report(context, sym)
 
     result: Dict[str, Any] = {
-        "symbol": symbol,
+        "symbol": sym,
         "report": report.to_dict(),
         "dataGaps": bundle.gaps,
-        "rawData": bundle.to_dict(),
     }
 
     if include_inline:
         inline = await ai.generate_inline_insights(context)
         result["inline"] = inline.to_dict()
 
+    result["lastAnalyzedAt"] = datetime.now(timezone.utc).isoformat()
+
+    # Persist to Redis
+    try:
+        cache_set(cache_key, result, ttl_seconds=SYMBOL_ANALYSIS_TTL_SEC)
+        logger.info(f"[Symbol Analysis] cached result for {sym}")
+    except Exception as e:
+        logger.warning(f"[Symbol Analysis] failed to cache: {e}")
+
+    result["cached"] = False
     return result
 
 
-async def get_stock_insights(symbol: str) -> Dict[str, str]:
+async def get_stock_insights(
+    symbol: str,
+    *,
+    force_refresh: bool = False,
+) -> Dict[str, str]:
+    """
+    Inline insights with Redis caching (6h TTL).
+    """
+    sym = symbol.upper()
+    cache_key = _inline_cache_key(sym)
+
+    if not force_refresh:
+        cached = cache_get(cache_key)
+        if cached and isinstance(cached, dict):
+            logger.info(f"[Symbol Inline] cache hit for {sym}")
+            return cached
+
     from services.ai.analyze_symbol.analyze_symbol_aggregator import aggregate_stock_data
 
-    bundle = await aggregate_stock_data(symbol, include_news=False)
+    bundle = await aggregate_stock_data(sym, include_news=False)
     context = bundle.to_ai_context()
 
     ai = AIAnalysisService()
     inline = await ai.generate_inline_insights(context)
-    return inline.to_dict()
+    result = inline.to_dict()
+
+    try:
+        cache_set(cache_key, result, ttl_seconds=SYMBOL_INLINE_TTL_SEC)
+    except Exception as e:
+        logger.warning(f"[Symbol Inline] failed to cache: {e}")
+
+    return result

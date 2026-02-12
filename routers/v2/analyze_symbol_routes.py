@@ -56,6 +56,8 @@ class AnalysisResponse(BaseModel):
     report: FullReportResponse
     inline: Optional[InlineInsightsResponse] = None
     dataGaps: List[str]
+    cached: Optional[bool] = None
+    lastAnalyzedAt: Optional[str] = None
 
 
 class QuickSummaryResponse(BaseModel):
@@ -72,9 +74,12 @@ class QuickSummaryResponse(BaseModel):
 async def get_full_analysis(
     symbol: str,
     include_inline: bool = Query(True, description="Include inline insights"),
+    force_refresh: bool = Query(False, description="Bypass cache and recompute"),
 ):
     """
     Get comprehensive AI analysis for a stock.
+    
+    Returns cached result if less than 12h old, unless force_refresh=true.
     
     Returns full report with:
     - Investment thesis summary
@@ -89,6 +94,7 @@ async def get_full_analysis(
         result = await analyze_stock(
             symbol.upper(),
             include_inline=include_inline,
+            force_refresh=force_refresh,
         )
         return result
     except Exception as e:
@@ -97,17 +103,19 @@ async def get_full_analysis(
 
 
 @router.get("/inline/{symbol}", response_model=InlineInsightsResponse)
-async def get_inline_insights(symbol: str):
+async def get_inline_insights(
+    symbol: str,
+    force_refresh: bool = Query(False, description="Bypass cache"),
+):
     """
     Get quick inline insights for UI placement.
     
-    Faster and cheaper than full analysis.
-    Returns short, punchy insights for badges/callouts.
+    Cached for 6 hours. Pass force_refresh=true to recompute.
     """
     from services.ai.analyze_symbol.analyze_symbol_service import get_stock_insights
     
     try:
-        result = await get_stock_insights(symbol.upper())
+        result = await get_stock_insights(symbol.upper(), force_refresh=force_refresh)
         return result
     except Exception as e:
         print(e)
