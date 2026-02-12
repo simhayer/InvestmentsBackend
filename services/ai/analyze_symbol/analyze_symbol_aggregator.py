@@ -38,6 +38,9 @@ class StockDataBundle:
     # Yahoo supplemental data
     yahoo_data: Dict[str, Any] = field(default_factory=dict)
     
+    # Quantitative risk metrics (from Yahoo price history)
+    risk_metrics: Dict[str, Any] = field(default_factory=dict)
+    
     # Data quality tracking
     gaps: List[str] = field(default_factory=list)
     fetched_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
@@ -55,6 +58,7 @@ class StockDataBundle:
             "news": self.news,
             "peers": self.peers,
             "yahooData": self.yahoo_data,
+            "riskMetrics": self.risk_metrics,
             "gaps": self.gaps,
             "fetchedAt": self.fetched_at,
         }
@@ -202,6 +206,33 @@ class StockDataBundle:
                 lines.append(f"- Trading {above_200} 200-day MA (${ma_200:.2f})")
             lines.append("")
         
+        # Quantitative risk metrics
+        rm = self.risk_metrics
+        if rm:
+            lines.append("## Risk Metrics (Trailing 1Y)")
+            beta = rm.get("beta")
+            vol = rm.get("volatility_annualized")
+            mdd = rm.get("max_drawdown")
+            sharpe = rm.get("sharpe_ratio")
+            sortino = rm.get("sortino_ratio")
+            days = rm.get("trading_days")
+            
+            if beta is not None:
+                beta_label = "defensive" if beta < 0.8 else "market-like" if beta < 1.2 else "aggressive" if beta < 1.6 else "highly volatile"
+                lines.append(f"- Beta: {beta:.2f} ({beta_label})")
+            if vol is not None:
+                lines.append(f"- Annualized Volatility: {vol * 100:.1f}%")
+            if mdd is not None:
+                lines.append(f"- Maximum Drawdown: {mdd * 100:.1f}%")
+            if sharpe is not None:
+                sharpe_label = "poor" if sharpe < 0.5 else "adequate" if sharpe < 1.0 else "good" if sharpe < 2.0 else "excellent"
+                lines.append(f"- Sharpe Ratio: {sharpe:.2f} ({sharpe_label})")
+            if sortino is not None:
+                lines.append(f"- Sortino Ratio: {sortino:.2f}")
+            if days is not None:
+                lines.append(f"- Based on {days} trading days")
+            lines.append("")
+        
         # Data gaps
         if self.gaps:
             lines.append("## Data Gaps (Missing Information)")
@@ -343,6 +374,18 @@ async def aggregate_stock_data(
             bundle.gaps.append("Yahoo data unavailable")
     except Exception as e:
         bundle.gaps.append(f"Yahoo fetch failed: {e}")
+    
+    # Compute quantitative risk metrics from Yahoo price history
+    try:
+        from services.ai.risk_metrics import fetch_symbol_risk_metrics
+        
+        # Reuse beta from Yahoo data if available to skip an extra HTTP call
+        existing_beta = bundle.yahoo_data.get("beta") if bundle.yahoo_data else None
+        bundle.risk_metrics = await fetch_symbol_risk_metrics(
+            sym, period="1y", existing_beta=existing_beta
+        )
+    except Exception as e:
+        bundle.gaps.append(f"Risk metrics computation failed: {e}")
     
     return bundle
 

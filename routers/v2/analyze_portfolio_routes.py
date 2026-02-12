@@ -33,6 +33,12 @@ class PositionInsight(BaseModel):
     issue: Optional[str] = None
 
 
+class ActionItem(BaseModel):
+    action: str  # "reduce" | "add" | "hold" | "sell" | "buy"
+    symbol: Optional[str] = None
+    reasoning: str
+
+
 class PortfolioReportResponse(BaseModel):
     summary: str
     health: str
@@ -47,7 +53,7 @@ class PortfolioReportResponse(BaseModel):
     opportunities: List[str]
     risks: List[str]
     rebalancingSuggestions: List[str]
-    actionItems: List[str]
+    actionItems: List[ActionItem]
 
 
 class PortfolioInlineResponse(BaseModel):
@@ -67,10 +73,38 @@ class PortfolioSummaryResponse(BaseModel):
     currency: str
 
 
+class BenchmarkMetrics(BaseModel):
+    symbol: str
+    annualized_return: Optional[float] = None
+    volatility: Optional[float] = None
+    max_drawdown: Optional[float] = None
+    sharpe_ratio: Optional[float] = None
+
+
+class SymbolRiskMetrics(BaseModel):
+    volatility_annualized: Optional[float] = None
+    max_drawdown: Optional[float] = None
+    sharpe_ratio: Optional[float] = None
+    sortino_ratio: Optional[float] = None
+    beta: Optional[float] = None
+    trading_days: Optional[int] = None
+
+
+class PortfolioRiskMetrics(BaseModel):
+    portfolio_beta: Optional[float] = None
+    portfolio_volatility_weighted: Optional[float] = None
+    hhi_concentration: Optional[float] = None
+    avg_correlation_top_holdings: Optional[float] = None
+    symbols_analyzed: Optional[int] = None
+    per_symbol: Optional[Dict[str, SymbolRiskMetrics]] = None
+    benchmark: Optional[BenchmarkMetrics] = None
+
+
 class FullPortfolioAnalysisResponse(BaseModel):
     report: PortfolioReportResponse
     inline: Optional[PortfolioInlineResponse] = None
     portfolioSummary: PortfolioSummaryResponse
+    riskMetrics: Optional[PortfolioRiskMetrics] = None
     dataGaps: List[str]
 
 

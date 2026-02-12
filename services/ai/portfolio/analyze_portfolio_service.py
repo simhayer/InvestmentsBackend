@@ -53,7 +53,7 @@ class PortfolioAnalysisReport:
 
     # Recommendations
     rebalancing_suggestions: List[str]
-    action_items: List[str]
+    action_items: List[Dict[str, Any]]  # structured: {action, symbol, reasoning}
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -97,95 +97,112 @@ class PortfolioInlineInsights:
 # PROMPTS
 # ============================================================================
 
-PORTFOLIO_SYSTEM_PROMPT = """You are a professional portfolio analyst and financial advisor. 
-Your role is to provide clear, actionable portfolio analysis based on the data provided.
+PORTFOLIO_SYSTEM_PROMPT = """You are a senior portfolio analyst at a wealth-management firm.
+Your role is to provide data-driven, quantitative portfolio analysis personalized to the investor.
 
 Guidelines:
-- Be direct and specific with observations
-- Support claims with data from the portfolio
-- Focus on actionable insights, not generic advice
-- Consider both opportunities and risks
-- Be balanced - acknowledge both strengths and weaknesses
-- Tailor advice to the portfolio size and composition
+- ALWAYS cite specific numbers: beta values, Sharpe ratios, volatility percentages, HHI scores, correlations, P/L figures, and portfolio weights
+- When benchmark data (S&P 500) is provided, explicitly compare portfolio metrics against it (e.g. "Portfolio Sharpe of 0.85 vs S&P 500 Sharpe of 1.12")
+- Reference concentration risk using HHI scores and top-3 weight percentages
+- Use risk-adjusted return metrics (Sharpe, Sortino) to evaluate performance — not just raw returns
+- Be specific about sector/industry exposure using the industry data provided
+- Give actionable, position-level recommendations with target weights when suggesting rebalancing
+- Consider correlation structure — flag when holdings are highly correlated (avg correlation > 0.7)
+
+Personalization (when Investor Profile is provided):
+- Calibrate risk assessments to the investor's stated risk tolerance — a "High" risk portfolio may be appropriate for an aggressive investor but alarming for a conservative one
+- Match recommendation complexity to experience level: plain language for beginners, technical detail for advanced investors
+- Align suggestions with the investor's primary goal (growth vs income vs preservation)
+- Consider time horizon when evaluating drawdowns and volatility — a long-term investor can tolerate more short-term volatility
+- Respect stated asset preferences — don't recommend crypto to someone who excluded it, or vice versa
+- If the portfolio contradicts the investor's profile (e.g. conservative investor with speculative positions), flag this mismatch explicitly
 
 You always respond with valid JSON matching the requested schema."""
 
 
-PORTFOLIO_FULL_REPORT_PROMPT = """Analyze the following portfolio and provide a comprehensive review.
+PORTFOLIO_FULL_REPORT_PROMPT = """Analyze the following portfolio and provide a comprehensive, data-driven review.
 
 {context}
 
 Respond with a JSON object matching this exact schema:
 {{
-    "summary": "2-3 sentence portfolio assessment",
+    "summary": "2-3 sentence assessment. MUST cite key numbers: portfolio beta, Sharpe ratio, total return vs benchmark if available.",
     "health": "Excellent" | "Good" | "Fair" | "Needs Attention",
     "riskLevel": "Low" | "Moderate" | "High" | "Very High",
 
     "diversification": {{
         "assessment": "Well Diversified" | "Adequate" | "Concentrated" | "Highly Concentrated",
-        "detail": "1-2 sentences on sector/position concentration"
+        "detail": "Cite HHI score, top-3 weight %, sector breakdown, and avg correlation between holdings."
     }},
 
     "performance": {{
         "assessment": "Strong" | "Moderate" | "Weak" | "Mixed",
-        "detail": "1-2 sentences on overall P/L and notable performers"
+        "detail": "Cite total P/L, total return %, and compare to S&P 500 benchmark if data is available. Reference Sharpe/Sortino ratios."
     }},
 
     "riskExposure": {{
         "assessment": "Conservative" | "Balanced" | "Aggressive" | "Speculative",
-        "detail": "1-2 sentences on risk factors"
+        "detail": "Cite portfolio beta, weighted volatility, max drawdown, and any correlation concerns."
     }},
 
     "topConviction": [
-        {{"symbol": "AAPL", "reasoning": "Why this is a strong position"}},
-        {{"symbol": "MSFT", "reasoning": "Why this is a strong position"}}
+        {{"symbol": "AAPL", "reasoning": "Reference P/L, Sharpe ratio, beta, or fundamentals that make this a strong hold"}}
     ],
 
     "concerns": [
-        {{"symbol": "XYZ", "issue": "What's concerning about this position"}},
-        {{"symbol": "ABC", "issue": "What's concerning"}}
+        {{"symbol": "XYZ", "issue": "Reference specific metrics: loss amount, high beta, poor Sharpe, overweight %, etc."}}
     ],
 
-    "strengths": ["strength 1", "strength 2", "strength 3"],
-    "weaknesses": ["weakness 1", "weakness 2"],
-    "opportunities": ["opportunity 1", "opportunity 2"],
-    "risks": ["risk 1", "risk 2", "risk 3"],
+    "strengths": ["Cite specific data points in each strength"],
+    "weaknesses": ["Cite specific data points in each weakness"],
+    "opportunities": ["Specific opportunity with rationale"],
+    "risks": ["Specific risk with quantification when possible"],
 
     "rebalancingSuggestions": [
-        "Specific rebalancing recommendation 1",
-        "Specific rebalancing recommendation 2"
+        "Specific rebalancing recommendation referencing current vs target weights"
     ],
 
     "actionItems": [
-        "Prioritized action 1",
-        "Prioritized action 2"
+        {{
+            "action": "reduce" | "add" | "hold" | "sell" | "buy",
+            "symbol": "NVDA",
+            "reasoning": "Specific rationale citing data (e.g. 'Beta of 1.8 at 25% weight contributes disproportionate portfolio risk')"
+        }}
     ]
 }}
 
-Important:
-- Base all observations on the actual data provided
-- topConviction should highlight 2-3 strongest positions with reasoning
-- concerns should only include positions with real issues (losses, overweight, etc.)
-- rebalancingSuggestions should be specific and actionable
+Critical instructions:
+- EVERY observation must reference actual numbers from the data — never make vague claims
+- topConviction: 2-3 positions with the best risk-adjusted profile (cite Sharpe, P/L, beta)
+- concerns: only positions with measurable issues (cite losses, high beta, low Sharpe, overweight)
+- actionItems: specific position-level recommendations with action type and symbol
+- When benchmark data is available, the summary and performance MUST compare against it
+- If HHI > 2500 or top-3 weight > 60%, flag concentration risk explicitly
+- If avg correlation > 0.7, flag diversification concern
 - If portfolio is small (<5 positions), note limited diversification
-- Consider position sizes when assessing risk"""
+- If an Investor Profile is provided, personalize the tone and recommendations:
+  * For beginners: use plain language, explain financial terms briefly
+  * For advanced investors: use technical language freely
+  * Flag any mismatch between the portfolio and the investor's stated risk level or goals
+  * Align rebalancing suggestions with the investor's time horizon and primary goal"""
 
 
-PORTFOLIO_INLINE_PROMPT = """Based on the following portfolio data, generate brief insights for dashboard display.
-Each insight should be concise and impactful.
+PORTFOLIO_INLINE_PROMPT = """Based on the following portfolio data, generate brief quantitative insights for dashboard display.
+Each insight should cite specific numbers — never be vague.
 
 {context}
 
 Respond with a JSON object:
 {{
-    "healthBadge": "Short health status, e.g., 'Well Diversified' or '15 positions, balanced'",
-    "performanceNote": "Brief P/L summary, e.g., '+18.5% YTD' or 'Up $12,450 overall'",
-    "riskFlag": "Notable risk if any (e.g., '60% in tech'), or null if portfolio is balanced",
-    "topPerformer": "Best position, e.g., 'NVDA +145%'",
-    "actionNeeded": "Urgent action if needed (e.g., 'Consider taking profits on NVDA'), or null"
+    "healthBadge": "Short status with a number, e.g., 'HHI 1200 — Well Diversified' or 'Beta 1.4 — Aggressive'",
+    "performanceNote": "Return with benchmark comparison if available, e.g., '+18.5% vs SPY +22%' or 'Sharpe 1.2, beating benchmark'",
+    "riskFlag": "Cite a specific risk metric if concerning (e.g., 'Top 3 = 72% of portfolio, HHI 3100'), or null if balanced",
+    "topPerformer": "Best position with data, e.g., 'NVDA +145%, Sharpe 2.1'",
+    "actionNeeded": "Specific action with reason (e.g., 'NVDA at 25% — trim to 15% to reduce beta'), or null"
 }}
 
-Be specific with numbers. Use null for riskFlag and actionNeeded if nothing notable."""
+Be specific with numbers. Use null for riskFlag and actionNeeded if nothing notable.
+If an Investor Profile is provided, calibrate the actionNeeded urgency to their risk tolerance and goals."""
 
 
 PORTFOLIO_QUICK_SUMMARY_PROMPT = """Provide a one-paragraph portfolio summary.
@@ -330,6 +347,7 @@ async def analyze_portfolio(
             "positionCount": bundle.position_count,
             "currency": bundle.currency,
         },
+        "riskMetrics": bundle.risk_metrics if bundle.risk_metrics else None,
         "dataGaps": bundle.gaps,
     }
 

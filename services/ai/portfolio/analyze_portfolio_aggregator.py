@@ -6,10 +6,13 @@ Combines holdings, prices, fundamentals, and news for comprehensive portfolio re
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 from datetime import datetime
 from collections import defaultdict
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -44,6 +47,12 @@ class PortfolioDataBundle:
     concentration_risk: float = 0.0  # Top 3 holdings as % of portfolio
     position_count: int = 0
     
+    # Quantitative risk metrics (from Yahoo price history)
+    risk_metrics: Dict[str, Any] = field(default_factory=dict)
+    
+    # Investor profile (from onboarding)
+    investor_profile: Optional[Dict[str, Any]] = None
+    
     # Data quality
     gaps: List[str] = field(default_factory=list)
     fetched_at: str = field(default_factory=lambda: datetime.utcnow().isoformat() + "Z")
@@ -66,6 +75,7 @@ class PortfolioDataBundle:
             "portfolioNews": self.portfolio_news,
             "concentrationRisk": self.concentration_risk,
             "positionCount": self.position_count,
+            "riskMetrics": self.risk_metrics,
             "gaps": self.gaps,
             "fetchedAt": self.fetched_at,
         }
@@ -73,6 +83,44 @@ class PortfolioDataBundle:
     def to_ai_context(self, max_news: int = 8) -> str:
         """Format portfolio data for LLM analysis."""
         lines = ["# Portfolio Analysis Data", ""]
+        
+        # Investor Profile (from onboarding — guides tone and recommendations)
+        if self.investor_profile:
+            p = self.investor_profile
+            lines.append("## Investor Profile")
+            
+            risk = p.get("risk_level")
+            horizon = p.get("time_horizon")
+            goal = p.get("primary_goal")
+            experience = p.get("experience_level")
+            age = p.get("age_band")
+            style = p.get("style_preference")
+            
+            if risk:
+                label = {"low": "Conservative", "medium": "Moderate", "high": "Aggressive"}.get(risk, risk.title())
+                lines.append(f"- Risk Tolerance: {label}")
+            if horizon:
+                label = {"short": "Short-term (<2 years)", "medium": "Medium-term (2-7 years)", "long": "Long-term (7+ years)"}.get(horizon, horizon.title())
+                lines.append(f"- Time Horizon: {label}")
+            if goal:
+                label = {"growth": "Capital Growth", "income": "Income / Dividends", "preserve": "Capital Preservation", "save_for_goal": "Saving for a Specific Goal"}.get(goal, goal.replace("_", " ").title())
+                lines.append(f"- Primary Goal: {label}")
+            if experience:
+                lines.append(f"- Experience Level: {experience.title()}")
+            if age:
+                lines.append(f"- Age Range: {age.replace('_', '-')}")
+            if style:
+                label = {"set_and_forget": "Set & Forget (passive)", "hands_on": "Hands-On (active)", "news_driven": "News-Driven (reactive)"}.get(style, style.replace("_", " ").title())
+                lines.append(f"- Investing Style: {label}")
+            
+            # Asset preferences
+            prefs = p.get("asset_preferences")
+            if isinstance(prefs, dict):
+                liked = [k for k, v in prefs.items() if v]
+                if liked:
+                    lines.append(f"- Preferred Assets: {', '.join(liked)}")
+            
+            lines.append("")
         
         # Portfolio Overview
         lines.append("## Portfolio Overview")
@@ -91,7 +139,74 @@ class PortfolioDataBundle:
                          "Moderately Concentrated" if self.concentration_risk < 60 else \
                          "Highly Concentrated"
         lines.append(f"- Diversification: {diversification}")
+        
+        # Quantitative risk metrics (from price history)
+        rm = self.risk_metrics
+        if rm:
+            p_beta = rm.get("portfolio_beta")
+            p_vol = rm.get("portfolio_volatility_weighted")
+            hhi = rm.get("hhi_concentration")
+            avg_corr = rm.get("avg_correlation_top_holdings")
+            
+            if p_beta is not None:
+                lines.append(f"- Portfolio Beta: {p_beta:.2f} (market = 1.0)")
+            if p_vol is not None:
+                lines.append(f"- Weighted Volatility (annualized): {p_vol * 100:.1f}%")
+            if hhi is not None:
+                hhi_label = "Diversified" if hhi < 1500 else "Moderate" if hhi < 2500 else "Concentrated"
+                lines.append(f"- HHI Concentration: {hhi:,.0f} ({hhi_label})")
+            if avg_corr is not None:
+                corr_label = "Low" if avg_corr < 0.4 else "Moderate" if avg_corr < 0.7 else "High"
+                lines.append(f"- Avg Correlation (Top Holdings): {avg_corr:.2f} ({corr_label})")
         lines.append("")
+        
+        # Benchmark comparison (S&P 500 via SPY)
+        bench = rm.get("benchmark", {}) if rm else {}
+        if bench:
+            lines.append("## Benchmark Comparison (S&P 500 / SPY)")
+            b_ret = bench.get("annualized_return")
+            b_vol = bench.get("volatility")
+            b_mdd = bench.get("max_drawdown")
+            b_sharpe = bench.get("sharpe_ratio")
+            
+            if b_ret is not None:
+                lines.append(f"- S&P 500 1Y Return: {b_ret * 100:+.1f}%")
+            if b_vol is not None:
+                lines.append(f"- S&P 500 Volatility: {b_vol * 100:.1f}%")
+            if b_mdd is not None:
+                lines.append(f"- S&P 500 Max Drawdown: {b_mdd * 100:.1f}%")
+            if b_sharpe is not None:
+                lines.append(f"- S&P 500 Sharpe: {b_sharpe:.2f}")
+            
+            # Portfolio vs benchmark summary
+            p_vol_val = rm.get("portfolio_volatility_weighted")
+            if b_ret is not None and self.total_pl_pct != 0:
+                port_ret = self.total_pl_pct / 100
+                diff = port_ret - b_ret
+                lines.append(f"- Your Portfolio Return: {port_ret * 100:+.1f}% ({'outperforming' if diff > 0 else 'underperforming'} S&P 500 by {abs(diff) * 100:.1f}pp)")
+            lines.append("")
+        
+        # Per-symbol risk metrics
+        per_sym = rm.get("per_symbol", {}) if rm else {}
+        if per_sym:
+            lines.append("## Per-Holding Risk Metrics")
+            for sym, sm in per_sym.items():
+                parts = [f"{sym}:"]
+                beta = sm.get("beta")
+                vol = sm.get("volatility_annualized")
+                mdd = sm.get("max_drawdown")
+                sharpe = sm.get("sharpe_ratio")
+                sortino = sm.get("sortino_ratio")
+                
+                if beta is not None: parts.append(f"Beta {beta:.2f}")
+                if vol is not None: parts.append(f"Vol {vol * 100:.1f}%")
+                if mdd is not None: parts.append(f"MaxDD {mdd * 100:.1f}%")
+                if sharpe is not None: parts.append(f"Sharpe {sharpe:.2f}")
+                if sortino is not None: parts.append(f"Sortino {sortino:.2f}")
+                
+                if len(parts) > 1:
+                    lines.append(f"- {' | '.join(parts)}")
+            lines.append("")
         
         # Asset Type Allocation
         if self.type_allocation:
@@ -225,6 +340,25 @@ async def aggregate_portfolio_data(
     
     bundle = PortfolioDataBundle(user_id=user_id, currency=currency)
     
+    # 0. Load investor profile from onboarding (lightweight DB query)
+    try:
+        from models.user_onboarding_profile import UserOnboardingProfile
+        profile = db.query(UserOnboardingProfile).filter(
+            UserOnboardingProfile.user_id == int(user_id)
+        ).first()
+        if profile and profile.completed_at:
+            bundle.investor_profile = {
+                "risk_level": profile.risk_level,
+                "time_horizon": profile.time_horizon,
+                "primary_goal": profile.primary_goal,
+                "experience_level": profile.experience_level,
+                "age_band": profile.age_band,
+                "style_preference": profile.style_preference,
+                "asset_preferences": profile.asset_preferences,
+            }
+    except Exception as e:
+        logger.warning(f"Could not load investor profile: {e}")
+    
     # 1. Fetch holdings with prices
     try:
         holdings_data = await get_holdings_with_live_prices(
@@ -276,7 +410,33 @@ async def aggregate_portfolio_data(
     if bundle.symbol_fundamentals:
         _calculate_sector_allocation(bundle)
     
-    # 6. Fetch news for holdings
+    # 6. Compute quantitative risk metrics from Yahoo price history
+    #    NOTE: yahooquery handles raw crypto tickers (ETH, BTC, etc.) natively —
+    #    no need to convert to ETH-USD format. Beta fallback is computed from
+    #    returns vs SPY when Yahoo summary_detail doesn't provide it.
+    if include_fundamentals and bundle.top_holdings:
+        try:
+            from services.ai.risk_metrics import fetch_portfolio_risk_metrics
+            
+            risk_symbols = [h["symbol"] for h in bundle.top_holdings[:8] if h.get("symbol")]
+            weight_map = {h["symbol"]: h.get("weight", 0) for h in bundle.holdings if h.get("symbol")}
+            
+            logger.info(f"[Risk Metrics] symbols={risk_symbols}, weight_keys={list(weight_map.keys())}")
+            
+            bundle.risk_metrics = await fetch_portfolio_risk_metrics(
+                risk_symbols, weight_map, period="1y"
+            )
+            
+            logger.info(
+                f"[Risk Metrics] result: keys={list(bundle.risk_metrics.keys()) if bundle.risk_metrics else 'empty'}, "
+                f"per_symbol={len(bundle.risk_metrics.get('per_symbol', {})) if bundle.risk_metrics else 0}, "
+                f"benchmark={'yes' if bundle.risk_metrics.get('benchmark') else 'no'}"
+            )
+        except Exception as e:
+            logger.error(f"[Risk Metrics] computation failed: {e}", exc_info=True)
+            bundle.gaps.append(f"Risk metrics computation failed: {e}")
+    
+    # 7. Fetch news for holdings
     if include_news and bundle.top_holdings:
         news_symbols = [h["symbol"] for h in bundle.top_holdings[:5] if h.get("symbol")]
         
