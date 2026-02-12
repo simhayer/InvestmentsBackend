@@ -1,12 +1,12 @@
 # ai_stock_analysis.py
 from __future__ import annotations
 
-import os
 import json
-import asyncio
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict, List, Optional, Protocol, Literal
+from typing import Any, Dict, List, Optional
+
+from services.ai.llm_service import get_llm_service
 
 
 # ============================================================================
@@ -164,180 +164,6 @@ Respond with JSON:
 
 
 # ============================================================================
-# LLM CLIENT INTERFACE
-# ============================================================================
-
-class LLMClient(Protocol):
-    async def generate_json(self, *, system: str, user: str) -> str:
-        """Return raw text that should be JSON."""
-
-
-# ============================================================================
-# OPENAI CLIENT
-# ============================================================================
-
-class OpenAIClient:
-    def __init__(self, api_key: str, model: str, timeout_s: float = 60.0):
-        self.api_key = api_key
-        self.model = model
-        self.timeout_s = timeout_s
-
-    async def generate_json(self, *, system: str, user: str) -> str:
-        import httpx
-        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            r = await client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": self.model,
-                    "messages": [
-                        {"role": "system", "content": system},
-                        {"role": "user", "content": user},
-                    ],
-                    "temperature": 0.3,
-                    "response_format": {"type": "json_object"},
-                },
-            )
-            r.raise_for_status()
-            data = r.json()
-            return data["choices"][0]["message"]["content"]
-
-
-# ============================================================================
-# ANTHROPIC CLIENT
-# ============================================================================
-
-class AnthropicClient:
-    def __init__(self, api_key: str, model: str, timeout_s: float = 60.0):
-        self.api_key = api_key
-        self.model = model
-        self.timeout_s = timeout_s
-
-    async def generate_json(self, *, system: str, user: str) -> str:
-        import httpx
-        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            r = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": self.api_key,
-                    "Content-Type": "application/json",
-                    "anthropic-version": "2023-06-01",
-                },
-                json={
-                    "model": self.model,
-                    "max_tokens": 2000,
-                    "system": system,
-                    "messages": [{"role": "user", "content": user}],
-                },
-            )
-            r.raise_for_status()
-            data = r.json()
-            return data["content"][0]["text"]
-
-
-# ============================================================================
-# GEMINI CLIENT (optionally with web search)
-# ============================================================================
-
-GeminiThinking = Literal["LOW", "MEDIUM", "HIGH"]
-
-class GeminiClient:
-    def __init__(
-        self,
-        api_key: str,
-        model: str,
-        *,
-        use_web: bool = True,
-        thinking_level: GeminiThinking = "HIGH",
-        temperature: float = 0.3,
-    ):
-        self.api_key = api_key
-        self.model = model
-        self.use_web = use_web
-        self.thinking_level = thinking_level
-        self.temperature = temperature
-
-    def _normalize_thinking(self) -> str:
-        lvl = (self.thinking_level or "HIGH").upper()
-        m = (self.model or "").lower()
-
-        if "pro" in m:
-            return lvl if lvl in ("LOW", "HIGH") else "HIGH"
-        if "flash" in m:
-            return lvl if lvl in ("LOW", "MEDIUM", "HIGH") else "MEDIUM"
-        return lvl if lvl in ("LOW", "HIGH") else "HIGH"
-
-    async def generate_json(self, *, system: str, user: str) -> str:
-        return await asyncio.to_thread(self._sync_call, system, user)
-
-    def _sync_call(self, system: str, user: str) -> str:
-        from google import genai
-        from google.genai import types
-
-        client = genai.Client(api_key=self.api_key)
-
-        combined = f"{system}\n\n{user}"
-        contents = [
-            types.Content(role="user", parts=[types.Part.from_text(text=combined)])
-        ]
-
-        tools = None
-        if self.use_web:
-            tools = [types.Tool(googleSearch=types.GoogleSearch())]
-
-        config = types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(thinking_level=self._normalize_thinking()),
-            tools=tools,
-            temperature=self.temperature,
-        )
-
-        resp = client.models.generate_content(
-            model=self.model,
-            contents=contents,
-            config=config,
-        )
-
-        text = getattr(resp, "text", None)
-        return text if text else str(resp)
-
-
-# ============================================================================
-# (OPTIONAL) "CLOUD" CLIENT STUB
-# - For your own gateway / internal service later
-# - Caller doesn't change; only this resolver changes
-# ============================================================================
-
-class CloudLLMClient:
-    """
-    Example: call your own cloud gateway: POST /v1/llm/analyze
-    You can implement however you want later.
-    """
-    def __init__(self, base_url: str, api_key: str, timeout_s: float = 60.0):
-        self.base_url = base_url.rstrip("/")
-        self.api_key = api_key
-        self.timeout_s = timeout_s
-
-    async def generate_json(self, *, system: str, user: str) -> str:
-        import httpx
-        async with httpx.AsyncClient(timeout=self.timeout_s) as client:
-            r = await client.post(
-                f"{self.base_url}/v1/generate",
-                headers={
-                    "Authorization": f"Bearer {self.api_key}",
-                    "Content-Type": "application/json",
-                },
-                json={"system": system, "user": user},
-            )
-            r.raise_for_status()
-            data = r.json()
-            # you decide your gateway shape; assume {"text": "..."}
-            return data["text"]
-
-
-# ============================================================================
 # SERVICE (CALLER NEVER CHOOSES PROVIDER)
 # ============================================================================
 
@@ -348,52 +174,10 @@ class AIAnalysisService:
     """
 
     def __init__(self):
-        self.client = self._resolve_client()
-
-    def _resolve_client(self) -> LLMClient:
-        """
-        Decide provider/model here only.
-        Callers never care.
-        """
-        provider = (os.getenv("AI_PROVIDER") or "gemini").lower()
-
-        if provider == "openai":
-            api_key = os.getenv("OPENAI_API_KEY", "")
-            if not api_key:
-                raise ValueError("Missing OPENAI_API_KEY")
-            model = os.getenv("OPENAI_MODEL") or "gpt-4o-mini"
-            return OpenAIClient(api_key=api_key, model=model)
-
-        if provider == "anthropic":
-            api_key = os.getenv("ANTHROPIC_API_KEY", "")
-            if not api_key:
-                raise ValueError("Missing ANTHROPIC_API_KEY")
-            model = os.getenv("ANTHROPIC_MODEL") or "claude-3-5-sonnet-latest"
-            return AnthropicClient(api_key=api_key, model=model)
-
-        if provider == "cloud":
-            base_url = os.getenv("CLOUD_LLM_BASE_URL", "")
-            api_key = os.getenv("CLOUD_LLM_API_KEY", "")
-            if not base_url or not api_key:
-                raise ValueError("Missing CLOUD_LLM_BASE_URL or CLOUD_LLM_API_KEY")
-            return CloudLLMClient(base_url=base_url, api_key=api_key)
-
-        # default: gemini
-        api_key = os.getenv("GEMINI_API_KEY", "")
-        if not api_key:
-            raise ValueError("Missing GEMINI_API_KEY")
-        model = os.getenv("GEMINI_MODEL") or "gemini-3-flash-preview"
-        use_web = (os.getenv("GEMINI_USE_WEB", "1") == "1")
-        thinking = (os.getenv("GEMINI_THINKING_LEVEL") or "HIGH").upper()
-        return GeminiClient(
-            api_key=api_key,
-            model=model,
-            use_web=use_web,
-            thinking_level=thinking,  # auto-normalized inside client
-            temperature=float(os.getenv("AI_TEMPERATURE", "0.3")),
-        )
+        self.llm = get_llm_service()
 
     def _parse_json(self, text: str) -> Dict[str, Any]:
+        # Keep this here to avoid changing other behavior/assumptions.
         text = (text or "").strip()
         if text.startswith("```"):
             lines = text.split("\n")
@@ -411,8 +195,13 @@ class AIAnalysisService:
             return default
 
     async def _ask(self, prompt: str) -> Dict[str, Any]:
-        raw = await self.client.generate_json(system=SYSTEM_PROMPT, user=prompt)
-        return self._parse_json(raw)
+        # New shared LLM service handles provider selection.
+        raw_obj = await self.llm.generate_json(system=SYSTEM_PROMPT, user=prompt)
+
+        # llm_service.generate_json returns dict already, but keep compatibility:
+        if isinstance(raw_obj, dict):
+            return raw_obj
+        return self._parse_json(str(raw_obj))
 
     async def generate_full_report(self, context: str, symbol: str) -> AnalysisReport:
         data = await self._ask(FULL_REPORT_PROMPT.format(context=context))
