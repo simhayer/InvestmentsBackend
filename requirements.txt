@@ -14,4 +14,4 @@ pgvector==0.4.2
 sec-parser==0.58.1
 openai==2.15.0
 langchain-openai==1.1.7
-unicorn==0.38.0
+uvicorn[standard]==0.30.6
