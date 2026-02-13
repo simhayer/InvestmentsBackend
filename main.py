@@ -23,6 +23,7 @@ from routers.crypto_routes import router as crypto_router
 from routers.filing_routes import router as filing_router
 from routers.v2.analyze_symbol_routes import router as analyze_symbol_router
 from routers.v2.analyze_portfolio_routes import router as analyze_portfolio_router
+from routers.v2.analyze_crypto_routes import router as analyze_crypto_router
 
 
 # load crypto catalog on startup
@@ -93,3 +94,4 @@ app.include_router(crypto_router, prefix="/api/crypto", tags=["crypto"])
 app.include_router(filing_router, prefix="/api/filings", tags=["filings"])
 app.include_router(analyze_symbol_router, prefix="/api/analyze/symbol", tags=["analyze-symbol"])
 app.include_router(analyze_portfolio_router, prefix="/api/portfolio/analysis", tags=["analyze-portfolio"])
+app.include_router(analyze_crypto_router, prefix="/api/analyze/crypto", tags=["analyze-crypto"])
