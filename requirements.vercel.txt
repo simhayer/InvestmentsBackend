@@ -13,3 +13,4 @@ python-jose==3.5.0
 pgvector==0.4.2
 sec-parser==0.58.1
 slowapi==0.1.9
+alembic==1.18.4

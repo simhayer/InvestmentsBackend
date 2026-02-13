@@ -3,6 +3,9 @@
 Analyst data endpoints for Finnhub: recommendations and price targets.
 Add these methods to your FinnhubService class, or use standalone.
 """
+import logging
+
+logger = logging.getLogger(__name__)
 from __future__ import annotations
 
 import os
@@ -193,7 +196,7 @@ class FinnhubAnalystService:
             return recommendations
 
         except Exception as e:
-            print(f"fetch_recommendations failed for {sym}: {e}")
+            logger.exception("fetch_recommendations failed for %s", sym)
             return []
         finally:
             if should_close:
@@ -241,7 +244,7 @@ class FinnhubAnalystService:
             )
 
         except Exception as e:
-            print(f"fetch_price_target failed for {sym}: {e}")
+            logger.exception("fetch_price_target failed for %s", sym)
             return None
         finally:
             if should_close:

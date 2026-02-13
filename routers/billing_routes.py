@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 from typing import Literal, Optional
 
 import stripe
@@ -176,9 +179,9 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
         elif price_id == PRICE_PRO:
             plan = "pro"
 
-        print("SUB EVENT customer_id:", customer_id)
+        logger.info("SUB EVENT customer_id: %s", customer_id)
         row = db.query(UserSubscription).filter_by(stripe_customer_id=customer_id).first()
-        print("DB lookup found:", bool(row))
+        logger.info("DB lookup found: %s", bool(row))
         
         if row:
             row.stripe_subscription_id = stripe_sub_id
