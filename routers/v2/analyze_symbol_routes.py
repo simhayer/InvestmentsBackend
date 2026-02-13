@@ -4,9 +4,15 @@ FastAPI routes for AI stock analysis.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query
+import logging
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
+
+from services.supabase_auth import get_current_db_user
+from middleware.rate_limit import limiter
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -71,10 +77,13 @@ class QuickSummaryResponse(BaseModel):
 # ============================================================================
 
 @router.get("/full/{symbol}", response_model=AnalysisResponse)
+@limiter.limit("10/minute")
 async def get_full_analysis(
+    request: Request,
     symbol: str,
     include_inline: bool = Query(True, description="Include inline insights"),
     force_refresh: bool = Query(False, description="Bypass cache and recompute"),
+    _user=Depends(get_current_db_user),
 ):
     """
     Get comprehensive AI analysis for a stock.
@@ -98,14 +107,17 @@ async def get_full_analysis(
         )
         return result
     except Exception as e:
-        print(e)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"Analysis failed for {symbol}")
+        raise HTTPException(status_code=500, detail="Analysis failed")
 
 
 @router.get("/inline/{symbol}", response_model=InlineInsightsResponse)
+@limiter.limit("20/minute")
 async def get_inline_insights(
+    request: Request,
     symbol: str,
     force_refresh: bool = Query(False, description="Bypass cache"),
+    _user=Depends(get_current_db_user),
 ):
     """
     Get quick inline insights for UI placement.
@@ -118,12 +130,13 @@ async def get_inline_insights(
         result = await get_stock_insights(symbol.upper(), force_refresh=force_refresh)
         return result
     except Exception as e:
-        print(e)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"Inline insights failed for {symbol}")
+        raise HTTPException(status_code=500, detail="Insights failed")
 
 
 @router.get("/summary/{symbol}", response_model=QuickSummaryResponse)
-async def get_quick_summary(symbol: str):
+@limiter.limit("20/minute")
+async def get_quick_summary(request: Request, symbol: str, _user=Depends(get_current_db_user)):
     """
     Get just a summary paragraph and verdict.
     
@@ -149,11 +162,13 @@ async def get_quick_summary(symbol: str):
             "verdict": result.get("verdict", "Neutral"),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"Quick summary failed for {symbol}")
+        raise HTTPException(status_code=500, detail="Summary failed")
 
 
 @router.get("/data/{symbol}")
-async def get_raw_data(symbol: str) -> Dict[str, Any]:
+@limiter.limit("30/minute")
+async def get_raw_data(request: Request, symbol: str, _user=Depends(get_current_db_user)) -> Dict[str, Any]:
     """
     Get aggregated raw data without AI analysis.
     
@@ -169,4 +184,5 @@ async def get_raw_data(symbol: str) -> Dict[str, Any]:
             "context": bundle.to_ai_context(),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"Data fetch failed for {symbol}")
+        raise HTTPException(status_code=500, detail="Data fetch failed")

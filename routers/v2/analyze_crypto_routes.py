@@ -4,9 +4,15 @@ FastAPI routes for AI crypto analysis.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, HTTPException, Query
+import logging
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
+
+from services.supabase_auth import get_current_db_user
+from middleware.rate_limit import limiter
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -73,10 +79,13 @@ class CryptoAnalysisResponse(BaseModel):
 # ============================================================================
 
 @router.get("/full/{symbol}", response_model=CryptoAnalysisResponse)
+@limiter.limit("10/minute")
 async def get_full_crypto_analysis(
+    request: Request,
     symbol: str,
     include_inline: bool = Query(True, description="Include inline insights"),
     force_refresh: bool = Query(False, description="Bypass cache and recompute"),
+    _user=Depends(get_current_db_user),
 ):
     """
     Get comprehensive AI analysis for a crypto asset.
@@ -100,14 +109,17 @@ async def get_full_crypto_analysis(
         )
         return result
     except Exception as e:
-        print(e)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"Crypto analysis failed for {symbol}")
+        raise HTTPException(status_code=500, detail="Analysis failed")
 
 
 @router.get("/inline/{symbol}", response_model=CryptoInlineResponse)
+@limiter.limit("20/minute")
 async def get_crypto_inline_insights(
+    request: Request,
     symbol: str,
     force_refresh: bool = Query(False, description="Bypass cache"),
+    _user=Depends(get_current_db_user),
 ):
     """
     Get quick inline insights for UI placement.
@@ -122,12 +134,13 @@ async def get_crypto_inline_insights(
         )
         return result
     except Exception as e:
-        print(e)
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"Crypto inline insights failed for {symbol}")
+        raise HTTPException(status_code=500, detail="Insights failed")
 
 
 @router.get("/data/{symbol}")
-async def get_raw_crypto_data(symbol: str) -> Dict[str, Any]:
+@limiter.limit("30/minute")
+async def get_raw_crypto_data(request: Request, symbol: str, _user=Depends(get_current_db_user)) -> Dict[str, Any]:
     """
     Get aggregated raw crypto data without AI analysis.
 
@@ -143,4 +156,5 @@ async def get_raw_crypto_data(symbol: str) -> Dict[str, Any]:
             "context": bundle.to_ai_context(),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception(f"Crypto data fetch failed for {symbol}")
+        raise HTTPException(status_code=500, detail="Data fetch failed")
