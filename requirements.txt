@@ -17,3 +17,4 @@ langchain-openai==1.1.7
 uvicorn[standard]==0.30.6
 google-genai==1.62.0
 slowapi==0.1.9
+alembic==1.18.4

@@ -1,7 +1,10 @@
 # services/finnhub_service.py
 from __future__ import annotations
 import asyncio
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -556,7 +559,7 @@ class FinnhubService:
                 data = r.json()  # peers endpoint returns a list
                 if not isinstance(data, list):
                     return []
-                print(f"fetch_peers: raw data for {sym}: {data}")
+                logger.debug("fetch_peers: raw data for %s: %s", sym, data)
                 if not isinstance(data, list):
                     return []
 
@@ -571,10 +574,9 @@ class FinnhubService:
                     seen.add(p)
                     out.append(p)
 
-                print('fetched peers:', out)
+                logger.debug("fetched peers: %s", out)
                 return out
 
             except Exception as e:
-                # better than print; swap to logger if you have it
-                print(f"fetch_peers failed for {sym}: {e}")
+                logger.exception("fetch_peers failed for %s", sym)
                 return []

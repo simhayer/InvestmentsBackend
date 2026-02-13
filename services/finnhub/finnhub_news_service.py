@@ -1,8 +1,11 @@
 # finnhub_news_sdk.py
 from __future__ import annotations
 
+import logging
 import os
 import asyncio
+
+logger = logging.getLogger(__name__)
 import datetime as dt
 from typing import List, Dict, Optional, TypedDict, Any
 import finnhub  # pip install finnhub-python
@@ -97,7 +100,7 @@ async def get_company_news_for_symbols(
             try:
                 items = await asyncio.to_thread(_fetch_company_news_blocking, sym, frm, to, api_key)
             except Exception as e:
-                print("Finnhub company_news failed for %s (%s -> %s): %s", sym, frm, to, e)
+                logger.exception("Finnhub company_news failed for %s (%s -> %s)", sym, frm, to)
                 items = []
             out[sym] = items[:limit_per_symbol] if limit_per_symbol else items
 

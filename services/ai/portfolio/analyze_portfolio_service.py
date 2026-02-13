@@ -339,7 +339,7 @@ async def analyze_portfolio(
 
     Usage:
         result = await analyze_portfolio(user_id, db, finnhub)
-        print(result["report"]["summary"])
+        logger.info("Portfolio analysis summary: %s", result["report"]["summary"])
     """
     from models.portfolio_analysis import PortfolioAnalysis
 

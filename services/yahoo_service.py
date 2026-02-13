@@ -1,7 +1,10 @@
 # services/yahoo_service.py
 from __future__ import annotations
 
+import logging
 from datetime import datetime, timezone, timedelta
+
+logger = logging.getLogger(__name__)
 
 from typing import Any, Dict, List, Optional
 from yahooquery import Ticker
@@ -354,7 +357,7 @@ def _financials_df_fallback(sym: str, period: str) -> Json:
         }
 
     except Exception as e:
-        print("Error in _financials_df_fallback:", str(e))
+        logger.exception("Error in _financials_df_fallback: %s", e)
         return {"status": "error", "error_code": "YQ_FINANCIALS_FALLBACK_FAILED", "message": str(e)}
 
 # ---------- NEW: earnings ----------
