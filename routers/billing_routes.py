@@ -140,6 +140,45 @@ def get_my_subscription(
     )
 
 
+class UsageLimitItem(BaseModel):
+    feature: str
+    used: int
+    limit: int  # -1 = unlimited
+
+
+class UsageOut(BaseModel):
+    plan: str
+    usage: list[UsageLimitItem]
+
+
+FEATURES = [
+    "portfolio_full_analysis",
+    "portfolio_inline",
+    "symbol_full_analysis",
+    "symbol_inline",
+    "crypto_full_analysis",
+    "crypto_inline",
+]
+
+
+@router.get("/usage", response_model=UsageOut)
+def get_my_usage(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_db_user),
+):
+    from services.tier import get_user_plan, get_usage, get_limit
+
+    plan = get_user_plan(user, db)
+    items = []
+    for feat in FEATURES:
+        items.append(UsageLimitItem(
+            feature=feat,
+            used=get_usage(user.id, feat, plan),
+            limit=get_limit(plan, feat),
+        ))
+    return UsageOut(plan=plan, usage=items)
+
+
 # Webhook: no auth
 @router.post("/webhook")
 async def stripe_webhook(request: Request, db: Session = Depends(get_db)):

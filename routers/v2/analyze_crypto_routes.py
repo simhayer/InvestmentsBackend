@@ -9,8 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 
+from database import get_db
+from sqlalchemy.orm import Session
 from services.supabase_auth import get_current_db_user
 from middleware.rate_limit import limiter
+from services.tier import require_tier
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +89,7 @@ async def get_full_crypto_analysis(
     include_inline: bool = Query(True, description="Include inline insights"),
     force_refresh: bool = Query(False, description="Bypass cache and recompute"),
     _user=Depends(get_current_db_user),
+    db: Session = Depends(get_db),
 ):
     """
     Get comprehensive AI analysis for a crypto asset.
@@ -99,6 +103,8 @@ async def get_full_crypto_analysis(
     - Quantitative risk metrics (volatility, Sharpe, max drawdown, beta vs SPY)
     - Optional inline insights for UI badges
     """
+    require_tier(_user, db, "crypto_full_analysis")
+
     from services.ai.analyze_crypto.analyze_crypto_service import analyze_crypto
 
     try:
@@ -108,6 +114,8 @@ async def get_full_crypto_analysis(
             force_refresh=force_refresh,
         )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"Crypto analysis failed for {symbol}")
         raise HTTPException(status_code=500, detail="Analysis failed")
@@ -120,12 +128,15 @@ async def get_crypto_inline_insights(
     symbol: str,
     force_refresh: bool = Query(False, description="Bypass cache"),
     _user=Depends(get_current_db_user),
+    db: Session = Depends(get_db),
 ):
     """
     Get quick inline insights for UI placement.
 
     Cached for 3 hours. Pass force_refresh=true to recompute.
     """
+    require_tier(_user, db, "crypto_inline")
+
     from services.ai.analyze_crypto.analyze_crypto_service import get_crypto_insights
 
     try:
@@ -133,6 +144,8 @@ async def get_crypto_inline_insights(
             symbol.upper(), force_refresh=force_refresh
         )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"Crypto inline insights failed for {symbol}")
         raise HTTPException(status_code=500, detail="Insights failed")
