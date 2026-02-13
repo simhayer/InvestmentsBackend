@@ -15,16 +15,80 @@ def create_holding(
     symbol: str,
     quantity: float,
     purchase_price: float,
-    type_: str
+    type_: str,
+    name: str | None = None,
+    currency: str = "USD",
 ) -> Holding:
+    total_cost = purchase_price * quantity
+    current_value = purchase_price * quantity  # initial estimate until live price
+
     holding = Holding(
-        symbol=symbol,
+        symbol=symbol.upper().strip(),
+        name=name or symbol.upper().strip(),
         quantity=quantity,
         purchase_price=purchase_price,
+        purchase_unit_price=purchase_price,
+        purchase_amount_total=total_cost,
+        current_price=purchase_price,  # placeholder until live enrichment
+        current_value=current_value,
+        value=current_value,
+        unrealized_pl=0.0,
+        unrealized_pl_pct=0.0,
         type=type_,
+        currency=currency.upper(),
+        source="manual",
+        external_id=f"manual_{symbol.upper().strip()}_{int(time.time())}",
+        institution="Manual",
+        account_name="Manual",
         user_id=user_id,
     )
     db.add(holding)
+    db.commit()
+    db.refresh(holding)
+    return holding
+
+
+def update_holding(
+    db: Session,
+    user_id: int,
+    holding_id: int,
+    updates: dict,
+) -> Holding:
+    """Update a manual holding. Only source='manual' holdings can be edited."""
+    holding = db.query(Holding).filter_by(id=holding_id, user_id=user_id).first()
+    if not holding:
+        raise ValueError("Holding not found")
+    if holding.source != "manual":
+        raise PermissionError("Only manually added holdings can be edited")
+
+    if "symbol" in updates and updates["symbol"] is not None:
+        holding.symbol = updates["symbol"].upper().strip()
+    if "name" in updates and updates["name"] is not None:
+        holding.name = updates["name"]
+    if "quantity" in updates and updates["quantity"] is not None:
+        holding.quantity = updates["quantity"]
+    if "purchase_price" in updates and updates["purchase_price"] is not None:
+        holding.purchase_price = updates["purchase_price"]
+        holding.purchase_unit_price = updates["purchase_price"]
+    if "type" in updates and updates["type"] is not None:
+        holding.type = updates["type"]
+    if "currency" in updates and updates["currency"] is not None:
+        holding.currency = updates["currency"].upper()
+
+    # Recompute derived fields
+    qty = holding.quantity or 0
+    unit_price = holding.purchase_price or 0
+    holding.purchase_amount_total = unit_price * qty
+    holding.value = (holding.current_price or unit_price) * qty
+    holding.current_value = holding.value
+
+    if holding.purchase_amount_total and holding.purchase_amount_total > 0:
+        holding.unrealized_pl = holding.current_value - holding.purchase_amount_total
+        holding.unrealized_pl_pct = ((holding.current_value / holding.purchase_amount_total) - 1.0) * 100.0
+    else:
+        holding.unrealized_pl = 0.0
+        holding.unrealized_pl_pct = 0.0
+
     db.commit()
     db.refresh(holding)
     return holding

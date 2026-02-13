@@ -9,7 +9,7 @@ from database import get_db
 from models.holding import Holding
 from routers.finnhub_routes import get_finnhub_service
 from services.finnhub.finnhub_service import FinnhubService
-from services.holding_service import get_all_holdings, get_holdings_with_live_prices, create_holding
+from services.holding_service import get_all_holdings, get_holdings_with_live_prices, create_holding, update_holding
 from services.supabase_auth import get_current_db_user
 from services.currency_service import resolve_currency
 
@@ -28,7 +28,25 @@ def save_holding(
         holding.quantity,
         holding.purchase_price,
         holding.type,
+        name=holding.name,
+        currency=holding.currency or "USD",
     )
+
+@router.put("/holdings/{holding_id}")
+def edit_holding(
+    holding_id: int,
+    payload: general.HoldingUpdate,
+    db: Session = Depends(get_db),
+    user=Depends(get_current_db_user),
+):
+    try:
+        updates = payload.model_dump(exclude_none=True)
+        updated = update_holding(db, user.id, holding_id, updates)
+        return updated
+    except ValueError:
+        raise HTTPException(status_code=404, detail="Holding not found")
+    except PermissionError:
+        raise HTTPException(status_code=403, detail="Only manually added holdings can be edited")
 
 @router.get("/holdings")
 async def get_holdings(
