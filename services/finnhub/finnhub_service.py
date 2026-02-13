@@ -392,6 +392,7 @@ class FinnhubService:
                     if isinstance(item, dict) and item.get("symbol") and item.get("description")
                 ]
             except Exception:
+                logger.warning("search_symbols failed for q=%s", q)
                 return []
 
     async def fetch_quote(self, symbol: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
@@ -404,6 +405,7 @@ class FinnhubService:
                 r.raise_for_status()
                 return safe_json(r) or {}
             except Exception:
+                logger.warning("fetch_quote failed for %s", sym)
                 return {}
 
     async def fetch_profile(self, symbol: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
@@ -416,6 +418,7 @@ class FinnhubService:
                 r.raise_for_status()
                 return safe_json(r) or {}
             except Exception:
+                logger.warning("fetch_profile failed for %s", sym)
                 return {}
 
     async def fetch_basic_financials(self, symbol: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
@@ -432,6 +435,7 @@ class FinnhubService:
                 r.raise_for_status()
                 return safe_json(r) or {}
             except Exception:
+                logger.warning("fetch_basic_financials failed for %s", sym)
                 return {}
 
     async def fetch_earnings(
@@ -455,6 +459,7 @@ class FinnhubService:
                 data = safe_json(r)
                 return data if isinstance(data, list) else []
             except Exception:
+                logger.warning("fetch_earnings failed for %s", sym)
                 return []
 
     async def fetch_prices_for_symbols(
@@ -529,6 +534,7 @@ class FinnhubService:
                 r.raise_for_status()
                 return safe_json(r) or {}
             except Exception:
+                logger.warning("fetch_earnings_calendar failed")
                 return {}
             
 # todo, use the grouping in the future

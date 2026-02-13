@@ -1,4 +1,5 @@
 import logging
+import os
 import requests
 from datetime import datetime, timedelta
 from typing import List, Dict, Any
@@ -8,11 +9,13 @@ from services.finnhub.finnhub_service import FinnhubService
 from services.filings.vector_store_service import VectorStoreService
 from database import SessionLocal
 
+_SEC_CONTACT = os.getenv("SEC_EDGAR_CONTACT", "support@wallstreetai.io")
+
 class FilingService:
     def __init__(self):
         self.client = FinnhubService().get_finnhub_client()
         # Required User-Agent for SEC EDGAR access
-        self.headers = {'User-Agent': 'WALLSTREETAI hayersimrat23@gmail.com'}
+        self.headers = {'User-Agent': f'WALLSTREETAI {_SEC_CONTACT}'}
         self.session = requests.Session()
 
     def get_filing_metadata(self, symbol: str, years: int = 1) -> List[Dict[str, Any]]:

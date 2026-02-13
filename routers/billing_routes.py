@@ -96,7 +96,8 @@ def create_checkout_session(
         )
         return {"url": session["url"]}
     except Exception as e:
-        raise HTTPException(400, detail=str(e))
+        logger.exception("Stripe checkout session creation failed")
+        raise HTTPException(400, detail="Could not create checkout session")
 
 
 class PortalOut(BaseModel):
@@ -193,7 +194,8 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     try:
         event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
     except Exception as e:
-        raise HTTPException(400, detail=str(e))
+        logger.exception("Stripe webhook signature verification failed")
+        raise HTTPException(400, detail="Invalid webhook signature")
 
     if event["type"] in (
         "customer.subscription.created",
