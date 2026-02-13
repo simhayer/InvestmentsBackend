@@ -4,17 +4,19 @@ FastAPI routes for AI portfolio analysis.
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+import logging
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 from sqlalchemy.orm import Session
-
-# from core.deps import get_db, get_current_db_user, get_finnhub_service
 
 from database import get_db
 from services.supabase_auth import get_current_db_user
 from routers.finnhub_routes import get_finnhub_service
 from services.finnhub.finnhub_service import FinnhubService
+from middleware.rate_limit import limiter
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -120,7 +122,9 @@ class QuickSummaryResponse(BaseModel):
 # ============================================================================
 
 @router.get("/full", response_model=FullPortfolioAnalysisResponse)
+@limiter.limit("5/minute")
 async def get_full_portfolio_analysis(
+    request: Request,
     currency: str = Query("USD", description="Currency for values"),
     include_inline: bool = Query(True, description="Include inline insights"),
     force_refresh: bool = Query(False, description="Bypass cache and recompute"),
@@ -152,12 +156,16 @@ async def get_full_portfolio_analysis(
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Portfolio analysis failed")
+        raise HTTPException(status_code=500, detail="Analysis failed")
 
 
 @router.get("/inline", response_model=PortfolioInlineResponse)
+@limiter.limit("10/minute")
 async def get_portfolio_inline_insights(
+    request: Request,
     currency: str = Query("USD"),
+    force_refresh: bool = Query(False, description="Bypass inline cache"),
     db: Session = Depends(get_db),
     user = Depends(get_current_db_user),
     finnhub: FinnhubService = Depends(get_finnhub_service),
@@ -165,7 +173,7 @@ async def get_portfolio_inline_insights(
     """
     Get quick inline insights for portfolio dashboard.
     
-    Faster and cheaper than full analysis.
+    Cached in Redis for 3 hours per user. Pass force_refresh=true to recompute.
     Returns short, punchy insights for badges/cards.
     """
     from services.ai.portfolio.analyze_portfolio_service import get_portfolio_insights
@@ -176,14 +184,18 @@ async def get_portfolio_inline_insights(
             db,
             finnhub,
             currency=currency.upper(),
+            force_refresh=force_refresh,
         )
         return result
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Portfolio inline insights failed")
+        raise HTTPException(status_code=500, detail="Insights failed")
 
 
 @router.get("/summary", response_model=QuickSummaryResponse)
+@limiter.limit("10/minute")
 async def get_portfolio_summary(
+    request: Request,
     currency: str = Query("USD"),
     db: Session = Depends(get_db),
     user = Depends(get_current_db_user),
@@ -216,11 +228,14 @@ async def get_portfolio_summary(
             "health": result.get("health", "Good"),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Portfolio summary failed")
+        raise HTTPException(status_code=500, detail="Summary failed")
 
 
 @router.get("/data")
+@limiter.limit("15/minute")
 async def get_portfolio_raw_data(
+    request: Request,
     currency: str = Query("USD"),
     db: Session = Depends(get_db),
     user = Depends(get_current_db_user),
@@ -245,4 +260,5 @@ async def get_portfolio_raw_data(
             "context": bundle.to_ai_context(),
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.exception("Portfolio data fetch failed")
+        raise HTTPException(status_code=500, detail="Data fetch failed")

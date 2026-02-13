@@ -19,6 +19,14 @@ logger = logging.getLogger(__name__)
 # Default TTL for cached portfolio analysis (24 hours)
 PORTFOLIO_ANALYSIS_TTL_HOURS = 24
 
+# TTL for inline insights in Redis (3 hours)
+PORTFOLIO_INLINE_TTL_SEC = int(3 * 3600)
+
+
+def _inline_cache_key(user_id: str, currency: str) -> str:
+    """Redis key for per-user inline insights."""
+    return f"portfolio:inline:{user_id}:{currency.upper()}"
+
 
 class PortfolioHealth(str, Enum):
     EXCELLENT = "Excellent"
@@ -396,7 +404,16 @@ async def analyze_portfolio(
     # Generate inline insights if requested
     if include_inline:
         inline = await ai.generate_inline_insights(context)
-        result["inline"] = inline.to_dict()
+        inline_dict = inline.to_dict()
+        result["inline"] = inline_dict
+
+        # Write-through: also cache inline insights in Redis for the /inline endpoint
+        try:
+            from services.cache.cache_backend import cache_set
+            cache_set(_inline_cache_key(user_id, currency), inline_dict, PORTFOLIO_INLINE_TTL_SEC)
+            logger.info(f"[Portfolio Inline] cached in Redis for user {user_id}")
+        except Exception as e:
+            logger.warning(f"[Portfolio Inline] failed to cache in Redis: {e}")
 
     # ------------------------------------------------------------------
     # 3. Persist to DB (upsert — one row per user)
@@ -429,10 +446,31 @@ async def get_portfolio_insights(
     db,
     finnhub,
     currency: str = "USD",
-) -> Dict[str, str]:
+    force_refresh: bool = False,
+) -> Dict[str, Any]:
     """
     Quick inline insights only (faster, cheaper).
+
+    Caching strategy:
+    - Checks Redis first for a cached result (TTL = 3 hours).
+    - If miss, generates fresh insights and caches them.
+    - Pass force_refresh=True to bypass cache.
     """
+    from services.cache.cache_backend import cache_get, cache_set
+
+    cache_key = _inline_cache_key(user_id, currency)
+
+    # ── Check Redis cache ──────────────────────────────────────────
+    if not force_refresh:
+        try:
+            cached = cache_get(cache_key)
+            if cached and isinstance(cached, dict):
+                logger.info(f"[Portfolio Inline] Redis cache hit for user {user_id}")
+                return cached
+        except Exception as e:
+            logger.warning(f"[Portfolio Inline] Redis cache check failed: {e}")
+
+    # ── Generate fresh insights ────────────────────────────────────
     from services.ai.portfolio.analyze_portfolio_aggregator import aggregate_portfolio_data
 
     bundle = await aggregate_portfolio_data(
@@ -445,5 +483,13 @@ async def get_portfolio_insights(
 
     ai = AIPortfolioAnalysisService()
     inline = await ai.generate_inline_insights(context)
+    inline_dict = inline.to_dict()
 
-    return inline.to_dict()
+    # ── Store in Redis ─────────────────────────────────────────────
+    try:
+        cache_set(cache_key, inline_dict, PORTFOLIO_INLINE_TTL_SEC)
+        logger.info(f"[Portfolio Inline] cached in Redis for user {user_id}")
+    except Exception as e:
+        logger.warning(f"[Portfolio Inline] failed to cache in Redis: {e}")
+
+    return inline_dict

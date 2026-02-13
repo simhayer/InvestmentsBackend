@@ -8,6 +8,10 @@ load_dotenv()
     
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from slowapi import _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+
+from middleware.rate_limit import limiter
 from routers.user_routes import router as user_router
 from routers.holdings_routes import router as holdings_router
 from routers.finnhub_routes import router as finnhub_router  # keep this as-is
@@ -58,6 +62,10 @@ async def lifespan(app: FastAPI):
     yield
 
 app = FastAPI(lifespan=lifespan)
+
+# ─── Rate limiting ──────────────────────────────────────────────────
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 origins = [
     "http://localhost:3000",
