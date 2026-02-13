@@ -8,11 +8,9 @@ load_dotenv()
 _plaid_env_name = os.getenv("PLAID_ENV", "sandbox").strip().lower()
 _ENV_MAP = {
     "sandbox": Environment.Sandbox,
-    "development": Environment.Development,
     "production": Environment.Production,
 }
 _plaid_host = _ENV_MAP.get(_plaid_env_name, Environment.Sandbox)
-
 _client_id = os.getenv("PLAID_CLIENT_ID")
 _secret = os.getenv("PLAID_SECRET")
 
