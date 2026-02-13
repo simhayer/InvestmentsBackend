@@ -15,6 +15,7 @@ from services.supabase_auth import get_current_db_user
 from routers.finnhub_routes import get_finnhub_service
 from services.finnhub.finnhub_service import FinnhubService
 from middleware.rate_limit import limiter
+from services.tier import require_tier
 
 logger = logging.getLogger(__name__)
 
@@ -143,6 +144,8 @@ async def get_full_portfolio_analysis(
     - Rebalancing suggestions
     - Optional inline insights for dashboard
     """
+    require_tier(user, db, "portfolio_full_analysis")
+
     from services.ai.portfolio.analyze_portfolio_service import analyze_portfolio
     
     try:
@@ -155,6 +158,8 @@ async def get_full_portfolio_analysis(
             force_refresh=force_refresh,
         )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Portfolio analysis failed")
         raise HTTPException(status_code=500, detail="Analysis failed")
@@ -176,6 +181,8 @@ async def get_portfolio_inline_insights(
     Cached in Redis for 3 hours per user. Pass force_refresh=true to recompute.
     Returns short, punchy insights for badges/cards.
     """
+    require_tier(user, db, "portfolio_inline")
+
     from services.ai.portfolio.analyze_portfolio_service import get_portfolio_insights
     
     try:
@@ -187,6 +194,8 @@ async def get_portfolio_inline_insights(
             force_refresh=force_refresh,
         )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception("Portfolio inline insights failed")
         raise HTTPException(status_code=500, detail="Insights failed")

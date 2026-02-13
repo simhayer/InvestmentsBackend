@@ -9,8 +9,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from typing import Any, Dict, List, Optional
 
+from database import get_db
+from sqlalchemy.orm import Session
 from services.supabase_auth import get_current_db_user
 from middleware.rate_limit import limiter
+from services.tier import require_tier
 
 logger = logging.getLogger(__name__)
 
@@ -84,19 +87,15 @@ async def get_full_analysis(
     include_inline: bool = Query(True, description="Include inline insights"),
     force_refresh: bool = Query(False, description="Bypass cache and recompute"),
     _user=Depends(get_current_db_user),
+    db: Session = Depends(get_db),
 ):
     """
     Get comprehensive AI analysis for a stock.
     
     Returns cached result if less than 12h old, unless force_refresh=true.
-    
-    Returns full report with:
-    - Investment thesis summary
-    - Bull/bear cases
-    - Valuation, profitability, financial health assessments
-    - Risks and catalysts
-    - Optional inline insights for UI badges
     """
+    require_tier(_user, db, "symbol_full_analysis")
+
     from services.ai.analyze_symbol.analyze_symbol_service import analyze_stock
     
     try:
@@ -106,6 +105,8 @@ async def get_full_analysis(
             force_refresh=force_refresh,
         )
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"Analysis failed for {symbol}")
         raise HTTPException(status_code=500, detail="Analysis failed")
@@ -118,17 +119,22 @@ async def get_inline_insights(
     symbol: str,
     force_refresh: bool = Query(False, description="Bypass cache"),
     _user=Depends(get_current_db_user),
+    db: Session = Depends(get_db),
 ):
     """
     Get quick inline insights for UI placement.
     
     Cached for 6 hours. Pass force_refresh=true to recompute.
     """
+    require_tier(_user, db, "symbol_inline")
+
     from services.ai.analyze_symbol.analyze_symbol_service import get_stock_insights
     
     try:
         result = await get_stock_insights(symbol.upper(), force_refresh=force_refresh)
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         logger.exception(f"Inline insights failed for {symbol}")
         raise HTTPException(status_code=500, detail="Insights failed")

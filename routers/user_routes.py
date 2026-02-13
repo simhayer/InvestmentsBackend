@@ -1,7 +1,9 @@
 from fastapi import APIRouter, Depends
 from pydantic import BaseModel
+from typing import Optional
 from models.user import User
 from services.supabase_auth import get_current_db_user
+from services.tier import get_user_plan
 from database import get_db
 from sqlalchemy.orm import Session
 from fastapi import HTTPException
@@ -14,14 +16,20 @@ class MeOut(BaseModel):
   supabase_user_id: str
   email: str
   base_currency: str  # or Literal["USD","CAD"]
+  plan: str  # "free" | "premium" | "pro"
 
 @router.get("/me", response_model=MeOut)
-def me(current_user: User = Depends(get_current_db_user)):
+def me(
+    current_user: User = Depends(get_current_db_user),
+    db: Session = Depends(get_db),
+):
+    plan = get_user_plan(current_user, db)
     return MeOut(
         id=current_user.id,
         supabase_user_id=current_user.supabase_user_id,
         email=current_user.email,
         base_currency=current_user.currency or "USD",
+        plan=plan,
     )
 
 
