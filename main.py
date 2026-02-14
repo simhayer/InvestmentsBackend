@@ -13,6 +13,7 @@ from routers.holdings_routes import router as holdings_router
 from routers.finnhub_routes import router as finnhub_router  # keep this as-is
 from routers.plaid_routes import router as plaid_routers
 from routers.ai_routes import router as ai_router  # keep this as-is
+from routers.ai_chat_routes import router as ai_chat_router
 from routers.investment_routes import router as investment_router
 from routers.portfolio_routes import router as portfolio_router
 from routers.news_routes import router as news_router
@@ -81,6 +82,7 @@ app.include_router(holdings_router)
 app.include_router(finnhub_router, prefix="/api/finnhub")
 app.include_router(plaid_routers, prefix="/api/plaid")
 app.include_router(ai_router, prefix="/api/ai")
+app.include_router(ai_chat_router, prefix="/api/ai", tags=["ai-chat"])
 app.include_router(investment_router, prefix="/api/investment")
 app.include_router(portfolio_router, prefix="/api/portfolio")
 app.include_router(news_router, prefix="/api/news")

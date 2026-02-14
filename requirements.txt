@@ -1,5 +1,6 @@
 fastapi==0.121.0
 finnhub-python==2.4.25
+google-genai
 httpx==0.28.1
 plaid-python==37.1.0
 pydantic==2.12.4
