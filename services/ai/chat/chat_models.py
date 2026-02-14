@@ -20,10 +20,21 @@ class ChatMessage(BaseModel):
         return out
 
 
+# ── Page Context (from frontend) ────────────────────────────────────────
+
+class PageContext(BaseModel):
+    page_type: str = Field(max_length=32)
+    route: str = Field(max_length=256)
+    symbol: Optional[str] = Field(default=None, max_length=20)
+    summary: Optional[str] = Field(default=None, max_length=3000)
+    data_snapshot: Optional[Dict[str, Any]] = None
+
+
 class ChatContext(BaseModel):
     portfolio_summary: Optional[str] = Field(default=None, max_length=8000)
     risk_profile: Optional[str] = Field(default=None, max_length=200)
     preferred_currency: Optional[str] = Field(default=None, max_length=8)
+    page: Optional[PageContext] = None
 
 
 class ChatRequest(BaseModel):
@@ -41,6 +52,10 @@ SSEEventType = Literal[
     "done",
     "error",
     "heartbeat",
+    "thinking",
+    "page_ack",
+    "plan",
+    "citation",
 ]
 
 

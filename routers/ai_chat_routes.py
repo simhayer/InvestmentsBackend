@@ -9,7 +9,7 @@ from models.user import User
 from routers.finnhub_routes import get_finnhub_service
 from services.ai.chat.chat_models import ChatRequest
 from services.ai.chat.chat_orchestrator import ChatOrchestrator
-from services.ai.chat.finnhub_tools import FinnhubToolRegistry
+from services.ai.chat.tool_registry import ChatToolRegistry
 from services.finnhub.finnhub_service import FinnhubService
 from services.supabase_auth import get_current_db_user
 
@@ -24,12 +24,16 @@ async def stream_chat(
     user: User = Depends(get_current_db_user),
     finnhub: FinnhubService = Depends(get_finnhub_service),
 ):
-    tools = FinnhubToolRegistry(
-        service=finnhub,
+    tools = ChatToolRegistry(
+        finnhub=finnhub,
         db=db,
         user_id=str(user.id),
     )
-    orchestrator = ChatOrchestrator(finnhub_tools=tools)
+    orchestrator = ChatOrchestrator(
+        tools=tools,
+        db=db,
+        user_id=user.id,
+    )
 
     async def event_generator():
         async for event in orchestrator.stream_sse(

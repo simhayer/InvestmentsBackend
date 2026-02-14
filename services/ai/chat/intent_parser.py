@@ -31,6 +31,9 @@ IntentType = Literal[
     "peer_comparison",
     "macro_news",
     "portfolio_guidance",
+    "portfolio_analysis",
+    "symbol_analysis",
+    "risk_analysis",
     "general_finance",
 ]
 
@@ -103,6 +106,9 @@ class IntentParser:
             "peer_comparison",
             "macro_news",
             "portfolio_guidance",
+            "portfolio_analysis",
+            "symbol_analysis",
+            "risk_analysis",
             "general_finance",
         }:
             intent = "general_finance"
