@@ -1,14 +1,14 @@
 # finnhub_analyst.py
+from __future__ import annotations
+
 """
 Analyst data endpoints for Finnhub: recommendations and price targets.
 Add these methods to your FinnhubService class, or use standalone.
 """
 import logging
+import os
 
 logger = logging.getLogger(__name__)
-from __future__ import annotations
-
-import os
 import asyncio
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional

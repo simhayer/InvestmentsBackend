@@ -9,3 +9,4 @@ from .user_subscription import UserSubscription
 from .crypto_asset import CryptoAsset
 from .vectors.sec_filing_chunk import SecFilingChunk
 from .vectors.company_insights import CompanyInsight
+from .conversation import Conversation, ConversationMessage
