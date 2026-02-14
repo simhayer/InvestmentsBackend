@@ -200,7 +200,7 @@ def sync_plaid_holdings(user_id: str, plaid_holdings: List[Dict], db: Session):
         sec_id = ph.get("externalId") or ph.get("external_id")
         if not sec_id:
             # Don't crash on bad data, just skip and log
-            print("Skipping holding without externalId/external_id:", ph)
+            logger.warning("Skipping holding without externalId/external_id: %s", ph)
             continue
 
         seen_ids.add(sec_id)
@@ -326,5 +326,5 @@ async def get_connected_institutions(
     try:
         return get_connections(str(user.id), db)
     except Exception as e:
-        print("Error fetching institutions:", e)
+        logger.exception("Error fetching institutions")
         raise HTTPException(status_code=500, detail="Failed to fetch institutions")

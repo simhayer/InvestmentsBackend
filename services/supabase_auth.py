@@ -1,7 +1,10 @@
 # services/supabase_auth.py
+import logging
 import os
 import time
 import httpx
+
+logger = logging.getLogger(__name__)
 from jose import jwt, JWTError
 from fastapi import HTTPException, Request, status
 from fastapi import Depends, HTTPException
@@ -38,7 +41,7 @@ async def get_current_supabase_user(request: Request) -> dict:
         )
         return payload
     except JWTError as e:
-        print(f"❌ JWTError: {e}")
+        logger.warning("JWTError: %s", e)
         raise HTTPException(status_code=401, detail=f"Invalid or expired token: {e}")
 
 def get_current_db_user(

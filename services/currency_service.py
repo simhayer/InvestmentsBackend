@@ -1,8 +1,11 @@
+import logging
 from typing import List, Dict, Optional
 from sqlalchemy.orm import Session
 from models.user import User
 import time
 import httpx
+
+logger = logging.getLogger(__name__)
 
 def infer_base_currency_from_holdings(plaid_holdings: List[Dict]) -> str:
     """
@@ -74,23 +77,23 @@ async def get_usd_to_cad_rate() -> float:
             r.raise_for_status()
             data = r.json()
     except Exception as e:
-        print("⚠️ FX fetch failed, defaulting to 1.0:", e)
+        logger.warning("FX fetch failed, defaulting to 1.0: %s", e)
         return 1.0
     try:
         rate = data.get("rates", {}).get("CAD")
         if rate is None:
-            print("⚠️ FX fetch failed, defaulting to 1.0: rate missing")
+            logger.warning("FX fetch failed, defaulting to 1.0: rate missing")
             return 1.0
 
         rate_f = float(rate)
         if rate_f <= 0:
-            print("⚠️ FX fetch failed, defaulting to 1.0: invalid rate")
+            logger.warning("FX fetch failed, defaulting to 1.0: invalid rate")
             return 1.0
 
         _fx_cache = (rate_f, now + _FX_TTL_SEC)
         return rate_f
     except Exception as e:
-        print("⚠️ FX parse failed, defaulting to 1.0:", e)
+        logger.warning("FX parse failed, defaulting to 1.0: %s", e)
         return 1.0
     
 def resolve_currency(user: User, currency_query: str | None) -> str:

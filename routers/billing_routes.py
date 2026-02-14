@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import logging
 import os
 from datetime import datetime, timezone
+
+logger = logging.getLogger(__name__)
 from typing import Literal, Optional
 
 import stripe
@@ -93,7 +96,8 @@ def create_checkout_session(
         )
         return {"url": session["url"]}
     except Exception as e:
-        raise HTTPException(400, detail=str(e))
+        logger.exception("Stripe checkout session creation failed")
+        raise HTTPException(400, detail="Could not create checkout session")
 
 
 class PortalOut(BaseModel):
@@ -137,6 +141,45 @@ def get_my_subscription(
     )
 
 
+class UsageLimitItem(BaseModel):
+    feature: str
+    used: int
+    limit: int  # -1 = unlimited
+
+
+class UsageOut(BaseModel):
+    plan: str
+    usage: list[UsageLimitItem]
+
+
+FEATURES = [
+    "portfolio_full_analysis",
+    "portfolio_inline",
+    "symbol_full_analysis",
+    "symbol_inline",
+    "crypto_full_analysis",
+    "crypto_inline",
+]
+
+
+@router.get("/usage", response_model=UsageOut)
+def get_my_usage(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_db_user),
+):
+    from services.tier import get_user_plan, get_usage, get_limit
+
+    plan = get_user_plan(user, db)
+    items = []
+    for feat in FEATURES:
+        items.append(UsageLimitItem(
+            feature=feat,
+            used=get_usage(user.id, feat, plan),
+            limit=get_limit(plan, feat),
+        ))
+    return UsageOut(plan=plan, usage=items)
+
+
 # Webhook: no auth
 @router.post("/webhook")
 async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
@@ -151,7 +194,8 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
     try:
         event = stripe.Webhook.construct_event(payload, sig, WEBHOOK_SECRET)
     except Exception as e:
-        raise HTTPException(400, detail=str(e))
+        logger.exception("Stripe webhook signature verification failed")
+        raise HTTPException(400, detail="Invalid webhook signature")
 
     if event["type"] in (
         "customer.subscription.created",
@@ -176,9 +220,9 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
         elif price_id == PRICE_PRO:
             plan = "pro"
 
-        print("SUB EVENT customer_id:", customer_id)
+        logger.info("SUB EVENT customer_id: %s", customer_id)
         row = db.query(UserSubscription).filter_by(stripe_customer_id=customer_id).first()
-        print("DB lookup found:", bool(row))
+        logger.info("DB lookup found: %s", bool(row))
         
         if row:
             row.stripe_subscription_id = stripe_sub_id

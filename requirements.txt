@@ -2,10 +2,13 @@ fastapi==0.121.0
 finnhub-python==2.4.25
 google-genai
 httpx==0.28.1
+httpx[http2]==0.28.1
+pandas>=2.2.0
 plaid-python==37.1.0
 pydantic==2.12.4
 python-dotenv==1.2.1
 redis==7.0.1
+requests>=2.31.0
 SQLAlchemy==2.0.44
 yahooquery==2.4.1
 stripe==14.1.0
@@ -13,3 +16,9 @@ psycopg2-binary==2.9.11
 python-jose==3.5.0
 pgvector==0.4.2
 sec-parser==0.58.1
+openai==2.15.0
+langchain-openai==1.1.7
+uvicorn[standard]==0.30.6
+google-genai==1.62.0
+slowapi==0.1.9
+alembic==1.18.4

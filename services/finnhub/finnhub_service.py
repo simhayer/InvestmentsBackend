@@ -1,7 +1,10 @@
 # services/finnhub_service.py
 from __future__ import annotations
 import asyncio
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -389,6 +392,7 @@ class FinnhubService:
                     if isinstance(item, dict) and item.get("symbol") and item.get("description")
                 ]
             except Exception:
+                logger.warning("search_symbols failed for q=%s", q)
                 return []
 
     async def fetch_quote(self, symbol: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
@@ -401,6 +405,7 @@ class FinnhubService:
                 r.raise_for_status()
                 return safe_json(r) or {}
             except Exception:
+                logger.warning("fetch_quote failed for %s", sym)
                 return {}
 
     async def fetch_profile(self, symbol: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
@@ -413,6 +418,7 @@ class FinnhubService:
                 r.raise_for_status()
                 return safe_json(r) or {}
             except Exception:
+                logger.warning("fetch_profile failed for %s", sym)
                 return {}
 
     async def fetch_basic_financials(self, symbol: str, client: Optional[httpx.AsyncClient] = None) -> Dict[str, Any]:
@@ -429,6 +435,7 @@ class FinnhubService:
                 r.raise_for_status()
                 return safe_json(r) or {}
             except Exception:
+                logger.warning("fetch_basic_financials failed for %s", sym)
                 return {}
 
     async def fetch_earnings(
@@ -452,6 +459,7 @@ class FinnhubService:
                 data = safe_json(r)
                 return data if isinstance(data, list) else []
             except Exception:
+                logger.warning("fetch_earnings failed for %s", sym)
                 return []
 
     async def fetch_prices_for_symbols(
@@ -526,6 +534,7 @@ class FinnhubService:
                 r.raise_for_status()
                 return safe_json(r) or {}
             except Exception:
+                logger.warning("fetch_earnings_calendar failed")
                 return {}
             
 # todo, use the grouping in the future
@@ -556,7 +565,7 @@ class FinnhubService:
                 data = r.json()  # peers endpoint returns a list
                 if not isinstance(data, list):
                     return []
-                print(f"fetch_peers: raw data for {sym}: {data}")
+                logger.debug("fetch_peers: raw data for %s: %s", sym, data)
                 if not isinstance(data, list):
                     return []
 
@@ -571,10 +580,9 @@ class FinnhubService:
                     seen.add(p)
                     out.append(p)
 
-                print('fetched peers:', out)
+                logger.debug("fetched peers: %s", out)
                 return out
 
             except Exception as e:
-                # better than print; swap to logger if you have it
-                print(f"fetch_peers failed for {sym}: {e}")
+                logger.exception("fetch_peers failed for %s", sym)
                 return []
