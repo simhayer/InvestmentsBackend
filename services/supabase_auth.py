@@ -9,6 +9,7 @@ from jose import jwt, JWTError
 from fastapi import HTTPException, Request, status
 from fastapi import Depends, HTTPException
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import DBAPIError
 from models.user import User
 from database import get_db
 
@@ -52,12 +53,19 @@ def get_current_db_user(
     if not supabase_user_id:
         raise HTTPException(status_code=401, detail="Invalid auth token")
 
-    # 2) Try to find existing local user
-    user = (
-        db.query(User)
-        .filter(User.supabase_user_id == str(supabase_user_id))
-        .first()
-    )
+    # 2) Try to find existing local user. Retry once on transient DB disconnect.
+    def _query_user() -> User | None:
+        return (
+            db.query(User)
+            .filter(User.supabase_user_id == str(supabase_user_id))
+            .first()
+        )
+
+    try:
+        user = _query_user()
+    except DBAPIError:
+        db.rollback()
+        user = _query_user()
     if user:
         return user
 
@@ -79,8 +87,14 @@ def get_current_db_user(
         # hashed_password intentionally omitted (Supabase manages auth)
     )
 
-    db.add(user)
-    db.commit()
-    db.refresh(user)
+    try:
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    except DBAPIError:
+        db.rollback()
+        db.add(user)
+        db.commit()
+        db.refresh(user)
 
     return user
