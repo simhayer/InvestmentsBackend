@@ -62,21 +62,33 @@ class GeminiStreamClient:
             return lvl if lvl in ("LOW", "MEDIUM", "HIGH") else "MEDIUM"
         return lvl if lvl in ("LOW", "HIGH") else "HIGH"
 
+    @staticmethod
+    def _model_supports_thinking(model: str) -> bool:
+        """Only Gemini 3.x and 2.5+ models support thinking_level."""
+        m = (model or "").lower()
+        if "lite" in m:
+            return False
+        if "gemini-3" in m or "gemini-2.5" in m:
+            return True
+        return False
+
     def _build_config(self, *, use_web: bool, model: Optional[str] = None):
         from google.genai import types
 
+        resolved_model = model or self.config.model
         tools = [types.Tool(googleSearch=types.GoogleSearch())] if use_web else None
         thinking_config = None
-        try:
-            fields = set(getattr(types.ThinkingConfig, "model_fields", {}).keys())
-            normalized = self._normalize_thinking(model or self.config.model, self.config.thinking_level)
-            if "thinking_level" in fields:
-                thinking_config = types.ThinkingConfig(thinking_level=normalized)
-            elif "include_thoughts" in fields:
-                # Newer SDK versions replaced level controls with a boolean switch.
-                thinking_config = types.ThinkingConfig(include_thoughts=(normalized != "LOW"))
-        except Exception:
-            thinking_config = None
+
+        if self._model_supports_thinking(resolved_model):
+            try:
+                fields = set(getattr(types.ThinkingConfig, "model_fields", {}).keys())
+                normalized = self._normalize_thinking(resolved_model, self.config.thinking_level)
+                if "thinking_level" in fields:
+                    thinking_config = types.ThinkingConfig(thinking_level=normalized)
+                elif "include_thoughts" in fields:
+                    thinking_config = types.ThinkingConfig(include_thoughts=(normalized != "LOW"))
+            except Exception:
+                thinking_config = None
 
         return types.GenerateContentConfig(
             thinking_config=thinking_config,
