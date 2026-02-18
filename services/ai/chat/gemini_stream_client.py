@@ -41,6 +41,8 @@ class GeminiConfig:
 class GeminiStreamClient:
     def __init__(self, config: Optional[GeminiConfig] = None):
         self.config = config or self._from_env()
+        from google import genai
+        self._client = genai.Client(api_key=self.config.api_key)
 
     def _from_env(self) -> GeminiConfig:
         api_key = os.getenv("GEMINI_API_KEY", "")
@@ -130,19 +132,50 @@ class GeminiStreamClient:
         use_web: bool,
         model_override: Optional[str] = None,
     ) -> str:
-        from google import genai
         from google.genai import types
 
-        client = genai.Client(api_key=self.config.api_key)
         model = model_override or self.config.model
         combined = f"{system_prompt}\n\n{user_prompt}"
         contents = [types.Content(role="user", parts=[types.Part.from_text(text=combined)])]
-        resp = client.models.generate_content(
+        resp = self._client.models.generate_content(
             model=model,
             contents=contents,
             config=self._build_config(use_web=use_web, model=model),
         )
         return getattr(resp, "text", None) or str(resp)
+
+    async def quick_generate(
+        self,
+        *,
+        system_prompt: str,
+        user_prompt: str,
+        model_override: Optional[str] = None,
+        timeout_s: float = 3.5,
+    ) -> str:
+        started = time.perf_counter()
+        chosen_model = model_override or self.config.model
+        _trace_info("gemini.quick.start model=%s prompt_len=%s", chosen_model, len(user_prompt or ""))
+        try:
+            text = await asyncio.wait_for(
+                asyncio.to_thread(
+                    self._sync_generate_text,
+                    system_prompt,
+                    user_prompt,
+                    False,
+                    chosen_model,
+                ),
+                timeout=timeout_s,
+            )
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            _trace_info("gemini.quick.done elapsed_ms=%s chars=%s", elapsed_ms, len(text or ""))
+            return (text or "").strip()
+        except asyncio.TimeoutError:
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            _trace_warning("gemini.quick.timeout elapsed_ms=%s", elapsed_ms)
+            return ""
+        except Exception:
+            _trace_exception("gemini.quick.error")
+            return ""
 
     async def stream_answer(
         self,
@@ -164,15 +197,13 @@ class GeminiStreamClient:
         worker_state: Dict[str, Any] = {"error": None, "chunks_emitted": 0}
 
         def _worker() -> None:
-            from google import genai
             from google.genai import types
 
-            client = genai.Client(api_key=self.config.api_key)
             combined = f"{system_prompt}\n\n{user_prompt}"
             contents = [types.Content(role="user", parts=[types.Part.from_text(text=combined)])]
             for attempt in (1, 2):
                 try:
-                    stream = client.models.generate_content_stream(
+                    stream = self._client.models.generate_content_stream(
                         model=self.config.model,
                         contents=contents,
                         config=self._build_config(use_web=use_web),

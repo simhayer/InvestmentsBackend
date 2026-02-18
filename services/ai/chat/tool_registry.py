@@ -80,6 +80,27 @@ ALL_TOOL_NAMES = {
     "compare_symbols",
 }
 
+TOOL_TIMEOUTS: Dict[str, float] = {
+    "get_quote": 10.0,
+    "get_company_profile": 10.0,
+    "get_basic_financials": 10.0,
+    "get_peers": 10.0,
+    "get_portfolio_overview": 12.0,
+    "get_portfolio_position": 12.0,
+    "get_symbol_analysis": 35.0,
+    "get_portfolio_analysis": 50.0,
+    "get_risk_metrics": 18.0,
+    "get_portfolio_risk": 25.0,
+    "compare_symbols": 15.0,
+}
+
+DEFAULT_TOOL_TIMEOUT = 15.0
+
+TOOL_FALLBACKS: Dict[str, List[str]] = {
+    "get_symbol_analysis": ["get_quote", "get_basic_financials"],
+    "get_portfolio_analysis": ["get_portfolio_overview"],
+}
+
 
 class ChatToolRegistry:
     """Unified tool executor for the chat agent.

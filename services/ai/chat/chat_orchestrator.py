@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
@@ -22,11 +23,14 @@ from services.ai.chat.chat_models import ChatRequest, format_sse
 from services.ai.chat.context_assembler import build_system_prompt, build_context_text
 from services.ai.chat.gemini_stream_client import GeminiStreamClient
 from services.ai.chat.intent_parser import IntentParser
-from services.ai.chat.tool_registry import ChatToolRegistry
+from services.ai.chat.tool_registry import ChatToolRegistry, TOOL_TIMEOUTS, TOOL_FALLBACKS
 
 logger = logging.getLogger(__name__)
 
 DisconnectFn = Callable[[], Awaitable[bool]]
+
+_DIRECT_TOOL_INTENTS = {"portfolio_lookup"}
+_SINGLE_TOOL_INTENTS = {"quote_lookup", "company_profile", "fundamentals"}
 
 
 def _trace_info(msg: str, *args: Any) -> None:
@@ -51,10 +55,11 @@ class ChatOrchestrator:
         db: Optional[Session] = None,
         user_id: Optional[int] = None,
         max_tool_rounds: int = 5,
-        decision_timeout_s: float = 2.5,
+        decision_timeout_s: float = 4.0,
         tool_timeout_s: float = 15.0,
     ):
         self.gemini = gemini_client or GeminiStreamClient()
+        self._small_talk_model = os.getenv("GEMINI_SMALL_TALK_MODEL") or self.gemini.config.model
         self.tools = tools
         self.intent_parser = intent_parser or IntentParser(
             self.gemini, timeout_s=decision_timeout_s
@@ -87,11 +92,61 @@ class ChatOrchestrator:
         except Exception:
             return False
 
-    def _small_talk_response(self) -> str:
-        return (
-            "I can help with stock/crypto questions, portfolio analysis, and market updates. "
-            "Tell me what you want to analyze."
+    _SMALL_TALK_FALLBACK = (
+        "I can help with stock/crypto questions, portfolio analysis, and market updates. "
+        "Tell me what you want to analyze."
+    )
+
+    async def _small_talk_response(self, last_user: str) -> str:
+        from services.ai.chat.chat_prompts import SMALL_TALK_SYSTEM_PROMPT
+
+        text = await self.gemini.quick_generate(
+            system_prompt=SMALL_TALK_SYSTEM_PROMPT,
+            user_prompt=last_user,
+            model_override=self._small_talk_model,
         )
+        return text or self._SMALL_TALK_FALLBACK
+
+    async def _run_fallback_tools(
+        self,
+        failed_tool: str,
+        arguments: Dict[str, Any],
+        failed_tools: set,
+        req_id: str,
+    ) -> List[Any]:
+        """Run lighter Tier-1 tools in parallel when a heavy tool fails."""
+        fallback_names = TOOL_FALLBACKS.get(failed_tool, [])
+        to_run = [n for n in fallback_names if n not in failed_tools]
+        if not to_run or not self.tools:
+            return []
+        _trace_info(
+            "chat.fallback_start req_id=%s failed_tool=%s fallbacks=%s",
+            req_id, failed_tool, to_run,
+        )
+
+        async def _one(name: str):
+            timeout = TOOL_TIMEOUTS.get(name, self.tool_timeout_s)
+            return await asyncio.wait_for(
+                self.tools.execute(name, arguments), timeout=timeout,
+            )
+
+        raw = await asyncio.gather(
+            *[_one(n) for n in to_run], return_exceptions=True,
+        )
+        results = []
+        for fb_name, res in zip(to_run, raw):
+            if isinstance(res, Exception):
+                _trace_info(
+                    "chat.fallback_error req_id=%s tool=%s err=%s",
+                    req_id, fb_name, type(res).__name__,
+                )
+                continue
+            _trace_info(
+                "chat.fallback_ok req_id=%s tool=%s ok=%s",
+                req_id, fb_name, res.ok,
+            )
+            results.append(res)
+        return results
 
     # ── main SSE stream ─────────────────────────────────────────────
 
@@ -116,30 +171,14 @@ class ChatOrchestrator:
         )
 
         try:
-            # ── Step 1: Build system prompt with page context + investor profile ──
+            # ── Steps 1-3: Context + intent in parallel ──
             step_start = time.perf_counter()
-            if self._db and self._user_id:
-                system_prompt = build_system_prompt(
-                    db=self._db,
-                    user_id=self._user_id,
-                    req=req,
-                )
-            else:
-                from services.ai.chat.chat_prompts import build_finance_system_prompt
-                system_prompt = build_finance_system_prompt()
-
             conversation_text = self._conversation_text(req)
             context_text = build_context_text(req)
+            last_user = self._last_user_message(req)
             computed_allow_web = req.allow_web_search
-            _trace_info(
-                "chat.context_ready req_id=%s elapsed_ms=%s convo_chars=%s ctx_chars=%s",
-                req_id,
-                int((time.perf_counter() - step_start) * 1000),
-                len(conversation_text),
-                len(context_text),
-            )
 
-            # ── Step 2: Page acknowledgment ──
+            # Page acknowledgment (immediate, no LLM needed)
             page = req.context.page if req.context else None
             if page:
                 ack_text = f"Looking at {page.page_type} page"
@@ -151,24 +190,38 @@ class ChatOrchestrator:
                 )
                 _trace_info("chat.page_ack req_id=%s text=%s", req_id, ack_text)
 
-            # ── Step 3: Intent classification ──
             yield format_sse(
                 "meta",
                 {"request_id": req_id, "policy_mode": "llm_router"},
             )
 
-            step_start = time.perf_counter()
-            last_user = self._last_user_message(req)
-            decision = await self.intent_parser.parse(
-                conversation_text=conversation_text,
-                context_text=context_text,
-                last_user=last_user,
-                request_id=req_id,
+            # Build system prompt (DB query) and parse intent (LLM call) concurrently
+            async def _build_prompt() -> str:
+                if self._db and self._user_id:
+                    return await asyncio.to_thread(
+                        build_system_prompt,
+                        db=self._db,
+                        user_id=self._user_id,
+                        req=req,
+                    )
+                from services.ai.chat.chat_prompts import build_finance_system_prompt
+                return build_finance_system_prompt()
+
+            system_prompt, decision = await asyncio.gather(
+                _build_prompt(),
+                self.intent_parser.parse(
+                    conversation_text=conversation_text,
+                    context_text=context_text,
+                    last_user=last_user,
+                    request_id=req_id,
+                ),
             )
             _trace_info(
-                "chat.intent_ready req_id=%s elapsed_ms=%s intent=%s action=%s tool=%s use_web=%s",
+                "chat.context_and_intent_ready req_id=%s elapsed_ms=%s convo_chars=%s ctx_chars=%s intent=%s action=%s tool=%s use_web=%s",
                 req_id,
                 int((time.perf_counter() - step_start) * 1000),
+                len(conversation_text),
+                len(context_text),
                 decision.intent,
                 decision.action,
                 decision.tool_name,
@@ -176,7 +229,7 @@ class ChatOrchestrator:
             )
 
             # Guardrail: portfolio-intent queries should fetch portfolio data
-            if decision.intent in {"portfolio_guidance", "portfolio_analysis"} and decision.action != "tool":
+            if decision.intent in {"portfolio_lookup", "portfolio_guidance", "portfolio_analysis"} and decision.action != "tool":
                 preferred_currency = None
                 if req.context and req.context.preferred_currency:
                     preferred_currency = req.context.preferred_currency.strip().upper()
@@ -191,10 +244,10 @@ class ChatOrchestrator:
                     "chat.portfolio_guardrail req_id=%s tool=%s", req_id, decision.tool_name
                 )
 
-            # Fast path: small-talk
+            # Fast path: small-talk (dynamic via lite model)
             if decision.intent == "small_talk":
-                _trace_info("chat.small_talk_fast_path req_id=%s", req_id)
-                quick = self._small_talk_response()
+                _trace_info("chat.small_talk_fast_path req_id=%s model=%s", req_id, self._small_talk_model)
+                quick = await self._small_talk_response(last_user)
                 yield format_sse("heartbeat", {"request_id": req_id})
                 yield format_sse("token", {"request_id": req_id, "text": quick})
                 elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -283,15 +336,16 @@ class ChatOrchestrator:
                 )
                 _trace_info("chat.tool_call_sent req_id=%s tool=%s", req_id, tool_name)
 
-                # Execute tool
+                # Execute tool (per-tool timeout respects Tier-2 analysis latency)
                 step_start = time.perf_counter()
+                effective_timeout = TOOL_TIMEOUTS.get(tool_name, self.tool_timeout_s)
                 try:
                     tool_result = await asyncio.wait_for(
                         self.tools.execute(str(tool_name), arguments),
-                        timeout=self.tool_timeout_s,
+                        timeout=effective_timeout,
                     )
                 except asyncio.TimeoutError:
-                    _trace_info("chat.tool_timeout req_id=%s tool=%s", req_id, tool_name)
+                    _trace_info("chat.tool_timeout req_id=%s tool=%s timeout_s=%.1f", req_id, tool_name, effective_timeout)
                     failed_tools.add(tool_name)
                     tool_result_dict = {
                         "ok": False,
@@ -305,6 +359,24 @@ class ChatOrchestrator:
                         "tool_result",
                         {"request_id": req_id, **tool_result_dict},
                     )
+
+                    # Run lighter fallback tools so the LLM has partial data
+                    for fb_res in await self._run_fallback_tools(
+                        tool_name, arguments, failed_tools, req_id,
+                    ):
+                        fb_dict = fb_res.model_dump()
+                        tool_results.append(fb_dict)
+                        yield format_sse(
+                            "tool_result",
+                            {
+                                "request_id": req_id,
+                                "tool_name": fb_res.tool_name,
+                                "ok": fb_res.ok,
+                                "data": fb_res.data,
+                                "data_gaps": fb_res.data_gaps,
+                                "error": fb_res.error,
+                            },
+                        )
                     break
 
                 _trace_info(
@@ -317,6 +389,22 @@ class ChatOrchestrator:
 
                 if not tool_result.ok:
                     failed_tools.add(tool_name)
+                    for fb_res in await self._run_fallback_tools(
+                        tool_name, arguments, failed_tools, req_id,
+                    ):
+                        fb_dict = fb_res.model_dump()
+                        tool_results.append(fb_dict)
+                        yield format_sse(
+                            "tool_result",
+                            {
+                                "request_id": req_id,
+                                "tool_name": fb_res.tool_name,
+                                "ok": fb_res.ok,
+                                "data": fb_res.data,
+                                "data_gaps": fb_res.data_gaps,
+                                "error": fb_res.error,
+                            },
+                        )
 
                 result_dict = tool_result.model_dump()
                 tool_results.append(result_dict)
@@ -332,6 +420,14 @@ class ChatOrchestrator:
                         "error": tool_result.error,
                     },
                 )
+
+                # Single-tool and direct-tool intents: skip the replan LLM call
+                if tool_result.ok and decision.intent in (_DIRECT_TOOL_INTENTS | _SINGLE_TOOL_INTENTS):
+                    _trace_info(
+                        "chat.replan_skip req_id=%s reason=single_tool_intent intent=%s",
+                        req_id, decision.intent,
+                    )
+                    break
 
                 # Re-plan: ask the intent parser if we need another tool
                 if rounds < self.max_tool_rounds:
@@ -360,6 +456,12 @@ class ChatOrchestrator:
             if await self._safe_is_disconnected(is_disconnected):
                 _trace_info("chat.disconnect req_id=%s before_stream", req_id)
                 return
+
+            # Direct-tool intents get a focused prompt that avoids unsolicited analysis
+            if decision.intent in _DIRECT_TOOL_INTENTS:
+                from services.ai.chat.chat_prompts import DIRECT_TOOL_ANSWER_PROMPT
+                system_prompt = DIRECT_TOOL_ANSWER_PROMPT
+                computed_allow_web = False
 
             tool_payload_str = json.dumps(tool_results, ensure_ascii=True, default=str) if tool_results else "{}"
 
