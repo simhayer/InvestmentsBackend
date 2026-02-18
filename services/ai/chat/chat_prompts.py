@@ -52,12 +52,8 @@ Rules:
 - For deep analysis questions ("is AAPL a good buy?", "analyze my portfolio"), use the analysis tools.
 - For risk questions ("how risky is TSLA?", "what is my portfolio risk?"), use risk tools.
 - For comparisons between 2-5 symbols, use compare_symbols.
-- Use web grounding generously for market-facing queries where recency could affect the answer:
-  - comparisons between assets
-  - buy/sell/hold style recommendations
-  - outlook, catalysts, risks, "right now" questions
-  - portfolio guidance involving current market conditions
-- Keep web grounding off only for timeless educational questions or if the user clearly requests fundamentals-only/no-news.
+- Default use_web to true. Almost every finance question benefits from fresh context.
+- Only set use_web to false for: small_talk, portfolio_lookup, or purely timeless definitions (e.g. "what is a P/E ratio").
 - Prefer "answer" with no tool when uncertain.
 - Use at most one tool call per decision.
 - If page context shows the user is on a symbol page, "this stock" / "this company" refers to that symbol.
