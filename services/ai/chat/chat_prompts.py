@@ -37,6 +37,7 @@ Intent labels:
 - fundamentals
 - peer_comparison
 - macro_news
+- portfolio_lookup
 - portfolio_guidance
 - portfolio_analysis
 - symbol_analysis
@@ -46,7 +47,8 @@ Intent labels:
 Rules:
 - Multiple tool types are available (market data, analysis, risk, comparison).
 - Use a real-time data tool for symbol-specific factual lookup.
-- For portfolio-focused questions about the user's own holdings/performance (e.g., "my portfolio", "my holdings", "how am I doing"), prefer portfolio tools over a generic answer.
+- For simple portfolio questions (what stocks do I own, show holdings, my positions, list my portfolio) use portfolio_lookup with get_portfolio_overview. Reserve portfolio_analysis/portfolio_guidance for deeper questions about health, diversification, or strategy.
+- For portfolio-focused questions about the user's own holdings/performance (e.g., "how am I doing", "how is my portfolio"), prefer portfolio tools over a generic answer.
 - For deep analysis questions ("is AAPL a good buy?", "analyze my portfolio"), use the analysis tools.
 - For risk questions ("how risky is TSLA?", "what is my portfolio risk?"), use risk tools.
 - For comparisons between 2-5 symbols, use compare_symbols.
@@ -62,7 +64,7 @@ Rules:
 
 Return ONLY JSON:
 {
-  "intent": "small_talk" | "quote_lookup" | "company_profile" | "fundamentals" | "peer_comparison" | "macro_news" | "portfolio_guidance" | "portfolio_analysis" | "symbol_analysis" | "risk_analysis" | "general_finance",
+  "intent": "small_talk" | "quote_lookup" | "company_profile" | "fundamentals" | "peer_comparison" | "macro_news" | "portfolio_lookup" | "portfolio_guidance" | "portfolio_analysis" | "symbol_analysis" | "risk_analysis" | "general_finance",
   "use_web": true | false,
   "action": "tool" | "answer",
   "tool_name": "<tool_name>" | null,
@@ -70,6 +72,17 @@ Return ONLY JSON:
   "reason": "short reason"
 }
 """
+
+
+SMALL_TALK_SYSTEM_PROMPT = """You are a friendly, witty finance assistant named WealthStreet AI.
+Respond naturally and conversationally to the user's casual message.
+Subtly mention one capability you have (stocks, portfolio analysis, market data, risk analysis).
+Keep it to 1-2 sentences. Be warm but not corny. Vary your responses."""
+
+DIRECT_TOOL_ANSWER_PROMPT = """Present the tool data clearly and concisely.
+- Format holdings as a readable list with key numbers (value, weight, P/L).
+- Do NOT add risk analysis, diversification advice, or recommendations unless the user explicitly asked for them.
+- If the user asked a simple factual question, give a simple factual answer."""
 
 
 def build_finance_system_prompt() -> str:

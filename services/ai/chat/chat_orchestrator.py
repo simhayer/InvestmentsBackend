@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import time
 from typing import Any, AsyncIterator, Awaitable, Callable, Dict, List, Optional
 
@@ -27,6 +28,8 @@ from services.ai.chat.tool_registry import ChatToolRegistry
 logger = logging.getLogger(__name__)
 
 DisconnectFn = Callable[[], Awaitable[bool]]
+
+_DIRECT_TOOL_INTENTS = {"portfolio_lookup"}
 
 
 def _trace_info(msg: str, *args: Any) -> None:
@@ -55,6 +58,7 @@ class ChatOrchestrator:
         tool_timeout_s: float = 15.0,
     ):
         self.gemini = gemini_client or GeminiStreamClient()
+        self._small_talk_model = os.getenv("GEMINI_SMALL_TALK_MODEL") or self.gemini.config.model
         self.tools = tools
         self.intent_parser = intent_parser or IntentParser(
             self.gemini, timeout_s=decision_timeout_s
@@ -87,11 +91,20 @@ class ChatOrchestrator:
         except Exception:
             return False
 
-    def _small_talk_response(self) -> str:
-        return (
-            "I can help with stock/crypto questions, portfolio analysis, and market updates. "
-            "Tell me what you want to analyze."
+    _SMALL_TALK_FALLBACK = (
+        "I can help with stock/crypto questions, portfolio analysis, and market updates. "
+        "Tell me what you want to analyze."
+    )
+
+    async def _small_talk_response(self, last_user: str) -> str:
+        from services.ai.chat.chat_prompts import SMALL_TALK_SYSTEM_PROMPT
+
+        text = await self.gemini.quick_generate(
+            system_prompt=SMALL_TALK_SYSTEM_PROMPT,
+            user_prompt=last_user,
+            model_override=self._small_talk_model,
         )
+        return text or self._SMALL_TALK_FALLBACK
 
     # ── main SSE stream ─────────────────────────────────────────────
 
@@ -176,7 +189,7 @@ class ChatOrchestrator:
             )
 
             # Guardrail: portfolio-intent queries should fetch portfolio data
-            if decision.intent in {"portfolio_guidance", "portfolio_analysis"} and decision.action != "tool":
+            if decision.intent in {"portfolio_lookup", "portfolio_guidance", "portfolio_analysis"} and decision.action != "tool":
                 preferred_currency = None
                 if req.context and req.context.preferred_currency:
                     preferred_currency = req.context.preferred_currency.strip().upper()
@@ -191,10 +204,10 @@ class ChatOrchestrator:
                     "chat.portfolio_guardrail req_id=%s tool=%s", req_id, decision.tool_name
                 )
 
-            # Fast path: small-talk
+            # Fast path: small-talk (dynamic via lite model)
             if decision.intent == "small_talk":
-                _trace_info("chat.small_talk_fast_path req_id=%s", req_id)
-                quick = self._small_talk_response()
+                _trace_info("chat.small_talk_fast_path req_id=%s model=%s", req_id, self._small_talk_model)
+                quick = await self._small_talk_response(last_user)
                 yield format_sse("heartbeat", {"request_id": req_id})
                 yield format_sse("token", {"request_id": req_id, "text": quick})
                 elapsed_ms = int((time.perf_counter() - start) * 1000)
@@ -333,6 +346,14 @@ class ChatOrchestrator:
                     },
                 )
 
+                # Direct-tool intents: one tool call is enough, skip replan
+                if decision.intent in _DIRECT_TOOL_INTENTS and tool_result.ok:
+                    _trace_info(
+                        "chat.replan_skip req_id=%s reason=direct_tool_intent intent=%s",
+                        req_id, decision.intent,
+                    )
+                    break
+
                 # Re-plan: ask the intent parser if we need another tool
                 if rounds < self.max_tool_rounds:
                     tool_ctx = json.dumps(tool_results, ensure_ascii=True, default=str)
@@ -360,6 +381,12 @@ class ChatOrchestrator:
             if await self._safe_is_disconnected(is_disconnected):
                 _trace_info("chat.disconnect req_id=%s before_stream", req_id)
                 return
+
+            # Direct-tool intents get a focused prompt that avoids unsolicited analysis
+            if decision.intent in _DIRECT_TOOL_INTENTS:
+                from services.ai.chat.chat_prompts import DIRECT_TOOL_ANSWER_PROMPT
+                system_prompt = DIRECT_TOOL_ANSWER_PROMPT
+                computed_allow_web = False
 
             tool_payload_str = json.dumps(tool_results, ensure_ascii=True, default=str) if tool_results else "{}"
 
