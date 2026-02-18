@@ -14,7 +14,7 @@ from plaid.model.investments_holdings_get_request import InvestmentsHoldingsGetR
 from pydantic import BaseModel
 from models.holding import Holding
 from typing import List, Dict
-from services.plaid.plaid_service import get_connections
+from services.plaid.plaid_service import get_connections, remove_connection
 from utils.common_helpers import safe_div, num
 from models.user import User
 from services.supabase_auth import get_current_db_user
@@ -328,3 +328,19 @@ async def get_connected_institutions(
     except Exception as e:
         logger.exception("Error fetching institutions")
         raise HTTPException(status_code=500, detail="Failed to fetch institutions")
+
+
+@router.delete("/institutions/{connection_id}")
+async def delete_connection(
+    connection_id: str,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_db_user),
+):
+    try:
+        remove_connection(connection_id, str(user.id), db)
+        return {"detail": "Connection removed"}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception:
+        logger.exception("Error removing connection %s", connection_id)
+        raise HTTPException(status_code=500, detail="Failed to remove connection")
