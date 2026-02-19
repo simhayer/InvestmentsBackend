@@ -140,14 +140,12 @@ GeminiThinking = Literal["LOW", "MEDIUM", "HIGH"]
 class GeminiClient:
     def __init__(
         self,
-        api_key: str,
         model: str,
         *,
         use_web: bool = True,
         thinking_level: GeminiThinking = "HIGH",
         temperature: float = 0.3,
     ):
-        self.api_key = api_key
         self.model = model
         self.use_web = use_web
         self.thinking_level = thinking_level
@@ -172,30 +170,56 @@ class GeminiClient:
     def _sync_call(self, system: str, user: str) -> str:
         from google import genai
         from google.genai import types
+        import os
 
-        client = genai.Client(api_key=self.api_key)
+        client = genai.Client(
+            vertexai=True,
+            project=os.getenv("GCP_PROJECT_ID"),
+            location="us-central1",  # important
+        )
 
         combined = f"{system}\n\n{user}"
-        contents = [types.Content(role="user", parts=[types.Part.from_text(text=combined)])]
+        contents = [
+            types.Content(
+                role="user",
+                parts=[types.Part.from_text(text=combined)]
+            )
+        ]
 
         tools = None
         if self.use_web:
             tools = [types.Tool(googleSearch=types.GoogleSearch())]
 
         config = types.GenerateContentConfig(
-            thinking_config=types.ThinkingConfig(thinking_level=self._normalize_thinking()),
+            thinking_config=types.ThinkingConfig(
+                thinking_level=self._normalize_thinking()
+            ),
             tools=tools,
             temperature=self.temperature,
         )
 
-        resp = client.models.generate_content(
-            model=self.model,
-            contents=contents,
-            config=config,
-        )
+        try:
+            resp = client.models.generate_content(
+                model=self.model,
+                contents=contents,
+                config=config,
+            )
+        except Exception as e:
+            if "thinking_level" in str(e):
+                config = types.GenerateContentConfig(
+                    tools=tools,
+                    temperature=self.temperature,
+                )
+                resp = client.models.generate_content(
+                    model=self.model,
+                    contents=contents,
+                    config=config,
+                )
+            else:
+                raise
 
-        text = getattr(resp, "text", None)
-        return text if text else str(resp)
+        return resp.text if getattr(resp, "text", None) else str(resp)
+
 
 
 class CloudLLMClient:
@@ -261,14 +285,11 @@ class LLMService:
                 timeout_s=cfg.cloud_timeout_s,
             )
 
-        # default: gemini
-        if not cfg.gemini_api_key:
-            raise ValueError("Missing GEMINI_API_KEY")
+        # default: gemini (Vertex AI — authenticates via GOOGLE_APPLICATION_CREDENTIALS)
         return GeminiClient(
-            api_key=cfg.gemini_api_key,
             model=cfg.gemini_model,
             use_web=cfg.gemini_use_web,
-            thinking_level=cfg.gemini_thinking_level,  # auto-normalized
+            thinking_level=cfg.gemini_thinking_level,
             temperature=cfg.temperature,
         )
 
