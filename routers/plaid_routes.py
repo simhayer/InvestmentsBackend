@@ -21,8 +21,8 @@ from services.supabase_auth import get_current_db_user
 from services.currency_service import maybe_auto_set_user_base_currency
 from services.plaid.plaid_config import client
 import logging
+
 logger = logging.getLogger(__name__)
-import traceback
 router = APIRouter()
 
 # ----------- LINK TOKEN ----------------
@@ -83,7 +83,7 @@ async def exchange_token(
         return {"access_token": access_token}
 
     except Exception as e:
-        logger.error("Token exchange failed:\n%s", traceback.format_exc())
+        logger.error("Token exchange failed error_type=%s", type(e).__name__)
         raise HTTPException(status_code=500, detail=f"Token exchange failed: {e}")
 
 
@@ -199,8 +199,8 @@ def sync_plaid_holdings(user_id: str, plaid_holdings: List[Dict], db: Session):
         # ID: support both camelCase and snake_case just in case
         sec_id = ph.get("externalId") or ph.get("external_id")
         if not sec_id:
-            # Don't crash on bad data, just skip and log
-            logger.warning("Skipping holding without externalId/external_id: %s", ph)
+            # Don't crash on bad data, just skip and log (do not log ph; may contain PII)
+            logger.warning("Skipping holding without externalId/external_id")
             continue
 
         seen_ids.add(sec_id)

@@ -220,7 +220,7 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
         elif price_id == PRICE_PRO:
             plan = "pro"
 
-        logger.info("SUB EVENT customer_id: %s", customer_id)
+        logger.info("Subscription event processed")
         row = db.query(UserSubscription).filter_by(stripe_customer_id=customer_id).first()
         logger.info("DB lookup found: %s", bool(row))
         

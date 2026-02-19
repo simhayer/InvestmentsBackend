@@ -3,6 +3,10 @@ import logging
 import os
 from dotenv import load_dotenv
 load_dotenv()
+
+from config.logging_config import configure_logging
+configure_logging()
+
 # if os.getenv("DEBUGPY", "0") == "1":
 #     import debugpy
 #     debugpy.listen(("0.0.0.0", 5678))
@@ -14,6 +18,7 @@ from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
 from middleware.rate_limit import limiter
+from middleware.request_logging import RequestLoggingMiddleware
 
 logger = logging.getLogger(__name__)
 from routers.user_routes import router as user_router
@@ -88,6 +93,7 @@ app.add_middleware(
     allow_headers=["*"],
     allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?$",
 )
+app.add_middleware(RequestLoggingMiddleware)
 
 # ─── Health check ────────────────────────────────────────────────
 @app.get("/health", tags=["ops"])

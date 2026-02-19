@@ -40,9 +40,9 @@ async def get_current_supabase_user(request: Request) -> dict:
             issuer=f"{SUPABASE_PROJECT_URL}/auth/v1",
         )
         return payload
-    except JWTError as e:
-        logger.warning("JWTError: %s", e)
-        raise HTTPException(status_code=401, detail=f"Invalid or expired token: {e}")
+    except JWTError:
+        logger.warning("JWT validation failed")
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
 
 def get_current_db_user(
     db: Session = Depends(get_db),
@@ -91,10 +91,12 @@ def get_current_db_user(
         db.add(user)
         db.commit()
         db.refresh(user)
+        logger.info("New user created")
     except DBAPIError:
         db.rollback()
         db.add(user)
         db.commit()
         db.refresh(user)
+        logger.info("New user created (after retry)")
 
     return user

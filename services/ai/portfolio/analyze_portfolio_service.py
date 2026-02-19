@@ -339,7 +339,6 @@ async def analyze_portfolio(
 
     Usage:
         result = await analyze_portfolio(user_id, db, finnhub)
-        logger.info("Portfolio analysis summary: %s", result["report"]["summary"])
     """
     from models.portfolio_analysis import PortfolioAnalysis
 
@@ -360,7 +359,7 @@ async def analyze_portfolio(
                 ).total_seconds() / 3600
 
                 if age_hours < PORTFOLIO_ANALYSIS_TTL_HOURS:
-                    logger.info(f"[Portfolio Analysis] cache hit for user {uid} (age {age_hours:.1f}h)")
+                    logger.info("[Portfolio Analysis] cache hit (age %.1fh)", age_hours)
                     cached_data = cached_row.data
                     cached_data["cached"] = True
                     cached_data["lastAnalyzedAt"] = cached_row.created_at.isoformat()
@@ -411,7 +410,7 @@ async def analyze_portfolio(
         try:
             from services.cache.cache_backend import cache_set
             cache_set(_inline_cache_key(user_id, currency), inline_dict, PORTFOLIO_INLINE_TTL_SEC)
-            logger.info(f"[Portfolio Inline] cached in Redis for user {user_id}")
+            logger.info("[Portfolio Inline] cached in Redis")
         except Exception as e:
             logger.warning(f"[Portfolio Inline] failed to cache in Redis: {e}")
 
@@ -431,7 +430,7 @@ async def analyze_portfolio(
             db.add(PortfolioAnalysis(user_id=uid, data=result, created_at=now))
 
         db.commit()
-        logger.info(f"[Portfolio Analysis] cached result for user {uid}")
+        logger.info("[Portfolio Analysis] cached result persisted")
     except Exception as e:
         logger.warning(f"[Portfolio Analysis] failed to persist cache: {e}")
         db.rollback()
@@ -465,7 +464,7 @@ async def get_portfolio_insights(
         try:
             cached = cache_get(cache_key)
             if cached and isinstance(cached, dict):
-                logger.info(f"[Portfolio Inline] Redis cache hit for user {user_id}")
+                logger.info("[Portfolio Inline] Redis cache hit")
                 return cached
         except Exception as e:
             logger.warning(f"[Portfolio Inline] Redis cache check failed: {e}")
@@ -488,7 +487,7 @@ async def get_portfolio_insights(
     # ── Store in Redis ─────────────────────────────────────────────
     try:
         cache_set(cache_key, inline_dict, PORTFOLIO_INLINE_TTL_SEC)
-        logger.info(f"[Portfolio Inline] cached in Redis for user {user_id}")
+        logger.info("[Portfolio Inline] cached in Redis")
     except Exception as e:
         logger.warning(f"[Portfolio Inline] failed to cache in Redis: {e}")
 
