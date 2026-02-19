@@ -27,3 +27,5 @@
 /__pycache__/
 .vercel
 .env*.local
+
+service_account.json
