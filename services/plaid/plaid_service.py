@@ -18,6 +18,7 @@ def get_connections(userId: str, db: Session) -> List[Dict]:
             "id": ua.id,
             "institution_name": ua.institution_name,
             "institution_id": ua.institution_id,
+            "status": ua.status or "connected",
             "created_at": ua.created_at.isoformat(),
             "synced_at": ua.synced_at.isoformat() if ua.synced_at else None,
         }

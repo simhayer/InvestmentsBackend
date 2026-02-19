@@ -13,6 +13,7 @@ class UserAccess(Base):
     item_id: Mapped[str] = mapped_column(nullable=True)
     institution_id: Mapped[str] = mapped_column(nullable=True)
     institution_name: Mapped[str] = mapped_column(nullable=True)
+    status: Mapped[str] = mapped_column(nullable=False, default="connected")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc))
     synced_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
 
