@@ -1,11 +1,21 @@
 # main.py
 import logging
 import os
+import json
+import tempfile
 from dotenv import load_dotenv
 load_dotenv()
+
+_sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+if _sa_json and not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+    _tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False)
+    _tmp.write(_sa_json)
+    _tmp.close()
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = _tmp.name
+
 # if os.getenv("DEBUGPY", "0") == "1":
 #     import debugpy
-#     debugpy.listen(("0.0.0.0", 5678))
+#     debugpy.listen(("0.0.0.0", 5678)
     
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
