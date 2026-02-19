@@ -1,29 +1,29 @@
-from datetime import datetime, timezone
+import logging
 import os
-from fastapi import APIRouter, HTTPException, Body
+import traceback
+
+from fastapi import APIRouter, Body, Depends, HTTPException, Request
+from plaid.model.country_code import CountryCode
+from plaid.model.item_public_token_exchange_request import ItemPublicTokenExchangeRequest
 from plaid.model.link_token_create_request import LinkTokenCreateRequest
 from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUser
 from plaid.model.products import Products
-from plaid.model.country_code import CountryCode
-from plaid.model.item_public_token_exchange_request import ItemPublicTokenExchangeRequest
+from pydantic import BaseModel
+from sqlalchemy.orm import Session
+from typing import List
+
 from database import get_db
 from models.access_token import UserAccess
-from sqlalchemy.orm import Session
-from fastapi import Depends
-from plaid.model.investments_holdings_get_request import InvestmentsHoldingsGetRequest
-from pydantic import BaseModel
-from models.holding import Holding
-from typing import List, Dict
-from services.plaid.plaid_service import get_connections, remove_connection
-from utils.common_helpers import safe_div, num
 from models.user import User
-from services.supabase_auth import get_current_db_user
-from services.currency_service import maybe_auto_set_user_base_currency
 from services.plaid.plaid_config import client
-import logging
+from services.plaid.plaid_service import get_connections, remove_connection
+from services.plaid.plaid_sync import sync_all_connections, sync_by_item_id
+from services.supabase_auth import get_current_db_user
+
 logger = logging.getLogger(__name__)
-import traceback
 router = APIRouter()
+
+PLAID_WEBHOOK_URL = os.getenv("PLAID_WEBHOOK_URL")
 
 # ----------- LINK TOKEN ----------------
 
@@ -31,13 +31,17 @@ router = APIRouter()
 async def create_link_token(user: User = Depends(get_current_db_user)):
 
     try:
-        request = LinkTokenCreateRequest(
+        kwargs = dict(
             products=[Products("investments")],
             client_name="Investment Tracker",
             country_codes=[CountryCode("US"), CountryCode("CA")],
             language="en",
-            user=LinkTokenCreateRequestUser(client_user_id=str(user.id))
+            user=LinkTokenCreateRequestUser(client_user_id=str(user.id)),
         )
+        if PLAID_WEBHOOK_URL:
+            kwargs["webhook"] = PLAID_WEBHOOK_URL
+
+        request = LinkTokenCreateRequest(**kwargs)
         response = client.link_token_create(request)
         return {"link_token": response.link_token}
     except Exception as e:
@@ -93,228 +97,59 @@ async def get_investments(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_db_user),
 ):
-    token_entry = db.query(UserAccess).filter_by(user_id=str(user.id)).first()
-    if not token_entry:
+    token_entries = db.query(UserAccess).filter_by(user_id=str(user.id)).all()
+    if not token_entries:
         raise HTTPException(status_code=404, detail="User access token not found")
 
-    request = InvestmentsHoldingsGetRequest(access_token=token_entry.access_token)
-    response = client.investments_holdings_get(request).to_dict()
-
-    holdings = response.get("holdings", [])
-    securities = response.get("securities", [])
-    accounts = response.get("accounts", [])
-    institution_name = response.get("item", {}).get("institution_name", "Unknown")
-
-    security_lookup = {s["security_id"]: s for s in securities}
-    account_lookup = {a["account_id"]: a for a in accounts}
-
-    allowed_types = {"equity", "etf", "cryptocurrency"}
-
-    normalized = []
-    for h in holdings:
-        sec = security_lookup.get(h["security_id"])
-        if not sec or sec.get("type") not in allowed_types:
-            continue
-        acc = account_lookup.get(h["account_id"])
-
-        qty = h.get("quantity")
-        current_price = h.get("institution_price")
-        total_cost = h.get("cost_basis")  # TOTAL dollars spent (ACB)
-        unit_cost = safe_div(total_cost, qty)
-
-        current_value = (
-            current_price * qty
-            if (current_price is not None and qty is not None)
-            else None
-        )
-        unrealized_pl = (
-            current_value - total_cost
-            if (current_value is not None and total_cost is not None)
-            else None
-        )
-        unrealized_pl_pct = safe_div(current_value, total_cost)
-        unrealized_pl_pct = (
-            (unrealized_pl_pct - 1) * 100
-            if unrealized_pl_pct is not None
-            else None
-        )
-
-        normalized.append({
-            # identifiers
-            "externalId": h.get("security_id"),
-            "accountId": h.get("account_id"),
-            "accountName": (acc.get("name") if acc else "Unknown"),
-            "institution": institution_name,
-
-            # security
-            "symbol": sec.get("ticker_symbol"),
-            "name": sec.get("name"),
-            "type": sec.get("type"),
-            "currency": h.get("iso_currency_code"),
-
-            # positions & pricing
-            "quantity": qty,
-            "currentPrice": current_price,       # per-unit (as provided by Plaid)
-            "currentValue": current_value,       # computed total
-            "value": current_value,              # alias used by DB sync
-
-            # cost basis
-            "purchaseAmountTotal": total_cost,   # TOTAL (Plaid cost_basis)
-            "purchaseUnitPrice": unit_cost,      # derived per-unit
-            "purchasePrice": unit_cost,          # legacy alias = per-unit (for old UI)
-
-            # P/L (totals-based)
-            "unrealizedPl": unrealized_pl,
-            "unrealizedPlPct": unrealized_pl_pct,
-
-            # optional passthroughs
-            "previousClose": h.get("institution_price_datetime") or None,
-            "priceStatus": h.get("price_source") or None,
-        })
-
-    # Persist to DB
-    sync_plaid_holdings(str(user.id), normalized, db)
-
-    # Auto-set base currency (only if not manual)
-    maybe_auto_set_user_base_currency(user, normalized, db)
+    all_normalized = sync_all_connections(user, db)
 
     return {
         "message": "Holdings synced",
-        "count": len(normalized),
-        "holdings": normalized,
-        "raw": response,  # keep for now while debugging; remove later
+        "count": len(all_normalized),
+        "holdings": all_normalized,
     }
-def sync_plaid_holdings(user_id: str, plaid_holdings: List[Dict], db: Session):
-    # Step 1: Fetch existing holdings
-    existing_holdings = (
-        db.query(Holding)
-        .filter_by(user_id=str(user_id), source="plaid")
-        .all()
-    )
-    existing_map = {h.external_id: h for h in existing_holdings}
-    seen_ids = set()
 
-    # Step 2: Upsert
-    for ph in plaid_holdings:
-        # ID: support both camelCase and snake_case just in case
-        sec_id = ph.get("externalId") or ph.get("external_id")
-        if not sec_id:
-            # Don't crash on bad data, just skip and log
-            logger.warning("Skipping holding without externalId/external_id: %s", ph)
-            continue
 
-        seen_ids.add(sec_id)
+# ----------- PLAID WEBHOOK ----------------
+@router.post("/webhook")
+async def plaid_webhook(request: Request, db: Session = Depends(get_db)):
+    body = await request.json()
+    webhook_type = body.get("webhook_type", "")
+    webhook_code = body.get("webhook_code", "")
+    item_id = body.get("item_id", "")
 
-        # Core numbers
-        qty = num(ph.get("quantity"))
-        current_price = num(ph.get("currentPrice") or ph.get("current_price"))
+    logger.info("Plaid webhook received: type=%s code=%s item=%s", webhook_type, webhook_code, item_id)
 
-        # Total cost: prefer the explicit total, fall back to legacy names
-        total_cost = num(
-            ph.get("purchaseAmountTotal")
-            or ph.get("purchase_amount_total")
-            or ph.get("purchasePrice")
-            or ph.get("purchase_price")
-        )
+    if not item_id:
+        return {"received": True}
 
-        # Value (market value)
-        current_value = num(
-            ph.get("currentValue")
-            or ph.get("value")
-        )
-        if current_value is None and current_price is not None and qty is not None:
-            current_value = current_price * qty
+    if webhook_type == "HOLDINGS" and webhook_code in ("DEFAULT_UPDATE", "NEW_HOLDINGS_AVAILABLE"):
+        sync_by_item_id(item_id, db)
 
-        # Derivations
-        unit_cost = safe_div(total_cost, qty)
-        unrealized_pl = (
-            current_value - total_cost
-            if (current_value is not None and total_cost is not None)
-            else None
-        )
-        unrealized_pl_pct = None
-        if total_cost is not None and total_cost > 0 and current_value is not None:
-            unrealized_pl_pct = ((current_value / total_cost) - 1.0) * 100.0
+    elif webhook_type == "INVESTMENTS_TRANSACTIONS" and webhook_code == "DEFAULT_UPDATE":
+        sync_by_item_id(item_id, db)
 
-        symbol = ph.get("symbol") or ""
-        name = ph.get("name") or ""
-        sec_type = ph.get("type") or ""
-        account_name = (
-            ph.get("accountName")
-            or ph.get("account_name")
-            or ""
-        )
-        institution = ph.get("institution") or ""
-        currency = ph.get("currency") or ""
+    elif webhook_type == "ITEM":
+        token_entry = db.query(UserAccess).filter_by(item_id=item_id).first()
+        if token_entry:
+            error = body.get("error") or {}
+            error_code = error.get("error_code", "")
+            if webhook_code == "ERROR" and error_code == "ITEM_LOGIN_REQUIRED":
+                token_entry.status = "error"
+                db.commit()
+                logger.warning("Connection %s requires re-authentication", token_entry.id)
+            elif webhook_code == "PENDING_EXPIRATION":
+                token_entry.status = "error"
+                db.commit()
+                logger.warning("Connection %s access consent expiring soon", token_entry.id)
 
-        if sec_id in existing_map:
-            h = existing_map[sec_id]
-            h.symbol = symbol
-            h.name = name
-            h.type = sec_type
-            h.quantity = qty or 0.0
-            h.current_price = current_price or 0.0
-            h.current_value = current_value
-
-            # NEW explicit fields (if you added these columns)
-            h.purchase_amount_total = total_cost
-            h.purchase_unit_price = unit_cost
-            h.unrealized_pl = unrealized_pl
-            h.unrealized_pl_pct = unrealized_pl_pct
-
-            # Legacy field: keep as **unit** price for old UI
-            h.purchase_price = unit_cost or 0.0
-
-            # Total value
-            h.value = current_value or 0.0
-
-            h.account_name = account_name
-            h.institution = institution
-            h.currency = currency
-        else:
-            new_holding = Holding(
-                user_id=str(user_id),
-                source="plaid",
-                external_id=sec_id,
-                symbol=symbol,
-                name=name,
-                type=sec_type,
-                quantity=qty or 0.0,
-                current_price=current_price or 0.0,
-                current_value=current_value,
-
-                # NEW explicit fields
-                purchase_amount_total=total_cost,
-                purchase_unit_price=unit_cost,
-                unrealized_pl=unrealized_pl,
-                unrealized_pl_pct=unrealized_pl_pct,
-
-                # Legacy unit alias
-                purchase_price=unit_cost or 0.0,
-
-                value=current_value or 0.0,
-                account_name=account_name,
-                institution=institution,
-                currency=currency,
-            )
-            db.add(new_holding)
-
-    # Step 3: Delete stale Plaid holdings (optional)
-    for h in existing_holdings:
-        if h.external_id not in seen_ids:
-            db.delete(h)
-
-    # Step 4: mark tokens synced
-    tokens = db.query(UserAccess).filter_by(user_id=str(user_id)).all()
-    for t in tokens:
-        t.synced_at = datetime.now(timezone.utc)
-
-    db.commit()
+    return {"received": True}
 
 class InstitutionOut(BaseModel):
     id: str
     institution_name: str
     institution_id: str
+    status: str = "connected"
     created_at: str
     synced_at: str | None = None
 
