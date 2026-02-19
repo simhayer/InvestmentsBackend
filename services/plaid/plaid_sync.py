@@ -5,9 +5,11 @@ Used by both the manual /investments endpoint and the Plaid webhook handler.
 """
 
 import logging
+import time
 from datetime import datetime, timezone
 from typing import List, Dict, Optional
 
+from plaid.exceptions import ApiException
 from sqlalchemy.orm import Session
 from plaid.model.investments_holdings_get_request import InvestmentsHoldingsGetRequest
 
@@ -176,13 +178,31 @@ def _upsert_holdings(user_id: str, institution_name: str, plaid_holdings: List[D
             db.delete(h)
 
 
+def _fetch_holdings_with_retry(access_token: str, max_retries: int = 3) -> dict:
+    """Call investments/holdings/get with exponential back-off for PRODUCT_NOT_READY."""
+    for attempt in range(max_retries):
+        try:
+            req = InvestmentsHoldingsGetRequest(access_token=access_token)
+            return client.investments_holdings_get(req).to_dict()
+        except ApiException as e:
+            is_not_ready = e.status == 400 and "PRODUCT_NOT_READY" in str(e.body)
+            if is_not_ready and attempt < max_retries - 1:
+                wait = 2 ** attempt
+                logger.info(
+                    "PRODUCT_NOT_READY — retrying in %ds (attempt %d/%d)",
+                    wait, attempt + 1, max_retries,
+                )
+                time.sleep(wait)
+                continue
+            raise
+
+
 def sync_single_connection(token_entry: UserAccess, db: Session) -> List[Dict]:
     """
     Fetch holdings from Plaid for a single connection and persist them.
     Returns the normalized holdings list.
     """
-    request = InvestmentsHoldingsGetRequest(access_token=token_entry.access_token)
-    response = client.investments_holdings_get(request).to_dict()
+    response = _fetch_holdings_with_retry(token_entry.access_token)
 
     holdings = response.get("holdings", [])
     securities = response.get("securities", [])

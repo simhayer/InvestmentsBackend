@@ -10,7 +10,7 @@ from plaid.model.link_token_create_request_user import LinkTokenCreateRequestUse
 from plaid.model.products import Products
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from typing import List
+from typing import List, Optional
 
 from database import get_db
 from models.access_token import UserAccess
@@ -24,12 +24,18 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 PLAID_WEBHOOK_URL = os.getenv("PLAID_WEBHOOK_URL")
+_frontend_url = os.getenv("FRONTEND_URL", "").rstrip("/")
+PLAID_REDIRECT_URI = os.getenv("PLAID_REDIRECT_URI") or (
+    f"{_frontend_url}/plaid-oauth" if _frontend_url else None
+)
 
 # ----------- LINK TOKEN ----------------
 
 @router.post("/create-link-token")
-async def create_link_token(user: User = Depends(get_current_db_user)):
-
+async def create_link_token(
+    user: User = Depends(get_current_db_user),
+    redirect_uri: Optional[str] = Body(None, embed=True),
+):
     try:
         kwargs = dict(
             products=[Products("investments")],
@@ -38,6 +44,9 @@ async def create_link_token(user: User = Depends(get_current_db_user)):
             language="en",
             user=LinkTokenCreateRequestUser(client_user_id=str(user.id)),
         )
+        uri = redirect_uri or PLAID_REDIRECT_URI
+        if uri:
+            kwargs["redirect_uri"] = uri
         if PLAID_WEBHOOK_URL:
             kwargs["webhook"] = PLAID_WEBHOOK_URL
 
@@ -123,7 +132,9 @@ async def plaid_webhook(request: Request, db: Session = Depends(get_db)):
     if not item_id:
         return {"received": True}
 
-    if webhook_type == "HOLDINGS" and webhook_code in ("DEFAULT_UPDATE", "NEW_HOLDINGS_AVAILABLE"):
+    if webhook_type == "HOLDINGS" and webhook_code in (
+        "DEFAULT_UPDATE", "NEW_HOLDINGS_AVAILABLE", "INITIAL_UPDATE",
+    ):
         sync_by_item_id(item_id, db)
 
     elif webhook_type == "INVESTMENTS_TRANSACTIONS" and webhook_code == "DEFAULT_UPDATE":
@@ -144,6 +155,46 @@ async def plaid_webhook(request: Request, db: Session = Depends(get_db)):
                 logger.warning("Connection %s access consent expiring soon", token_entry.id)
 
     return {"received": True}
+
+
+# ----------- RE-AUTH (UPDATE MODE) LINK TOKEN ----------------
+
+@router.post("/create-update-link-token")
+async def create_update_link_token(
+    connection_id: str = Body(...),
+    redirect_uri: Optional[str] = Body(None),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_db_user),
+):
+    token_entry = db.query(UserAccess).filter_by(
+        id=connection_id, user_id=str(user.id)
+    ).first()
+    if not token_entry:
+        raise HTTPException(status_code=404, detail="Connection not found")
+
+    try:
+        kwargs = dict(
+            client_name="Investment Tracker",
+            country_codes=[CountryCode("US"), CountryCode("CA")],
+            language="en",
+            user=LinkTokenCreateRequestUser(client_user_id=str(user.id)),
+            access_token=token_entry.access_token,
+        )
+        uri = redirect_uri or PLAID_REDIRECT_URI
+        if uri:
+            kwargs["redirect_uri"] = uri
+        if PLAID_WEBHOOK_URL:
+            kwargs["webhook"] = PLAID_WEBHOOK_URL
+
+        request = LinkTokenCreateRequest(**kwargs)
+        response = client.link_token_create(request)
+        return {"link_token": response.link_token}
+    except Exception as e:
+        logger.error("Update link token failed:\n%s", traceback.format_exc())
+        raise HTTPException(status_code=500, detail=f"Error creating update link token: {e}")
+
+
+# ----------- INSTITUTIONS ----------------
 
 class InstitutionOut(BaseModel):
     id: str
