@@ -323,7 +323,7 @@ async def get_stock_insights(
     force_refresh: bool = False,
 ) -> Dict[str, str]:
     """
-    Inline insights with Redis caching (6h TTL).
+    Inline insights with Redis caching(6h TTL).
     """
     sym = symbol.upper()
     cache_key = _inline_cache_key(sym)
