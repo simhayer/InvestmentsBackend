@@ -4,10 +4,11 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Dict, Optional
+from typing import Any, AsyncIterator, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -31,29 +32,44 @@ def _trace_exception(msg: str, *args: Any) -> None:
 
 @dataclass
 class GeminiConfig:
-    api_key: str
     model: str
     use_web: bool
     temperature: float
     thinking_level: str
+    project_id: str
+    location: str
 
 
 class GeminiStreamClient:
     def __init__(self, config: Optional[GeminiConfig] = None):
         self.config = config or self._from_env()
         from google import genai
-        self._client = genai.Client(api_key=self.config.api_key)
+        self._client = genai.Client(
+            vertexai=True,
+            project=self.config.project_id,
+            location=self.config.location,
+        )
+        self._last_citations: List[Dict[str, str]] = []
 
     def _from_env(self) -> GeminiConfig:
-        api_key = os.getenv("GEMINI_API_KEY", "")
-        if not api_key:
-            raise ValueError("Missing GEMINI_API_KEY")
+        project_id = (
+            os.getenv("GCP_PROJECT_ID")
+            or os.getenv("GOOGLE_CLOUD_PROJECT")
+            or ""
+        ).strip()
+        if not project_id:
+            raise ValueError("Missing GCP_PROJECT_ID")
         return GeminiConfig(
-            api_key=api_key,
             model=os.getenv("GEMINI_MODEL") or "gemini-3-flash-preview",
             use_web=os.getenv("GEMINI_USE_WEB", "1") == "1",
             temperature=float(os.getenv("AI_TEMPERATURE", "0.3")),
             thinking_level=(os.getenv("GEMINI_THINKING_LEVEL") or "MEDIUM").upper(),
+            project_id=project_id,
+            location=(
+                os.getenv("GCP_LOCATION")
+                or os.getenv("GOOGLE_CLOUD_LOCATION")
+                or "us-central1"
+            ).strip(),
         )
 
     @staticmethod
@@ -74,14 +90,92 @@ class GeminiStreamClient:
             return True
         return False
 
-    def _build_config(self, *, use_web: bool, model: Optional[str] = None):
+    @staticmethod
+    def _is_thinking_level_unsupported_error(exc: Exception) -> bool:
+        text = str(exc).lower()
+        return ("thinking_level" in text) and ("not supported" in text)
+
+    @staticmethod
+    def _is_http_url(value: Any) -> bool:
+        return isinstance(value, str) and re.match(r"^https?://", value.strip(), re.IGNORECASE) is not None
+
+    @classmethod
+    def _extract_citations_from_payload(cls, payload: Any) -> List[Dict[str, str]]:
+        """Best-effort extraction of source links from GenAI response objects/chunks."""
+        if payload is None:
+            return []
+
+        root: Any = payload
+        if not isinstance(root, (dict, list)):
+            if hasattr(root, "model_dump"):
+                try:
+                    root = root.model_dump(mode="python")
+                except Exception:
+                    root = payload
+            elif hasattr(root, "to_dict"):
+                try:
+                    root = root.to_dict()
+                except Exception:
+                    root = payload
+
+        citations: List[Dict[str, str]] = []
+        seen_urls: set[str] = set()
+
+        def _add(url: str, title: Optional[str] = None) -> None:
+            normalized = (url or "").strip()
+            if not normalized or normalized in seen_urls:
+                return
+            seen_urls.add(normalized)
+            entry: Dict[str, str] = {"url": normalized}
+            if title and title.strip():
+                entry["title"] = title.strip()
+            citations.append(entry)
+
+        def _walk(node: Any) -> None:
+            if isinstance(node, dict):
+                url_value = None
+                for key in ("url", "uri", "link", "href"):
+                    candidate = node.get(key)
+                    if cls._is_http_url(candidate):
+                        url_value = str(candidate).strip()
+                        break
+                if url_value:
+                    title_value = None
+                    for title_key in ("title", "name", "display_name", "source"):
+                        t = node.get(title_key)
+                        if isinstance(t, str) and t.strip():
+                            title_value = t
+                            break
+                    _add(url_value, title_value)
+
+                for value in node.values():
+                    _walk(value)
+            elif isinstance(node, list):
+                for item in node:
+                    _walk(item)
+
+        _walk(root)
+        return citations
+
+    def pop_last_citations(self) -> List[Dict[str, str]]:
+        out = list(self._last_citations)
+        self._last_citations = []
+        return out
+
+    def _build_config(
+        self,
+        *,
+        use_web: bool,
+        model: Optional[str] = None,
+        disable_thinking: bool = False,
+    ):
         from google.genai import types
 
         resolved_model = model or self.config.model
         tools = [types.Tool(googleSearch=types.GoogleSearch())] if use_web else None
         thinking_config = None
 
-        if self._model_supports_thinking(resolved_model):
+        if (not disable_thinking) and self._model_supports_thinking(resolved_model):
             try:
                 fields = set(getattr(types.ThinkingConfig, "model_fields", {}).keys())
                 normalized = self._normalize_thinking(resolved_model, self.config.thinking_level)
@@ -137,11 +231,25 @@ class GeminiStreamClient:
         model = model_override or self.config.model
         combined = f"{system_prompt}\n\n{user_prompt}"
         contents = [types.Content(role="user", parts=[types.Part.from_text(text=combined)])]
-        resp = self._client.models.generate_content(
-            model=model,
-            contents=contents,
-            config=self._build_config(use_web=use_web, model=model),
-        )
+        try:
+            resp = self._client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=self._build_config(use_web=use_web, model=model),
+            )
+        except Exception as exc:
+            if not self._is_thinking_level_unsupported_error(exc):
+                raise
+            _trace_warning(
+                "gemini.generate.retry_without_thinking model=%s reason=thinking_level_unsupported",
+                model,
+            )
+            resp = self._client.models.generate_content(
+                model=model,
+                contents=contents,
+                config=self._build_config(use_web=use_web, model=model, disable_thinking=True),
+            )
+        self._last_citations = self._extract_citations_from_payload(resp)
         return getattr(resp, "text", None) or str(resp)
 
     async def quick_generate(
@@ -185,6 +293,7 @@ class GeminiStreamClient:
         allow_web_search: Optional[bool] = None,
     ) -> AsyncIterator[str]:
         use_web = self.config.use_web if allow_web_search is None else bool(allow_web_search)
+        self._last_citations = []
         _trace_info(
             "gemini.stream.start model=%s use_web=%s prompt_len=%s",
             self.config.model,
@@ -201,15 +310,27 @@ class GeminiStreamClient:
 
             combined = f"{system_prompt}\n\n{user_prompt}"
             contents = [types.Content(role="user", parts=[types.Part.from_text(text=combined)])]
+            disable_thinking = False
+            citations: List[Dict[str, str]] = []
+            citation_urls: set[str] = set()
             for attempt in (1, 2):
                 try:
                     stream = self._client.models.generate_content_stream(
                         model=self.config.model,
                         contents=contents,
-                        config=self._build_config(use_web=use_web),
+                        config=self._build_config(
+                            use_web=use_web,
+                            disable_thinking=disable_thinking,
+                        ),
                     )
                     emitted = 0
                     for chunk in stream:
+                        for item in self._extract_citations_from_payload(chunk):
+                            url = item.get("url", "")
+                            if not url or url in citation_urls:
+                                continue
+                            citation_urls.add(url)
+                            citations.append(item)
                         text = getattr(chunk, "text", None)
                         if text:
                             emitted += 1
@@ -219,6 +340,14 @@ class GeminiStreamClient:
                     worker_state["error"] = None
                     break
                 except Exception as exc:
+                    if self._is_thinking_level_unsupported_error(exc) and not disable_thinking:
+                        disable_thinking = True
+                        _trace_warning(
+                            "gemini.stream.worker.retry_without_thinking attempt=%s model=%s",
+                            attempt,
+                            self.config.model,
+                        )
+                        continue
                     worker_state["error"] = exc
                     chunks_emitted = int(worker_state["chunks_emitted"])
                     if chunks_emitted > 0:
@@ -240,6 +369,7 @@ class GeminiStreamClient:
                         break
                     _trace_warning("gemini.stream.worker.retry attempt=%s reason=stream_decode_error", attempt + 1)
                     time.sleep(0.15)
+            self._last_citations = citations
             loop.call_soon_threadsafe(q.put_nowait, None)
 
         threading.Thread(target=_worker, daemon=True).start()
