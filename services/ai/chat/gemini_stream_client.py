@@ -12,21 +12,16 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
+
 def _trace_info(msg: str, *args: Any) -> None:
-    text = msg % args if args else msg
-    print(text, flush=True)
     logger.info(msg, *args)
 
 
 def _trace_warning(msg: str, *args: Any) -> None:
-    text = msg % args if args else msg
-    print(text, flush=True)
     logger.warning(msg, *args)
 
 
 def _trace_exception(msg: str, *args: Any) -> None:
-    text = msg % args if args else msg
-    print(text, flush=True)
     logger.exception(msg, *args)
 
 
@@ -35,12 +30,14 @@ class GeminiConfig:
     model: str
     use_web: bool
     temperature: float
-    thinking_level: str
+    thinking_budget: int
     project_id: str
     location: str
 
 
 class GeminiStreamClient:
+    _thinking_unsupported_models: set = set()
+
     def __init__(self, config: Optional[GeminiConfig] = None):
         self.config = config or self._from_env()
         from google import genai
@@ -60,10 +57,10 @@ class GeminiStreamClient:
         if not project_id:
             raise ValueError("Missing GCP_PROJECT_ID")
         return GeminiConfig(
-            model=os.getenv("GEMINI_MODEL") or "gemini-3-flash-preview",
+            model=os.getenv("GEMINI_MODEL") or "gemini-2.5-flash",
             use_web=os.getenv("GEMINI_USE_WEB", "1") == "1",
             temperature=float(os.getenv("AI_TEMPERATURE", "0.3")),
-            thinking_level=(os.getenv("GEMINI_THINKING_LEVEL") or "MEDIUM").upper(),
+            thinking_budget=int(os.getenv("GEMINI_THINKING_BUDGET", "1024")),
             project_id=project_id,
             location=(
                 os.getenv("GCP_LOCATION")
@@ -72,28 +69,25 @@ class GeminiStreamClient:
             ).strip(),
         )
 
-    @staticmethod
-    def _normalize_thinking(model: str, level: str) -> str:
-        lvl = (level or "MEDIUM").upper()
+    @classmethod
+    def _model_supports_thinking(cls, model: str) -> bool:
         m = (model or "").lower()
-        if "flash" in m:
-            return lvl if lvl in ("LOW", "MEDIUM", "HIGH") else "MEDIUM"
-        return lvl if lvl in ("LOW", "HIGH") else "HIGH"
-
-    @staticmethod
-    def _model_supports_thinking(model: str) -> bool:
-        """Only Gemini 3.x and 2.5+ models support thinking_level."""
-        m = (model or "").lower()
+        if m in cls._thinking_unsupported_models:
+            return False
         if "lite" in m:
             return False
         if "gemini-3" in m or "gemini-2.5" in m:
             return True
         return False
 
+    @classmethod
+    def _blacklist_thinking(cls, model: str) -> None:
+        cls._thinking_unsupported_models.add((model or "").lower())
+
     @staticmethod
-    def _is_thinking_level_unsupported_error(exc: Exception) -> bool:
+    def _is_thinking_unsupported_error(exc: Exception) -> bool:
         text = str(exc).lower()
-        return ("thinking_level" in text) and ("not supported" in text)
+        return ("thinking" in text) and ("not supported" in text or "unsupported" in text)
 
     @staticmethod
     def _is_http_url(value: Any) -> bool:
@@ -101,7 +95,6 @@ class GeminiStreamClient:
 
     @classmethod
     def _extract_citations_from_payload(cls, payload: Any) -> List[Dict[str, str]]:
-        """Best-effort extraction of source links from GenAI response objects/chunks."""
         if payload is None:
             return []
 
@@ -168,6 +161,7 @@ class GeminiStreamClient:
         use_web: bool,
         model: Optional[str] = None,
         disable_thinking: bool = False,
+        system_instruction: Optional[str] = None,
     ):
         from google.genai import types
 
@@ -177,20 +171,21 @@ class GeminiStreamClient:
 
         if (not disable_thinking) and self._model_supports_thinking(resolved_model):
             try:
-                fields = set(getattr(types.ThinkingConfig, "model_fields", {}).keys())
-                normalized = self._normalize_thinking(resolved_model, self.config.thinking_level)
-                if "thinking_level" in fields:
-                    thinking_config = types.ThinkingConfig(thinking_level=normalized)
-                elif "include_thoughts" in fields:
-                    thinking_config = types.ThinkingConfig(include_thoughts=(normalized != "LOW"))
+                thinking_config = types.ThinkingConfig(
+                    thinking_budget=self.config.thinking_budget,
+                )
             except Exception:
                 thinking_config = None
 
-        return types.GenerateContentConfig(
-            thinking_config=thinking_config,
-            tools=tools,
-            temperature=self.config.temperature,
-        )
+        config_kwargs: Dict[str, Any] = {
+            "thinking_config": thinking_config,
+            "tools": tools,
+            "temperature": self.config.temperature,
+        }
+        if system_instruction:
+            config_kwargs["system_instruction"] = system_instruction
+
+        return types.GenerateContentConfig(**config_kwargs)
 
     async def decide_tool_action(
         self,
@@ -229,25 +224,25 @@ class GeminiStreamClient:
         from google.genai import types
 
         model = model_override or self.config.model
-        combined = f"{system_prompt}\n\n{user_prompt}"
-        contents = [types.Content(role="user", parts=[types.Part.from_text(text=combined)])]
+        contents = [types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)])]
         try:
             resp = self._client.models.generate_content(
                 model=model,
                 contents=contents,
-                config=self._build_config(use_web=use_web, model=model),
+                config=self._build_config(use_web=use_web, model=model, system_instruction=system_prompt),
             )
         except Exception as exc:
-            if not self._is_thinking_level_unsupported_error(exc):
+            if not self._is_thinking_unsupported_error(exc):
                 raise
+            self._blacklist_thinking(model)
             _trace_warning(
-                "gemini.generate.retry_without_thinking model=%s reason=thinking_level_unsupported",
+                "gemini.generate.retry_without_thinking model=%s (blacklisted)",
                 model,
             )
             resp = self._client.models.generate_content(
                 model=model,
                 contents=contents,
-                config=self._build_config(use_web=use_web, model=model, disable_thinking=True),
+                config=self._build_config(use_web=use_web, model=model, disable_thinking=True, system_instruction=system_prompt),
             )
         self._last_citations = self._extract_citations_from_payload(resp)
         return getattr(resp, "text", None) or str(resp)
@@ -308,8 +303,7 @@ class GeminiStreamClient:
         def _worker() -> None:
             from google.genai import types
 
-            combined = f"{system_prompt}\n\n{user_prompt}"
-            contents = [types.Content(role="user", parts=[types.Part.from_text(text=combined)])]
+            contents = [types.Content(role="user", parts=[types.Part.from_text(text=user_prompt)])]
             disable_thinking = False
             citations: List[Dict[str, str]] = []
             citation_urls: set[str] = set()
@@ -321,6 +315,7 @@ class GeminiStreamClient:
                         config=self._build_config(
                             use_web=use_web,
                             disable_thinking=disable_thinking,
+                            system_instruction=system_prompt,
                         ),
                     )
                     emitted = 0
@@ -340,10 +335,11 @@ class GeminiStreamClient:
                     worker_state["error"] = None
                     break
                 except Exception as exc:
-                    if self._is_thinking_level_unsupported_error(exc) and not disable_thinking:
+                    if self._is_thinking_unsupported_error(exc) and not disable_thinking:
                         disable_thinking = True
+                        self._blacklist_thinking(self.config.model)
                         _trace_warning(
-                            "gemini.stream.worker.retry_without_thinking attempt=%s model=%s",
+                            "gemini.stream.worker.retry_without_thinking attempt=%s model=%s (blacklisted)",
                             attempt,
                             self.config.model,
                         )
@@ -351,8 +347,6 @@ class GeminiStreamClient:
                     worker_state["error"] = exc
                     chunks_emitted = int(worker_state["chunks_emitted"])
                     if chunks_emitted > 0:
-                        # Non-fatal: stream produced content, then transport parse failed.
-                        # Avoid noisy traceback spam for this frequent SDK chunk-decoding issue.
                         _trace_warning(
                             "gemini.stream.worker.partial_decode_error attempt=%s chunks_emitted=%s err=%s",
                             attempt,
@@ -382,7 +376,6 @@ class GeminiStreamClient:
             emitted_tokens += 1
             yield item
 
-        # Fallback only if stream failed before any token was emitted.
         if worker_state["error"] is not None and emitted_tokens == 0:
             fallback_timeout_s = float(os.getenv("GEMINI_SYNC_FALLBACK_TIMEOUT_S", "12"))
             _trace_warning("gemini.stream.fallback.start timeout_s=%s", fallback_timeout_s)
@@ -391,7 +384,6 @@ class GeminiStreamClient:
                     asyncio.to_thread(self._sync_generate_text, system_prompt, user_prompt, use_web),
                     timeout=fallback_timeout_s,
                 )
-                # Emit moderate chunks to reduce SSE overhead.
                 text = (fallback or "").strip()
                 chunk_size = 180
                 for i in range(0, len(text), chunk_size):
@@ -404,3 +396,19 @@ class GeminiStreamClient:
 
         elapsed_ms = int((time.perf_counter() - started) * 1000)
         _trace_info("gemini.stream.done elapsed_ms=%s emitted_events=%s", elapsed_ms, emitted_tokens)
+
+
+# ── Singleton ────────────────────────────────────────────────────────────
+
+_shared_client: Optional[GeminiStreamClient] = None
+_shared_client_lock = threading.Lock()
+
+
+def get_shared_gemini_client() -> GeminiStreamClient:
+    global _shared_client
+    if _shared_client is not None:
+        return _shared_client
+    with _shared_client_lock:
+        if _shared_client is None:
+            _shared_client = GeminiStreamClient()
+    return _shared_client

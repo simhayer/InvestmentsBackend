@@ -79,6 +79,7 @@ class FinnhubToolRegistry:
         self._service = service or FinnhubService()
         self._db = db
         self._user_id = user_id
+        self._http = httpx.AsyncClient(timeout=6.0)
 
     async def execute(self, tool_name: str, arguments: Dict[str, Any]) -> ToolResult:
         try:
@@ -136,8 +137,7 @@ class FinnhubToolRegistry:
         return ToolResult(ok=True, tool_name="get_quote", data=data)
 
     async def get_company_profile(self, args: SymbolArgs) -> ToolResult:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            profile = await self._service.fetch_profile(args.symbol, client=client)
+        profile = await self._service.fetch_profile(args.symbol, client=self._http)
         if not profile:
             return ToolResult(
                 ok=False,
@@ -159,8 +159,7 @@ class FinnhubToolRegistry:
         return ToolResult(ok=True, tool_name="get_company_profile", data=safe)
 
     async def get_basic_financials(self, args: SymbolArgs) -> ToolResult:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            metrics = await self._service.fetch_basic_financials(args.symbol, client=client)
+        metrics = await self._service.fetch_basic_financials(args.symbol, client=self._http)
         metric_obj = metrics.get("metric", {}) if isinstance(metrics, dict) else {}
         if not isinstance(metric_obj, dict) or not metric_obj:
             return ToolResult(
@@ -190,8 +189,7 @@ class FinnhubToolRegistry:
         )
 
     async def get_peers(self, args: SymbolArgs) -> ToolResult:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            peers = await self._service.fetch_peers(args.symbol, client=client)
+        peers = await self._service.fetch_peers(args.symbol, client=self._http)
         if not peers:
             return ToolResult(
                 ok=False,
