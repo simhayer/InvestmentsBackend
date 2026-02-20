@@ -341,7 +341,9 @@ class ChatOrchestrator:
             )
 
             # Guardrail: portfolio-intent queries should fetch portfolio data
-            if decision.intent in {"portfolio_lookup", "portfolio_guidance", "portfolio_analysis"} and decision.action != "tool":
+            if decision.intent in {"portfolio_lookup", "portfolio_guidance", "portfolio_analysis"} and (
+                decision.action != "tool" or not decision.tool_name
+            ):
                 preferred_currency = None
                 if req.context and req.context.preferred_currency:
                     preferred_currency = req.context.preferred_currency.strip().upper()
