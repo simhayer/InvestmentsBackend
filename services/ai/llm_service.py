@@ -34,7 +34,7 @@ class LLMConfig:
 
     # Gemini
     gemini_api_key: str = ""
-    gemini_model: str = "gemini-3-flash-preview"
+    gemini_model: str = "gemini-2.5-flash"
     gemini_use_web: bool = True
     gemini_thinking_level: str = "HIGH"  # auto-normalized inside client
 
@@ -59,7 +59,7 @@ class LLMConfig:
             anthropic_timeout_s=float(os.getenv("ANTHROPIC_TIMEOUT_S", "60")),
 
             gemini_api_key=os.getenv("GEMINI_API_KEY", ""),
-            gemini_model=os.getenv("GEMINI_MODEL") or "gemini-3-flash-preview",
+            gemini_model=os.getenv("GEMINI_MODEL") or "gemini-2.5-flash",
             gemini_use_web=(os.getenv("GEMINI_USE_WEB", "1") == "1"),
             gemini_thinking_level=(os.getenv("GEMINI_THINKING_LEVEL") or "HIGH").upper(),
 

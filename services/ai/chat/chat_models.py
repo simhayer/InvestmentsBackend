@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from typing import Any, Dict, List, Literal, Optional
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 Role = Literal["system", "user", "assistant"]
@@ -9,15 +9,12 @@ Role = Literal["system", "user", "assistant"]
 
 class ChatMessage(BaseModel):
     role: Role
-    content: str = Field(min_length=1, max_length=8000)
+    content: str = Field(max_length=8000)
 
     @field_validator("content")
     @classmethod
     def _strip_content(cls, v: str) -> str:
-        out = (v or "").strip()
-        if not out:
-            raise ValueError("content must not be empty")
-        return out
+        return (v or "").strip()
 
 
 # ── Page Context (from frontend) ────────────────────────────────────────
@@ -38,10 +35,17 @@ class ChatContext(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    messages: List[ChatMessage] = Field(min_length=1, max_length=40)
+    messages: List[ChatMessage] = Field(max_length=40)
     context: Optional[ChatContext] = None
     conversation_id: Optional[str] = Field(default=None, max_length=128)
     allow_web_search: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def _drop_empty_messages(self) -> "ChatRequest":
+        self.messages = [m for m in self.messages if m.content]
+        if not self.messages:
+            raise ValueError("At least one message with non-empty content is required")
+        return self
 
 
 SSEEventType = Literal[
