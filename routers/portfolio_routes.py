@@ -1,4 +1,6 @@
 # routers/portfolio_routes.py
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from database import get_db
@@ -16,6 +18,7 @@ from schemas.portfolio_health_explain import (
 from typing import Literal
 from models.user import User
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 def get_finnhub_service() -> FinnhubService:
@@ -31,13 +34,16 @@ async def portfolio_summary(
     resolved_currency = resolve_currency(user, currency)
 
     try:
-        return await get_portfolio_summary(
+        out = await get_portfolio_summary(
             str(user.id),
             db,
             finnhub,
             currency=resolved_currency,
         )
+        logger.info("portfolio_summary user_id=%s currency=%s", user.id, resolved_currency)
+        return out
     except Exception as e:
+        logger.exception("portfolio summary failed for user_id=%s: %s", user.id, e)
         raise HTTPException(status_code=400, detail=f"Failed to build portfolio summary: {e}")
     
 @router.get("/health-score", response_model=PortfolioHealthScoreResponse)

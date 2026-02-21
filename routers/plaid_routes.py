@@ -71,6 +71,7 @@ async def create_link_token(
 
         request = LinkTokenCreateRequest(**kwargs)
         response = client.link_token_create(request)
+        logger.info("plaid_link_token_created user_id=%s", user.id)
         return {"link_token": response.link_token}
     except Exception as e:
         logger.exception("create_link_token failed: %s", e)
@@ -116,6 +117,7 @@ async def exchange_token(
 
         db.commit()
 
+        logger.info("plaid_token_exchanged user_id=%s item_id=%s institution_id=%s", user.id, item_id, institution_id)
         return {"access_token": access_token}
 
     except Exception as e:
@@ -135,6 +137,7 @@ async def get_investments(
 
     all_normalized = sync_all_connections(user, db)
 
+    logger.info("plaid_investments_synced user_id=%s count=%s", user.id, len(all_normalized))
     return {
         "message": "Holdings synced",
         "count": len(all_normalized),
@@ -154,7 +157,8 @@ async def plaid_webhook(request: Request, db: Session = Depends(get_db)):
             raise HTTPException(status_code=401, detail="Invalid webhook signature")
     try:
         body = json.loads(raw_body)
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as e:
+        logger.warning("plaid webhook invalid JSON body: %s", e)
         raise HTTPException(status_code=400, detail="Invalid JSON body")
     webhook_type = body.get("webhook_type", "")
     webhook_code = body.get("webhook_code", "")
@@ -163,6 +167,7 @@ async def plaid_webhook(request: Request, db: Session = Depends(get_db)):
     logger.info("Plaid webhook received: type=%s code=%s item=%s", webhook_type, webhook_code, item_id)
 
     if not item_id:
+        logger.info("plaid_webhook_processed no_item_id")
         return {"received": True}
 
     if webhook_type == "HOLDINGS" and webhook_code in (
@@ -187,6 +192,7 @@ async def plaid_webhook(request: Request, db: Session = Depends(get_db)):
                 db.commit()
                 logger.warning("Connection %s access consent expiring soon", token_entry.id)
 
+    logger.info("plaid_webhook_processed type=%s code=%s item_id=%s", webhook_type, webhook_code, item_id)
     return {"received": True}
 
 
@@ -222,6 +228,7 @@ async def create_update_link_token(
 
         request = LinkTokenCreateRequest(**kwargs)
         response = client.link_token_create(request)
+        logger.info("plaid_update_link_token_created user_id=%s connection_id=%s", user.id, connection_id)
         return {"link_token": response.link_token}
     except Exception as e:
         logger.error("Update link token failed:\n%s", traceback.format_exc())
@@ -244,7 +251,9 @@ async def get_connected_institutions(
     user: User = Depends(get_current_db_user),
 ):
     try:
-        return get_connections(str(user.id), db)
+        out = get_connections(str(user.id), db)
+        logger.info("plaid_institutions_listed user_id=%s count=%s", user.id, len(out))
+        return out
     except Exception as e:
         logger.exception("Error fetching institutions")
         raise HTTPException(status_code=500, detail="Failed to fetch institutions")
@@ -258,6 +267,7 @@ async def delete_connection(
 ):
     try:
         remove_connection(connection_id, str(user.id), db)
+        logger.info("plaid_connection_removed user_id=%s connection_id=%s", user.id, connection_id)
         return {"detail": "Connection removed"}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))

@@ -1,6 +1,8 @@
 # routers/market_routes.py
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, HTTPException, Query
 from starlette.concurrency import run_in_threadpool
 from typing import Any, Dict, Optional
@@ -15,6 +17,8 @@ from services.yahoo_service import (
 )
 
 from services.cache.cache_backend import cache_get, cache_set
+
+logger = logging.getLogger(__name__)
 router = APIRouter()
 Json = Dict[str, Any]
 
@@ -34,9 +38,12 @@ def _ck(kind: str, *parts: str) -> str:
 
 def _ok_or_raise(data: Any, *, default_msg: str = "Fetch failed") -> Json:
     if not isinstance(data, dict):
+        logger.warning("yahoo upstream returned non-JSON: type=%s", type(data).__name__)
         raise HTTPException(status_code=502, detail="Upstream returned non-JSON")
     if data.get("status") != "ok":
-        raise HTTPException(status_code=502, detail=data.get("message", default_msg))
+        msg = data.get("message", default_msg)
+        logger.warning("yahoo upstream error: status=%s message=%s", data.get("status"), msg)
+        raise HTTPException(status_code=502, detail=msg)
     return data  # type: ignore[return-value]
 
 @router.get("/quote/{symbol}")
@@ -52,11 +59,13 @@ async def get_quote(symbol: str, q: Optional[str] = Query(default=None)):
 
     data = await run_in_threadpool(get_full_stock_data, yahoo_symbol)
     if not isinstance(data, dict):
+        logger.warning("yahoo quote returned non-JSON symbol=%s", yahoo_symbol)
         raise HTTPException(status_code=502, detail="Upstream returned non-JSON")
 
     if data.get("status") != "ok":
         msg = data.get("message") or "Failed to fetch quote data"
         code = 502 if data.get("error_code") == "YAHOOQUERY_FAILURE" else 400
+        logger.warning("yahoo quote failed symbol=%s code=%s message=%s", yahoo_symbol, code, msg)
         raise HTTPException(status_code=code, detail=msg)
 
     cache_set(cache_key, data, ttl_seconds=TTL_YAHOO_QUOTE_SEC)

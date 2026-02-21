@@ -1,4 +1,6 @@
 # finnhub_routes.py
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import List, Dict, Any, Tuple
@@ -7,6 +9,8 @@ from services.cache.crypto_catalog import crypto_catalog
 from services.cache.cache_backend import cache_get, cache_set, cache_get_many, cache_set_many
 from services.cache.cache_utils import cacheable, should_cache_any_json
 from utils.common_helpers import canonical_key
+
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 TTL_FINNHUB_QUOTE_SEC = 60
@@ -58,6 +62,7 @@ async def get_price(
     except FinnhubServiceError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        logger.warning("get_price failed symbol=%s typ=%s: %s", sym, typ, e)
         raise HTTPException(status_code=400, detail=f"Error fetching price: {e}")
 
 
@@ -117,6 +122,7 @@ async def get_prices(
         except FinnhubServiceError as e:
             raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
+            logger.warning("get_prices failed: %s", e)
             raise HTTPException(status_code=400, detail=f"Error fetching prices: {e}")
 
     return out
@@ -157,8 +163,8 @@ async def _search_symbols_cached(query: str, svc: FinnhubService) -> List[Dict[s
                 })
                 if len(merged) >= limit * 3:
                     break
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("search_symbols merge failed for query=%s: %s", query, e)
 
     # 3) De-dupe by SYMBOL
     seen = set()
@@ -202,6 +208,9 @@ async def fetch_quote(
         return payload
     except FinnhubServiceError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.warning("fetch_quote failed symbol=%s: %s", sym, e)
+        raise HTTPException(status_code=400, detail=f"Error fetching quote: {e}")
 
 
 @router.get("/profile")
@@ -224,3 +233,6 @@ async def fetch_profile(
         return payload
     except FinnhubServiceError as e:
         raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.warning("fetch_profile failed symbol=%s: %s", sym, e)
+        raise HTTPException(status_code=400, detail=f"Error fetching profile: {e}")

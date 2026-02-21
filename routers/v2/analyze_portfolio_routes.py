@@ -157,6 +157,7 @@ async def get_full_portfolio_analysis(
             include_inline=include_inline,
             force_refresh=force_refresh,
         )
+        logger.info("portfolio_analysis_completed user_id=%s currency=%s", user.id, currency.upper())
         return result
     except HTTPException:
         raise
@@ -193,6 +194,7 @@ async def get_portfolio_inline_insights(
             currency=currency.upper(),
             force_refresh=force_refresh,
         )
+        logger.info("portfolio_inline_insights_completed user_id=%s", user.id)
         return result
     except HTTPException:
         raise
@@ -231,7 +233,7 @@ async def get_portfolio_summary(
         
         ai = AIPortfolioAnalysisService()
         result = await ai.generate_quick_summary(context)
-        
+        logger.info("portfolio_summary_completed user_id=%s", user.id)
         return {
             "summary": result.get("summary", ""),
             "health": result.get("health", "Good"),
@@ -264,6 +266,7 @@ async def get_portfolio_raw_data(
             finnhub,
             currency=currency.upper(),
         )
+        logger.info("portfolio_data_fetched user_id=%s", user.id)
         return {
             "data": bundle.to_dict(),
             "context": bundle.to_ai_context(),

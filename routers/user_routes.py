@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from typing import Optional
 from models.user import User
@@ -6,7 +8,8 @@ from services.supabase_auth import get_current_db_user
 from services.tier import get_user_plan
 from database import get_db
 from sqlalchemy.orm import Session
-from fastapi import HTTPException
+
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 ALLOWED_CURRENCIES = {"USD", "CAD"} 
@@ -53,6 +56,7 @@ def update_currency(payload: CurrencyUpdate, db: Session = Depends(get_db), curr
     db.commit()
     db.refresh(current_user)
 
+    logger.info("currency_updated user_id=%s new_currency=%s", current_user.id, currency)
     return {
         "status": "success",
         "new_currency": currency,

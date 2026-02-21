@@ -332,6 +332,7 @@ def _fetch_holdings_with_retry(access_token: str, max_retries: int = 5) -> dict:
                 )
                 time.sleep(wait)
                 continue
+            logger.exception("Plaid investments_holdings_get failed after retries: status=%s body=%s", e.status, e.body)
             raise
 
 

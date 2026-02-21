@@ -1,4 +1,6 @@
 # routes/onboarding_routes.py
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -9,6 +11,7 @@ from models.user import User
 from models.user_onboarding_profile import UserOnboardingProfile
 from services.supabase_auth import get_current_db_user
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 class OnboardingOut(BaseModel):
@@ -92,6 +95,7 @@ def update_onboarding(
         db.commit()
         db.refresh(profile)
 
+        logger.info("onboarding_updated user_id=%s current_step=%s", current_user.id, profile.current_step)
         return OnboardingOut(
             completed=profile.completed_at is not None,
             current_step=profile.current_step,
@@ -107,6 +111,7 @@ def update_onboarding(
             notes=profile.notes,
         )
     except Exception as e:
+        logger.exception("update onboarding profile failed for user_id=%s: %s", current_user.id, e)
         raise HTTPException(status_code=500, detail=f"Failed to update onboarding profile: {e}")
 
 @router.post("/complete", response_model=OnboardingOut)
@@ -138,6 +143,7 @@ def complete_onboarding(
     db.commit()
     db.refresh(profile)
 
+    logger.info("onboarding_completed user_id=%s", current_user.id)
     return OnboardingOut(
         completed=True,
         current_step=profile.current_step,
