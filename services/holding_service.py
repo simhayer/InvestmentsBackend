@@ -149,9 +149,13 @@ def get_holdings_broker_only(
     items: List[HoldingOut] = []
     for h in rows:
         qty = to_float(h.quantity)
-        unit_price = to_float(getattr(h, "purchase_unit_price", None)) or to_float(h.purchase_price)
-        # Value = purchase_price * quantity (cost basis); no current price
-        value = round(unit_price * qty, 8) if unit_price and qty else 0.0
+        # Prefer explicit cost basis (total); else derive from unit price * quantity
+        total_cost = to_float(getattr(h, "purchase_amount_total", None))
+        if total_cost is not None and total_cost > 0:
+            value = round(total_cost, 8)
+        else:
+            unit_price = to_float(getattr(h, "purchase_unit_price", None)) or to_float(h.purchase_price)
+            value = round(unit_price * qty, 8) if unit_price and qty else 0.0
         dto = HoldingOut(
             id=h.id,
             user_id=h.user_id,
