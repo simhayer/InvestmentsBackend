@@ -12,6 +12,7 @@ from services.ai.chat.gemini_stream_client import get_shared_gemini_client
 from services.ai.chat.tool_registry import ChatToolRegistry
 from services.finnhub.finnhub_service import FinnhubService
 from services.supabase_auth import get_current_db_user
+from services.tier import require_tier
 
 router = APIRouter()
 
@@ -25,6 +26,7 @@ async def stream_chat(
     user: User = Depends(get_current_db_user),
     finnhub: FinnhubService = Depends(get_finnhub_service),
 ):
+    require_tier(user, db, "chat_messages")
     try:
         tools = ChatToolRegistry(
             finnhub=finnhub,
