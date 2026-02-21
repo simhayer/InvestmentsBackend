@@ -159,6 +159,7 @@ FEATURES = [
     "symbol_inline",
     "crypto_full_analysis",
     "crypto_inline",
+    "chat_messages",
 ]
 
 

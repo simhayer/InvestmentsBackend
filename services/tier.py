@@ -46,6 +46,7 @@ class PlanLimits:
     crypto_full_analysis: int = 0
     crypto_inline: int = 0
     connections: int = 0           # max brokerage connections
+    chat_messages: int = 0         # daily AI chat messages
 
 
 PLAN_LIMITS: Dict[str, PlanLimits] = {
@@ -57,6 +58,7 @@ PLAN_LIMITS: Dict[str, PlanLimits] = {
         crypto_full_analysis=0,       # crypto is paid-only
         crypto_inline=0,
         connections=1,
+        chat_messages=15,             # 15 messages per day
     ),
     "premium": PlanLimits(
         portfolio_full_analysis=5,
@@ -66,6 +68,7 @@ PLAN_LIMITS: Dict[str, PlanLimits] = {
         crypto_full_analysis=5,
         crypto_inline=-1,
         connections=3,
+        chat_messages=100,            # 100 messages per day
     ),
     "pro": PlanLimits(
         portfolio_full_analysis=-1,
@@ -75,6 +78,7 @@ PLAN_LIMITS: Dict[str, PlanLimits] = {
         crypto_full_analysis=-1,
         crypto_inline=-1,
         connections=-1,
+        chat_messages=-1,             # unlimited
     ),
 }
 
