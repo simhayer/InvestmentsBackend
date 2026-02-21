@@ -25,21 +25,26 @@ load_dotenv()
 class FinnhubServiceError(Exception):
     """Domain-level error for the Finnhub service."""
 
-def format_finnhub_symbol(symbol: str, typ: str = "") -> str:
+def format_finnhub_symbol(symbol: str, typ: str = "", currency: Optional[str] = None) -> str:
     """
     Finnhub quote endpoint expects:
-      - Stocks/ETFs: "AAPL"
-      - Crypto often as "EXCHANGE:PAIR" (e.g., "BINANCE:BTCUSDT")
+      - US stocks/ETFs: "AAPL"
+      - Canadian (TSX): use .TO suffix for CAD-denominated prices (e.g. "FLT.TO", "VFV.TO")
+      - Crypto: "BINANCE:BTCUSDT"
     """
     s = (symbol or "").upper().strip()
     t = (typ or "").lower().strip()
+    ccy = (currency or "").upper().strip()
     if not s:
         return s
     if t == "cryptocurrency":
-        # If the symbol already looks qualified (e.g., "BINANCE:BTCUSDT"), keep it.
         if ":" in s:
             return s
         return f"BINANCE:{s}USDT"
+    # Canadian equity/ETF: use TSX suffix so Finnhub returns CAD price
+    if ccy == "CAD" and t in ("equity", "etf", "stock"):
+        if "." not in s:
+            return f"{s}.TO"
     return s
 
 @dataclass(frozen=True)

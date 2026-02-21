@@ -131,6 +131,69 @@ def _compute_pl_fields(h: HoldingOut) -> None:
 def get_all_holdings(user_id: str, db: Session) -> List[Holding]:
     return db.query(Holding).filter_by(user_id=user_id).all()
 
+
+def get_holdings_broker_only(
+    user_id: str,
+    db: Session,
+    currency: str | None = None,
+) -> Dict[str, Any]:
+    """
+    Return holdings using broker (DB) as source of truth only: currency from broker,
+    purchase_price, quantity, value = purchase_price * quantity. No live prices, no P/L.
+    """
+    rows = get_all_holdings(user_id, db)
+    as_of = int(time.time())
+    if not rows:
+        return {"items": [], "top_items": [], "as_of": as_of, "currency": None}
+
+    items: List[HoldingOut] = []
+    for h in rows:
+        qty = to_float(h.quantity)
+        unit_price = to_float(getattr(h, "purchase_unit_price", None)) or to_float(h.purchase_price)
+        # Value = purchase_price * quantity (cost basis); no current price
+        value = round(unit_price * qty, 8) if unit_price and qty else 0.0
+        dto = HoldingOut(
+            id=h.id,
+            user_id=h.user_id,
+            source=h.source,
+            external_id=h.external_id,
+            symbol=h.symbol,
+            name=h.name,
+            type=h.type,
+            quantity=h.quantity,
+            purchase_price=h.purchase_price,
+            value=value,
+            account_name=h.account_name,
+            institution=h.institution,
+            currency=(h.currency or "USD").strip().upper(),
+            purchase_amount_total=getattr(h, "purchase_amount_total", None),
+            purchase_unit_price=getattr(h, "purchase_unit_price", None),
+            current_price=None,
+            current_value=value,
+            unrealized_pl=None,
+            unrealized_pl_pct=None,
+            previous_close=None,
+            price_status=None,
+            day_pl=None,
+            weight=None,
+        )
+        items.append(dto)
+
+    # Optional: compute weights by cost (value)
+    total = sum(to_float(it.value) for it in items)
+    for it in items:
+        it.weight = round(to_float(it.value) / total * 100.0, 8) if total > 0 else 0.0
+
+    top_items = sorted(items, key=lambda x: to_float(x.value), reverse=True)[:5]
+    return {
+        "items": items,
+        "top_items": top_items,
+        "market_value": total,
+        "as_of": as_of,
+        "currency": None,  # per-holding currency from broker
+    }
+
+
 def _base_dto_from_row(h: Holding, currency_default: str) -> HoldingOut:
     return HoldingOut(
         id=h.id,
@@ -159,6 +222,11 @@ def enrich_holdings(
     quotes: Dict[str, Dict[str, Any] | None],
     currency: str = "USD",
 ) -> List[HoldingOut]:
+    """
+    Build DTOs for holdings. Prefer brokerage (Plaid) data when available so
+    current price, value, and P/L stay consistent with the institution. Only
+    use Finnhub for manual holdings or when brokerage did not provide a price.
+    """
     currency_default = currency.upper()
     enriched: List[HoldingOut] = []
 
@@ -167,21 +235,48 @@ def enrich_holdings(
         typ_n = normalize_asset_type(h.type)
         k_full = canonical_key(h.symbol, typ_n)
         q = quotes.get(k_full)
-
         qty = to_float(h.quantity)
 
-        if q and q.get("currentPrice") is not None:
+        # Prefer brokerage data for Plaid holdings: use DB current_price, value, P/L
+        # so maths match the institution (avg cost, P/L, etc.) instead of Finnhub.
+        db_price = to_float(h.current_price)
+        db_value = to_float(getattr(h, "current_value", None)) or to_float(h.value)
+        from_brokerage = (
+            getattr(h, "source", None) == "plaid"
+            and db_price is not None
+            and db_price > 0
+        )
+
+        if from_brokerage:
+            dto.current_price = db_price
+            if db_value is not None and db_value > 0:
+                dto.value = round(db_value, 8)
+            else:
+                dto.value = round(db_price * qty, 8) if qty > 0 else 0.0
+            dto.current_value = dto.value
+            dto.price_status = "brokerage"
+        elif q and q.get("currentPrice") is not None:
             live_price = to_float(q["currentPrice"])
             dto.current_price = live_price
             dto.previous_close = to_float(q.get("previousClose")) if q.get("previousClose") is not None else None
             dto.currency = (q.get("currency") or dto.currency or currency_default).upper()
             dto.price_status = "live"
+            price = live_price
+            dto.value = round(price * qty, 8) if price > 0 and qty > 0 else max(to_float(dto.value), 0.0)
+            dto.current_value = dto.value
         else:
             dto.price_status = "unavailable"
-
-        # set value consistently for everyone (live OR stored price)
-        price = to_float(dto.current_price)
-        dto.value = round(price * qty, 8) if price > 0 and qty > 0 else max(to_float(dto.value), 0.0)
+            price = to_float(dto.current_price)
+            if price > 0 and qty > 0:
+                dto.value = round(price * qty, 8)
+            else:
+                unit_cost = to_float(getattr(h, "purchase_unit_price", None)) or to_float(h.purchase_price)
+                if unit_cost and unit_cost > 0 and qty > 0:
+                    dto.current_price = unit_cost
+                    dto.value = round(unit_cost * qty, 8)
+                else:
+                    dto.value = max(to_float(dto.value), 0.0)
+            dto.current_value = dto.value
 
         enriched.append(dto)
 
@@ -219,39 +314,52 @@ async def get_holdings_with_live_prices(
     valued: List[Tuple[float, HoldingOut]] = []
 
     for it in enriched_items:
-        # Get the original database row to check its specific currency
+        # Get the original database row to check its specific currency (from broker via Plaid).
+        # Do not default brokerage holdings to USD when currency is missing—that causes CAD
+        # stocks (e.g. FLT, VFV) to be double-converted. Default plaid to CAD when empty.
         original_row = rows_map.get(it.id)
-        db_currency = (getattr(original_row, "currency", "USD") or "USD").upper()
+        raw_currency = getattr(original_row, "currency", None) or ""
+        raw_currency = (raw_currency or "").strip().upper()
+        if not raw_currency and getattr(original_row, "source", None) == "plaid":
+            raw_currency = "CAD"
+        db_currency = (raw_currency or "USD").upper()
         qty = to_float(it.quantity)
+        is_brokerage = getattr(it, "price_status", None) == "brokerage"
 
-        # --- STEP 1: Handle Live Price (Finnhub USD -> Target) ---
-        # Finnhub results are in USD. If target is CAD, convert.
-        if target_curr == "CAD":
-            it.current_price = round(to_float(it.current_price) * usd_to_cad_rate, 8)
-            if it.previous_close:
-                it.previous_close = round(it.previous_close * usd_to_cad_rate, 8)
-        elif target_curr == "USD":
-            # Already in USD from Finnhub, no conversion needed
-            pass
+        # --- STEP 1: Convert current price (and value for brokerage) to target currency ---
+        # Finnhub is always USD. Brokerage data uses db_currency.
+        if is_brokerage:
+            if db_currency == "USD" and target_curr == "CAD":
+                it.current_price = round(to_float(it.current_price) * usd_to_cad_rate, 8)
+                it.value = round(to_float(it.value) * usd_to_cad_rate, 8)
+                it.current_value = it.value
+            elif db_currency == "CAD" and target_curr == "USD":
+                it.current_price = round(to_float(it.current_price) / usd_to_cad_rate, 8)
+                it.value = round(to_float(it.value) / usd_to_cad_rate, 8)
+                it.current_value = it.value
+        else:
+            if target_curr == "CAD":
+                it.current_price = round(to_float(it.current_price) * usd_to_cad_rate, 8)
+                if it.previous_close:
+                    it.previous_close = round(it.previous_close * usd_to_cad_rate, 8)
 
         # --- STEP 2: Handle Cost Basis (DB Currency -> Target) ---
-        # If the DB stores CAD but we want USD portfolio view
         if db_currency == "CAD" and target_curr == "USD":
             it.purchase_unit_price = round(to_float(it.purchase_unit_price) / usd_to_cad_rate, 8)
             it.purchase_amount_total = round(to_float(it.purchase_amount_total) / usd_to_cad_rate, 8)
-        
-        # If the DB stores USD but we want CAD portfolio view
         elif db_currency == "USD" and target_curr == "CAD":
             it.purchase_unit_price = round(to_float(it.purchase_unit_price) * usd_to_cad_rate, 8)
             it.purchase_amount_total = round(to_float(it.purchase_amount_total) * usd_to_cad_rate, 8)
 
-        # --- STEP 3: Finalize Values ---
+        # --- STEP 3: Finalize value (brokerage already set in STEP 1) ---
         it.currency = target_curr
-        calc_val = round(to_float(it.current_price) * qty, 8)
-        
-        it.value = calc_val
-        it.current_value = calc_val
-        
+        if not is_brokerage:
+            calc_val = round(to_float(it.current_price) * qty, 8)
+            it.value = calc_val
+            it.current_value = calc_val
+        else:
+            calc_val = to_float(it.value)
+
         market_value += calc_val
         valued.append((calc_val, it))
 

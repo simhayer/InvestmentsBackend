@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import traceback
@@ -18,16 +19,29 @@ from models.user import User
 from services.plaid.plaid_config import client
 from services.plaid.plaid_service import get_connections, remove_connection
 from services.plaid.plaid_sync import sync_all_connections, sync_by_item_id
+from services.plaid.plaid_webhook_verify import is_webhook_verification_enabled, verify_plaid_webhook
 from services.supabase_auth import get_current_db_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 PLAID_WEBHOOK_URL = os.getenv("PLAID_WEBHOOK_URL")
+PLAID_ENV = os.getenv("PLAID_ENV", "sandbox").strip().lower()
 _frontend_url = os.getenv("FRONTEND_URL", "").rstrip("/")
 PLAID_REDIRECT_URI = os.getenv("PLAID_REDIRECT_URI") or (
     f"{_frontend_url}/plaid-oauth" if _frontend_url else None
 )
+
+
+def _redirect_uri_for_link(redirect_uri: Optional[str]) -> Optional[str]:
+    """Use redirect_uri only when valid. Production requires HTTPS; omit HTTP redirect so create_link_token succeeds locally."""
+    uri = (redirect_uri or PLAID_REDIRECT_URI or "").strip()
+    if not uri:
+        return None
+    if PLAID_ENV == "production" and uri.lower().startswith("http://"):
+        logger.info("Omitting HTTP redirect_uri for Plaid production (use HTTPS e.g. ngrok for OAuth redirect)")
+        return None
+    return uri
 
 # ----------- LINK TOKEN ----------------
 
@@ -36,6 +50,11 @@ async def create_link_token(
     user: User = Depends(get_current_db_user),
     redirect_uri: Optional[str] = Body(None, embed=True),
 ):
+    if not os.getenv("PLAID_CLIENT_ID") or not os.getenv("PLAID_SECRET"):
+        raise HTTPException(
+            status_code=503,
+            detail="Plaid is not configured. Set PLAID_CLIENT_ID and PLAID_SECRET in your environment.",
+        )
     try:
         kwargs = dict(
             products=[Products("investments")],
@@ -44,7 +63,7 @@ async def create_link_token(
             language="en",
             user=LinkTokenCreateRequestUser(client_user_id=str(user.id)),
         )
-        uri = redirect_uri or PLAID_REDIRECT_URI
+        uri = _redirect_uri_for_link(redirect_uri)
         if uri:
             kwargs["redirect_uri"] = uri
         if PLAID_WEBHOOK_URL:
@@ -54,7 +73,11 @@ async def create_link_token(
         response = client.link_token_create(request)
         return {"link_token": response.link_token}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error creating link token: {e}")
+        logger.exception("create_link_token failed: %s", e)
+        err_msg = str(e)
+        if "INVALID_API_KEYS" in err_msg or "invalid_client_id" in err_msg.lower():
+            err_msg = "Plaid API keys are invalid for the current environment. For production (live accounts), use production keys from the Plaid dashboard."
+        raise HTTPException(status_code=500, detail=err_msg)
 
 
 # ----------- EXCHANGE TOKEN ----------------
@@ -122,7 +145,17 @@ async def get_investments(
 # ----------- PLAID WEBHOOK ----------------
 @router.post("/webhook")
 async def plaid_webhook(request: Request, db: Session = Depends(get_db)):
-    body = await request.json()
+    raw_body = await request.body()
+    plaid_verification = request.headers.get("Plaid-Verification") or request.headers.get("plaid-verification")
+    if is_webhook_verification_enabled():
+        if not plaid_verification:
+            raise HTTPException(status_code=401, detail="Missing Plaid-Verification header")
+        if not verify_plaid_webhook(raw_body, plaid_verification):
+            raise HTTPException(status_code=401, detail="Invalid webhook signature")
+    try:
+        body = json.loads(raw_body)
+    except json.JSONDecodeError:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
     webhook_type = body.get("webhook_type", "")
     webhook_code = body.get("webhook_code", "")
     item_id = body.get("item_id", "")
@@ -173,6 +206,7 @@ async def create_update_link_token(
         raise HTTPException(status_code=404, detail="Connection not found")
 
     try:
+        # Update mode: access_token identifies the Item; no products needed for re-auth.
         kwargs = dict(
             client_name="Investment Tracker",
             country_codes=[CountryCode("US"), CountryCode("CA")],
@@ -180,7 +214,7 @@ async def create_update_link_token(
             user=LinkTokenCreateRequestUser(client_user_id=str(user.id)),
             access_token=token_entry.access_token,
         )
-        uri = redirect_uri or PLAID_REDIRECT_URI
+        uri = _redirect_uri_for_link(redirect_uri)
         if uri:
             kwargs["redirect_uri"] = uri
         if PLAID_WEBHOOK_URL:
