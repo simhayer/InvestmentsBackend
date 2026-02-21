@@ -1,6 +1,7 @@
 # routers/holdings_routes.py
 from __future__ import annotations
 
+import logging
 import time
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -18,6 +19,7 @@ from services.supabase_auth import get_current_db_user
 from services.yahoo_service import get_price_history
 from utils.common_helpers import to_float, canonical_key, normalize_asset_type
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 def _yahoo_symbol(symbol: str, typ: str, currency: str) -> str:
@@ -39,7 +41,7 @@ def save_holding(
     db: Session = Depends(get_db),
     user=Depends(get_current_db_user),
 ):
-    return create_holding(
+    out = create_holding(
         db,
         user.id,
         holding.symbol,
@@ -49,6 +51,8 @@ def save_holding(
         name=holding.name,
         currency=holding.currency or "USD",
     )
+    logger.info("holding_created user_id=%s symbol=%s holding_id=%s", user.id, holding.symbol, getattr(out, "id", None))
+    return out
 
 @router.put("/holdings/{holding_id}")
 def edit_holding(
@@ -60,10 +64,13 @@ def edit_holding(
     try:
         updates = payload.model_dump(exclude_none=True)
         updated = update_holding(db, user.id, holding_id, updates)
+        logger.info("holding_updated user_id=%s holding_id=%s", user.id, holding_id)
         return updated
     except ValueError:
+        logger.warning("edit_holding: holding not found holding_id=%s user_id=%s", holding_id, user.id)
         raise HTTPException(status_code=404, detail="Holding not found")
     except PermissionError:
+        logger.warning("edit_holding: permission denied (non-manual holding) holding_id=%s user_id=%s", holding_id, user.id)
         raise HTTPException(status_code=403, detail="Only manually added holdings can be edited")
 
 @router.get("/holdings")
@@ -78,12 +85,15 @@ async def get_holdings(
     When includePrices=true, current_price is filled from Finnhub (Canadian equity/ETF use TSX .TO for CAD;
     crypto quotes are in USD and are converted to the holding's currency when different)."""
     if not includePrices:
-        return get_all_holdings(str(user.id), db)
+        out = get_all_holdings(str(user.id), db)
+        logger.info("holdings_list user_id=%s include_prices=false count=%s", user.id, len(out))
+        return out
 
     data = get_holdings_broker_only(str(user.id), db)
     target_currency = resolve_currency(user, currency)
     if not data.get("items"):
         data["currency"] = target_currency
+        logger.info("holdings_list user_id=%s include_prices=true count=0", user.id)
         return data
 
     # Build (symbol, type) pairs for Finnhub; use TSX .TO for CAD equity/ETF so prices are in CAD
@@ -128,6 +138,7 @@ async def get_holdings(
         total_in_target += converted
     data["market_value"] = round(total_in_target, 2)
     data["currency"] = target_currency
+    logger.info("holdings_list user_id=%s include_prices=true count=%s", user.id, len(data.get("items") or []))
     return data
 
 
@@ -213,6 +224,7 @@ async def get_portfolio_history(
         out_points.append({"t": date_ts, "value": round(total, 2)})
 
     out_points.sort(key=lambda x: x["t"])
+    logger.info("portfolio_history user_id=%s days=%s points=%s", user.id, days, len(out_points))
     return {"points": out_points, "currency": target_currency}
 
 
@@ -224,8 +236,10 @@ def delete_holding(
 ):
     holding = db.query(Holding).filter_by(id=holding_id, user_id=user.id).first()
     if not holding:
+        logger.warning("delete_holding: holding not found holding_id=%s user_id=%s", holding_id, user.id)
         raise HTTPException(status_code=404, detail="Holding not found")
 
     db.delete(holding)
     db.commit()
+    logger.info("holding_deleted user_id=%s holding_id=%s", user.id, holding_id)
     return {"detail": "Deleted"}

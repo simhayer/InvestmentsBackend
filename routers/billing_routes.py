@@ -94,6 +94,7 @@ def create_checkout_session(
             subscription_data={},
             allow_promotion_codes=True,
         )
+        logger.info("checkout_session_created plan=%s customer_id=%s", payload.plan, customer_id)
         return {"url": session["url"]}
     except Exception as e:
         logger.exception("Stripe checkout session creation failed")
@@ -117,6 +118,7 @@ def create_portal_session(
         customer=row.stripe_customer_id,
         return_url=f"{FRONTEND_URL}/settings",
     )
+    logger.info("portal_session_created user_id=%s", user.id)
     return {"url": session["url"]}
 
 
@@ -240,5 +242,7 @@ async def stripe_webhook(request: Request, db: Session = Depends(get_db)):
 
             db.add(row)
             db.commit()
+            logger.info("stripe_subscription_updated customer_id=%s plan=%s status=%s", customer_id, plan, status)
 
+    logger.info("stripe_webhook_processed type=%s", event["type"])
     return {"received": True}

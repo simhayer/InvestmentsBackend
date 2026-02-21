@@ -113,6 +113,7 @@ async def get_full_crypto_analysis(
             include_inline=include_inline,
             force_refresh=force_refresh,
         )
+        logger.info("crypto_analysis_completed symbol=%s", symbol.upper())
         return result
     except HTTPException:
         raise
@@ -143,6 +144,7 @@ async def get_crypto_inline_insights(
         result = await get_crypto_insights(
             symbol.upper(), force_refresh=force_refresh
         )
+        logger.info("crypto_inline_insights_completed symbol=%s", symbol.upper())
         return result
     except HTTPException:
         raise
@@ -163,6 +165,7 @@ async def get_raw_crypto_data(request: Request, symbol: str, _user=Depends(get_c
 
     try:
         bundle = await aggregate_crypto_data(symbol.upper())
+        logger.info("crypto_data_fetched symbol=%s", symbol.upper())
         return {
             "symbol": symbol.upper(),
             "data": bundle.to_dict(),

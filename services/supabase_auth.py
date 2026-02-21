@@ -63,7 +63,8 @@ def get_current_db_user(
 
     try:
         user = _query_user()
-    except DBAPIError:
+    except DBAPIError as e:
+        logger.warning("get_current_db_user: DB query failed (retrying): %s", e)
         db.rollback()
         user = _query_user()
     if user:
@@ -91,7 +92,8 @@ def get_current_db_user(
         db.add(user)
         db.commit()
         db.refresh(user)
-    except DBAPIError:
+    except DBAPIError as e:
+        logger.warning("get_current_db_user: create user failed (retrying): %s", e)
         db.rollback()
         db.add(user)
         db.commit()

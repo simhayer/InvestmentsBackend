@@ -104,6 +104,7 @@ async def get_full_analysis(
             include_inline=include_inline,
             force_refresh=force_refresh,
         )
+        logger.info("symbol_analysis_completed symbol=%s", symbol.upper())
         return result
     except HTTPException:
         raise
@@ -132,6 +133,7 @@ async def get_inline_insights(
     
     try:
         result = await get_stock_insights(symbol.upper(), force_refresh=force_refresh)
+        logger.info("symbol_inline_insights_completed symbol=%s", symbol.upper())
         return result
     except HTTPException:
         raise
@@ -161,7 +163,7 @@ async def get_quick_summary(request: Request, symbol: str, _user=Depends(get_cur
         
         ai = AIAnalysisService()
         result = await ai.generate_quick_summary(context)
-        
+        logger.info("symbol_summary_completed symbol=%s", symbol.upper())
         return {
             "symbol": symbol.upper(),
             "summary": result.get("summary", ""),
@@ -184,6 +186,7 @@ async def get_raw_data(request: Request, symbol: str, _user=Depends(get_current_
     
     try:
         bundle = await aggregate_stock_data(symbol.upper())
+        logger.info("symbol_data_fetched symbol=%s", symbol.upper())
         return {
             "symbol": symbol.upper(),
             "data": bundle.to_dict(),

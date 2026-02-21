@@ -1,3 +1,5 @@
+import logging
+
 from fastapi import APIRouter, Body, Depends, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from sqlalchemy.orm import Session
@@ -13,6 +15,7 @@ from services.ai.chat.tool_registry import ChatToolRegistry
 from services.finnhub.finnhub_service import FinnhubService
 from services.supabase_auth import get_current_db_user
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -37,6 +40,7 @@ async def stream_chat(
             db=db,
             user_id=user.id,
         )
+        logger.info("chat_stream_started user_id=%s", user.id)
 
         async def event_generator():
             async for event in orchestrator.stream_sse(
@@ -56,4 +60,5 @@ async def stream_chat(
             headers=headers,
         )
     except Exception as e:
+        logger.exception("chat/stream failed: %s", e)
         return JSONResponse(status_code=500, content={"error": str(e)})

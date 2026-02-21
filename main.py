@@ -1,10 +1,24 @@
 # main.py
 import logging
 import os
+import sys
+import time
 import json
 import tempfile
 from dotenv import load_dotenv
 load_dotenv()
+
+# ─── Logging (stdout for Railway) ───────────────────────────────────
+_log_level = getattr(logging, os.getenv("LOG_LEVEL", "INFO").upper(), logging.INFO)
+_handler = logging.StreamHandler(sys.stdout)
+_handler.setLevel(_log_level)
+_handler.setFormatter(
+    logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+)
+_root = logging.getLogger()
+_root.setLevel(_log_level)
+_root.handlers.clear()
+_root.addHandler(_handler)
 
 _sa_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
 if _sa_json and not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
@@ -20,6 +34,7 @@ if _sa_json and not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from starlette.middleware.base import BaseHTTPMiddleware
 from slowapi import _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 
@@ -43,7 +58,7 @@ from routers.filing_routes import router as filing_router
 from routers.v2.analyze_symbol_routes import router as analyze_symbol_router
 from routers.v2.analyze_portfolio_routes import router as analyze_portfolio_router
 from routers.v2.analyze_crypto_routes import router as analyze_crypto_router
-
+from routers.log_routes import router as log_router
 
 # load crypto catalog on startup
 from contextlib import asynccontextmanager
@@ -99,12 +114,52 @@ app.add_middleware(
     allow_origin_regex=r"https?://(localhost|127\.0\.0\.1)(:\d+)?$",
 )
 
+
+# ─── Request logging (Railway) ─────────────────────────────────────
+class RequestLoggingMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request, call_next):
+        start = time.perf_counter()
+        response = await call_next(request)
+        duration_ms = (time.perf_counter() - start) * 1000
+        user_id = None
+        try:
+            auth = request.headers.get("Authorization")
+            if auth and auth.lower().startswith("bearer "):
+                token = auth.split(" ", 1)[1].strip()
+                secret = os.getenv("SUPABASE_JWT_SECRET")
+                aud = os.getenv("SUPABASE_JWT_AUD", "authenticated")
+                url = os.getenv("SUPABASE_PROJECT_URL", "").rstrip("/")
+                if secret and url:
+                    from jose import jwt, JWTError
+                    payload = jwt.decode(
+                        token, secret, algorithms=["HS256"],
+                        audience=aud,
+                        issuer=f"{url}/auth/v1",
+                    )
+                    user_id = payload.get("sub")
+        except Exception:
+            pass
+        extra = f" user={user_id}" if user_id else ""
+        logger.info(
+            "request | %s %s | %s | %.1fms%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+            extra,
+        )
+        return response
+
+
+app.add_middleware(RequestLoggingMiddleware)
+
 # ─── Health check ────────────────────────────────────────────────
 @app.get("/health", tags=["ops"])
 async def health_check():
     return JSONResponse({"status": "ok"})
 
 # Include routers
+app.include_router(log_router, prefix="/api")
 app.include_router(user_router)
 app.include_router(holdings_router)
 app.include_router(finnhub_router, prefix="/api/finnhub")

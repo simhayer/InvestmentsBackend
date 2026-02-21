@@ -1,4 +1,6 @@
 # routers/crypto_routes.py
+import logging
+
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.orm import Session
 
@@ -8,6 +10,7 @@ from services.binance_service import (
     load_crypto_catalog,
 )
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 @router.post("/refresh-catalog")
@@ -26,6 +29,7 @@ async def refresh_crypto_catalog_endpoint(
         # 2) Reload in-memory cache FROM DB
         cache = load_crypto_catalog(db, provider="binance")
 
+        logger.info("crypto_catalog_refreshed provider=binance coins_found=%s added=%s", result.get("coins_found"), result.get("added"))
         return {
             "status": "ok",
             **result,   # provider, coins_found, added
@@ -33,6 +37,7 @@ async def refresh_crypto_catalog_endpoint(
         }
 
     except Exception as e:
+        logger.exception("refresh crypto catalog failed: %s", e)
         raise HTTPException(
             status_code=500,
             detail=f"Failed to refresh crypto catalog: {str(e)}",
