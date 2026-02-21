@@ -61,6 +61,8 @@ class HoldingOut(BaseModel):
     purchase_unit_price: float | None = None     # per-unit cost
     unrealized_pl: float | None = None           # total P/L
     unrealized_pl_pct: float | None = None       # % P/L
-    current_value: float | None = None           
+    current_value: float | None = None
+    # Cost basis converted to user's display currency (when includePrices=true)
+    value_in_display_currency: float | None = None
 
 # If you want, add derived fields via @computed_field in Pydantic v2
