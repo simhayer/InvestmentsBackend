@@ -162,7 +162,7 @@ async def get_full_portfolio_analysis(
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Portfolio analysis failed")
+        logger.exception("portfolio_analysis_failed user_id=%s: %s", user.id, e)
         raise HTTPException(status_code=500, detail="Analysis failed")
 
 
@@ -199,7 +199,7 @@ async def get_portfolio_inline_insights(
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("Portfolio inline insights failed")
+        logger.exception("portfolio_inline_insights_failed user_id=%s: %s", user.id, e)
         raise HTTPException(status_code=500, detail="Insights failed")
 
 
@@ -239,7 +239,7 @@ async def get_portfolio_summary(
             "health": result.get("health", "Good"),
         }
     except Exception as e:
-        logger.exception("Portfolio summary failed")
+        logger.exception("portfolio_summary_failed user_id=%s: %s", user.id, e)
         raise HTTPException(status_code=500, detail="Summary failed")
 
 
@@ -272,5 +272,5 @@ async def get_portfolio_raw_data(
             "context": bundle.to_ai_context(),
         }
     except Exception as e:
-        logger.exception("Portfolio data fetch failed")
+        logger.exception("portfolio_data_fetch_failed user_id=%s: %s", user.id, e)
         raise HTTPException(status_code=500, detail="Data fetch failed")

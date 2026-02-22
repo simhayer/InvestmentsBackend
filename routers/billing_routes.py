@@ -94,10 +94,10 @@ def create_checkout_session(
             subscription_data={},
             allow_promotion_codes=True,
         )
-        logger.info("checkout_session_created plan=%s customer_id=%s", payload.plan, customer_id)
+        logger.info("checkout_session_created user_id=%s plan=%s customer_id=%s", user.id, payload.plan, customer_id)
         return {"url": session["url"]}
     except Exception as e:
-        logger.exception("Stripe checkout session creation failed")
+        logger.exception("checkout_session_failed user_id=%s: %s", user.id, e)
         raise HTTPException(400, detail="Could not create checkout session")
 
 

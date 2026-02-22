@@ -62,5 +62,5 @@ async def stream_chat(
             headers=headers,
         )
     except Exception as e:
-        logger.exception("chat/stream failed: %s", e)
+        logger.exception("chat_stream_failed user_id=%s: %s", user.id, e)
         return JSONResponse(status_code=500, content={"error": str(e)})

@@ -113,12 +113,12 @@ async def get_full_crypto_analysis(
             include_inline=include_inline,
             force_refresh=force_refresh,
         )
-        logger.info("crypto_analysis_completed symbol=%s", symbol.upper())
+        logger.info("crypto_analysis_completed user_id=%s symbol=%s", _user.id, symbol.upper())
         return result
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception(f"Crypto analysis failed for {symbol}")
+        logger.exception("crypto_analysis_failed user_id=%s symbol=%s: %s", _user.id, symbol, e)
         raise HTTPException(status_code=500, detail="Analysis failed")
 
 
@@ -144,12 +144,12 @@ async def get_crypto_inline_insights(
         result = await get_crypto_insights(
             symbol.upper(), force_refresh=force_refresh
         )
-        logger.info("crypto_inline_insights_completed symbol=%s", symbol.upper())
+        logger.info("crypto_inline_insights_completed user_id=%s symbol=%s", _user.id, symbol.upper())
         return result
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception(f"Crypto inline insights failed for {symbol}")
+        logger.exception("crypto_inline_insights_failed user_id=%s symbol=%s: %s", _user.id, symbol, e)
         raise HTTPException(status_code=500, detail="Insights failed")
 
 
@@ -165,12 +165,12 @@ async def get_raw_crypto_data(request: Request, symbol: str, _user=Depends(get_c
 
     try:
         bundle = await aggregate_crypto_data(symbol.upper())
-        logger.info("crypto_data_fetched symbol=%s", symbol.upper())
+        logger.info("crypto_data_fetched user_id=%s symbol=%s", _user.id, symbol.upper())
         return {
             "symbol": symbol.upper(),
             "data": bundle.to_dict(),
             "context": bundle.to_ai_context(),
         }
     except Exception as e:
-        logger.exception(f"Crypto data fetch failed for {symbol}")
+        logger.exception("crypto_data_fetch_failed user_id=%s symbol=%s: %s", _user.id, symbol, e)
         raise HTTPException(status_code=500, detail="Data fetch failed")

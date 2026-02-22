@@ -104,12 +104,12 @@ async def get_full_analysis(
             include_inline=include_inline,
             force_refresh=force_refresh,
         )
-        logger.info("symbol_analysis_completed symbol=%s", symbol.upper())
+        logger.info("symbol_analysis_completed user_id=%s symbol=%s", _user.id, symbol.upper())
         return result
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception(f"Analysis failed for {symbol}")
+        logger.exception("symbol_analysis_failed user_id=%s symbol=%s: %s", _user.id, symbol, e)
         raise HTTPException(status_code=500, detail="Analysis failed")
 
 
@@ -133,18 +133,22 @@ async def get_inline_insights(
     
     try:
         result = await get_stock_insights(symbol.upper(), force_refresh=force_refresh)
-        logger.info("symbol_inline_insights_completed symbol=%s", symbol.upper())
+        logger.info("symbol_inline_insights_completed user_id=%s symbol=%s", _user.id, symbol.upper())
         return result
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception(f"Inline insights failed for {symbol}")
+        logger.exception("symbol_inline_insights_failed user_id=%s symbol=%s: %s", _user.id, symbol, e)
         raise HTTPException(status_code=500, detail="Insights failed")
 
 
 @router.get("/summary/{symbol}", response_model=QuickSummaryResponse)
 @limiter.limit("20/minute")
-async def get_quick_summary(request: Request, symbol: str, _user=Depends(get_current_db_user)):
+async def get_quick_summary(
+    request: Request,
+    symbol: str,
+    _user=Depends(get_current_db_user),
+):
     """
     Get just a summary paragraph and verdict.
     
@@ -163,14 +167,14 @@ async def get_quick_summary(request: Request, symbol: str, _user=Depends(get_cur
         
         ai = AIAnalysisService()
         result = await ai.generate_quick_summary(context)
-        logger.info("symbol_summary_completed symbol=%s", symbol.upper())
+        logger.info("symbol_summary_completed user_id=%s symbol=%s", _user.id, symbol.upper())
         return {
             "symbol": symbol.upper(),
             "summary": result.get("summary", ""),
             "verdict": result.get("verdict", "Neutral"),
         }
     except Exception as e:
-        logger.exception(f"Quick summary failed for {symbol}")
+        logger.exception("symbol_summary_failed user_id=%s symbol=%s: %s", _user.id, symbol, e)
         raise HTTPException(status_code=500, detail="Summary failed")
 
 
@@ -186,12 +190,12 @@ async def get_raw_data(request: Request, symbol: str, _user=Depends(get_current_
     
     try:
         bundle = await aggregate_stock_data(symbol.upper())
-        logger.info("symbol_data_fetched symbol=%s", symbol.upper())
+        logger.info("symbol_data_fetched user_id=%s symbol=%s", _user.id, symbol.upper())
         return {
             "symbol": symbol.upper(),
             "data": bundle.to_dict(),
             "context": bundle.to_ai_context(),
         }
     except Exception as e:
-        logger.exception(f"Data fetch failed for {symbol}")
+        logger.exception("symbol_data_fetch_failed user_id=%s symbol=%s: %s", _user.id, symbol, e)
         raise HTTPException(status_code=500, detail="Data fetch failed")

@@ -74,7 +74,7 @@ async def create_link_token(
         logger.info("plaid_link_token_created user_id=%s", user.id)
         return {"link_token": response.link_token}
     except Exception as e:
-        logger.exception("create_link_token failed: %s", e)
+        logger.exception("create_link_token_failed user_id=%s: %s", user.id, e)
         err_msg = str(e)
         if "INVALID_API_KEYS" in err_msg or "invalid_client_id" in err_msg.lower():
             err_msg = "Plaid API keys are invalid for the current environment. For production (live accounts), use production keys from the Plaid dashboard."
@@ -121,7 +121,7 @@ async def exchange_token(
         return {"access_token": access_token}
 
     except Exception as e:
-        logger.error("Token exchange failed:\n%s", traceback.format_exc())
+        logger.error("token_exchange_failed user_id=%s: %s", user.id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Token exchange failed: {e}")
 
 
@@ -231,7 +231,7 @@ async def create_update_link_token(
         logger.info("plaid_update_link_token_created user_id=%s connection_id=%s", user.id, connection_id)
         return {"link_token": response.link_token}
     except Exception as e:
-        logger.error("Update link token failed:\n%s", traceback.format_exc())
+        logger.error("update_link_token_failed user_id=%s connection_id=%s: %s", user.id, connection_id, e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error creating update link token: {e}")
 
 
@@ -255,7 +255,7 @@ async def get_connected_institutions(
         logger.info("plaid_institutions_listed user_id=%s count=%s", user.id, len(out))
         return out
     except Exception as e:
-        logger.exception("Error fetching institutions")
+        logger.exception("plaid_institutions_failed user_id=%s: %s", user.id, e)
         raise HTTPException(status_code=500, detail="Failed to fetch institutions")
 
 
@@ -271,6 +271,6 @@ async def delete_connection(
         return {"detail": "Connection removed"}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
-    except Exception:
-        logger.exception("Error removing connection %s", connection_id)
+    except Exception as e:
+        logger.exception("plaid_connection_remove_failed user_id=%s connection_id=%s: %s", user.id, connection_id, e)
         raise HTTPException(status_code=500, detail="Failed to remove connection")
