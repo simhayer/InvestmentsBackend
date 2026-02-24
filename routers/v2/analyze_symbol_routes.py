@@ -13,7 +13,8 @@ from database import get_db
 from sqlalchemy.orm import Session
 from services.supabase_auth import get_current_db_user
 from middleware.rate_limit import limiter
-from services.tier import require_tier
+from services.tier import require_tier, increment_usage, get_user_plan
+from services.cache.cache_backend import cache_get
 
 logger = logging.getLogger(__name__)
 
@@ -66,6 +67,7 @@ class AnalysisResponse(BaseModel):
     inline: Optional[InlineInsightsResponse] = None
     dataGaps: List[str]
     cached: Optional[bool] = None
+    stale: Optional[bool] = None
     lastAnalyzedAt: Optional[str] = None
 
 
@@ -94,22 +96,56 @@ async def get_full_analysis(
     
     Returns cached result if less than 12h old, unless force_refresh=true.
     """
-    require_tier(_user, db, "symbol_full_analysis")
-
     from services.ai.analyze_symbol.analyze_symbol_service import analyze_stock
-    
+
+    sym = symbol.upper()
+    cache_key = f"analysis:full:{sym}"
+
+    def _get_cached():
+        try:
+            c = cache_get(cache_key)
+            if c and isinstance(c, dict):
+                return c
+        except Exception:
+            logger.exception("symbol_cache_check_failed user_id=%s symbol=%s", _user.id, sym)
+        return None
+
+    # 1) Fresh cache — serve without consuming quota
+    if not force_refresh:
+        cached = _get_cached()
+        if cached:
+            logger.info("symbol_analysis_cache_hit user_id=%s symbol=%s", _user.id, sym)
+            cached["cached"] = True
+            return cached
+
+    # 2) Cache miss or force refresh — check quota (without incrementing)
+    try:
+        require_tier(_user, db, "symbol_full_analysis", increment=False)
+    except HTTPException as tier_exc:
+        if tier_exc.status_code == 403:
+            stale = _get_cached()
+            if stale:
+                logger.info("symbol_analysis_stale_fallback user_id=%s symbol=%s", _user.id, sym)
+                stale["cached"] = True
+                stale["stale"] = True
+                return stale
+        raise
+
+    # 3) Run fresh analysis, only increment quota on success
     try:
         result = await analyze_stock(
-            symbol.upper(),
+            sym,
             include_inline=include_inline,
             force_refresh=force_refresh,
         )
-        logger.info("symbol_analysis_completed user_id=%s symbol=%s", _user.id, symbol.upper())
+        plan = get_user_plan(_user, db)
+        increment_usage(_user.id, "symbol_full_analysis", plan)
+        logger.info("symbol_analysis_completed user_id=%s symbol=%s", _user.id, sym)
         return result
     except HTTPException:
         raise
     except Exception as e:
-        logger.exception("symbol_analysis_failed user_id=%s symbol=%s: %s", _user.id, symbol, e)
+        logger.exception("symbol_analysis_failed user_id=%s symbol=%s: %s", _user.id, sym, e)
         raise HTTPException(status_code=500, detail="Analysis failed")
 
 
@@ -127,10 +163,21 @@ async def get_inline_insights(
     
     Cached for 6 hours. Pass force_refresh=true to recompute.
     """
+    from services.ai.analyze_symbol.analyze_symbol_service import get_stock_insights
+
+    # Serve cached inline insights without consuming quota
+    if not force_refresh:
+        try:
+            inline_key = f"analysis:inline:{symbol.upper()}"
+            cached = cache_get(inline_key)
+            if cached and isinstance(cached, dict):
+                logger.info("symbol_inline_cache_hit user_id=%s symbol=%s", _user.id, symbol.upper())
+                return cached
+        except Exception:
+            logger.exception("symbol_inline_cache_check_failed user_id=%s symbol=%s", _user.id, symbol)
+
     require_tier(_user, db, "symbol_inline")
 
-    from services.ai.analyze_symbol.analyze_symbol_service import get_stock_insights
-    
     try:
         result = await get_stock_insights(symbol.upper(), force_refresh=force_refresh)
         logger.info("symbol_inline_insights_completed user_id=%s symbol=%s", _user.id, symbol.upper())

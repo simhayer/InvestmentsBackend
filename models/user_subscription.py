@@ -31,6 +31,9 @@ class UserSubscription(Base):
     cancel_at_period_end: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sa_false(), nullable=False)
     cancel_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
+    has_used_refund: Mapped[bool] = mapped_column(Boolean, default=False, server_default=sa_false(), nullable=False)
+    refunded_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now(), nullable=False)
 

@@ -27,6 +27,8 @@ WEBHOOK_SECRET = os.environ.get("STRIPE_WEBHOOK_SECRET")
 
 Plan = Literal["premium", "pro"]
 
+REFUND_WINDOW_DAYS = int(os.environ.get("REFUND_WINDOW_DAYS", "7"))
+
 
 def get_or_create_sub(db: Session, user: User) -> UserSubscription:
     sub = db.query(UserSubscription).filter_by(user_id=user.id).first()
@@ -181,6 +183,146 @@ def get_my_usage(
             limit=get_limit(plan, feat),
         ))
     return UsageOut(plan=plan, usage=items)
+
+
+# ─── Refund ────────────────────────────────────────────────────
+
+
+class RefundEligibilityOut(BaseModel):
+    eligible: bool
+    days_left: Optional[int] = None
+    reason: Optional[str] = None
+
+
+@router.get("/refund-eligibility", response_model=RefundEligibilityOut)
+def check_refund_eligibility(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_db_user),
+):
+    row = get_or_create_sub(db, user)
+
+    if row.plan == "free" or row.status not in ("active", "trialing"):
+        return RefundEligibilityOut(eligible=False, reason="No active paid subscription.")
+
+    if row.has_used_refund:
+        return RefundEligibilityOut(eligible=False, reason="Refund has already been used.")
+
+    if not row.stripe_subscription_id:
+        return RefundEligibilityOut(eligible=False, reason="No subscription found.")
+
+    try:
+        sub_obj = stripe.Subscription.retrieve(row.stripe_subscription_id)
+        started_at = datetime.fromtimestamp(sub_obj["start_date"], tz=timezone.utc)
+        age = datetime.now(timezone.utc) - started_at
+        days_left = REFUND_WINDOW_DAYS - age.days
+
+        if days_left <= 0:
+            return RefundEligibilityOut(eligible=False, reason="Refund window has expired.")
+
+        return RefundEligibilityOut(eligible=True, days_left=days_left)
+    except Exception:
+        logger.exception("refund_eligibility_check_failed user_id=%s", user.id)
+        return RefundEligibilityOut(eligible=False, reason="Could not verify eligibility.")
+
+
+class RefundOut(BaseModel):
+    ok: bool
+    message: str
+
+
+@router.post("/refund", response_model=RefundOut)
+def request_refund(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_db_user),
+):
+    row = get_or_create_sub(db, user)
+
+    if row.plan == "free" or row.status not in ("active", "trialing"):
+        raise HTTPException(400, detail="No active paid subscription to refund.")
+
+    if row.has_used_refund:
+        raise HTTPException(400, detail="You have already used your refund.")
+
+    if not row.stripe_subscription_id:
+        raise HTTPException(400, detail="No Stripe subscription found.")
+
+    # Verify the refund window using Stripe as source of truth
+    try:
+        sub_obj = stripe.Subscription.retrieve(row.stripe_subscription_id)
+    except Exception:
+        logger.exception("stripe_sub_retrieve_failed user_id=%s", user.id)
+        raise HTTPException(400, detail="Could not retrieve subscription details.")
+
+    started_at = datetime.fromtimestamp(sub_obj["start_date"], tz=timezone.utc)
+    age = datetime.now(timezone.utc) - started_at
+    if age.days > REFUND_WINDOW_DAYS:
+        raise HTTPException(
+            400,
+            detail=f"Refund window has expired. Refunds are available within {REFUND_WINDOW_DAYS} days of purchase.",
+        )
+
+    try:
+        # Find the latest paid invoice with a charge
+        invoices = stripe.Invoice.list(
+            subscription=row.stripe_subscription_id,
+            status="paid",
+            limit=5,
+        )
+
+        charge_id = None
+        payment_intent_id = None
+        for inv in invoices.data:
+            charge_id = inv.get("charge")
+            payment_intent_id = inv.get("payment_intent")
+            if charge_id or payment_intent_id:
+                break
+
+        logger.info(
+            "refund_invoice_lookup user_id=%s invoices_found=%s charge=%s pi=%s",
+            user.id, len(invoices.data), charge_id, payment_intent_id,
+        )
+
+        if not charge_id and not payment_intent_id:
+            # No paid invoice — cancel without refund (nothing was charged)
+            stripe.Subscription.cancel(row.stripe_subscription_id)
+            logger.info("stripe_sub_canceled_no_charge user_id=%s", user.id)
+
+            row.plan = "free"
+            row.status = "canceled"
+            row.has_used_refund = True
+            row.refunded_at = datetime.now(timezone.utc)
+            row.updated_at = datetime.now(timezone.utc)
+            db.add(row)
+            db.commit()
+
+            return RefundOut(ok=True, message="Subscription canceled. No charge was found to refund.")
+
+        refund_params: dict = {"reason": "requested_by_customer"}
+        if charge_id:
+            refund_params["charge"] = charge_id
+        else:
+            refund_params["payment_intent"] = payment_intent_id
+
+        stripe.Refund.create(**refund_params)
+        logger.info("stripe_refund_issued user_id=%s sub_id=%s", user.id, row.stripe_subscription_id)
+
+        stripe.Subscription.cancel(row.stripe_subscription_id)
+        logger.info("stripe_sub_canceled_for_refund user_id=%s", user.id)
+
+        row.plan = "free"
+        row.status = "canceled"
+        row.has_used_refund = True
+        row.refunded_at = datetime.now(timezone.utc)
+        row.updated_at = datetime.now(timezone.utc)
+        db.add(row)
+        db.commit()
+
+        return RefundOut(ok=True, message="Refund issued and subscription canceled.")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("stripe_refund_failed user_id=%s", user.id)
+        raise HTTPException(400, detail="Refund failed. Please contact support.")
 
 
 # Webhook: no auth
