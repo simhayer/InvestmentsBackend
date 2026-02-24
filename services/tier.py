@@ -51,7 +51,7 @@ class PlanLimits:
 
 PLAN_LIMITS: Dict[str, PlanLimits] = {
     "free": PlanLimits(
-        portfolio_full_analysis=1,    # 1 per WEEK (see TTL override below)
+        portfolio_full_analysis=1,    # 1 per day
         portfolio_inline=5,
         symbol_full_analysis=3,       # 3 stocks per day
         symbol_inline=10,
@@ -85,9 +85,7 @@ PLAN_LIMITS: Dict[str, PlanLimits] = {
 # Features whose counters reset on a non-default window.
 # Key = (plan, feature) or just feature (applies to all plans).
 # Value = TTL in seconds.
-FEATURE_TTL_OVERRIDES: Dict[str, int] = {
-    "free:portfolio_full_analysis": WEEK_SEC,   # 1 per week on free
-}
+FEATURE_TTL_OVERRIDES: Dict[str, int] = {}
 
 
 # ─── Helpers ─────────────────────────────────────────────────────
