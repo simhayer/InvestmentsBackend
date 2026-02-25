@@ -16,6 +16,14 @@ from services.ai.llm_service import get_llm_service
 
 logger = logging.getLogger(__name__)
 
+LEGAL_DISCLAIMER = (
+    "AI-generated analysis for informational and educational purposes only. "
+    "This does not constitute financial advice, investment advice, or a recommendation "
+    "to buy, sell, or hold any security. AI outputs may contain errors. "
+    "Past performance does not guarantee future results. "
+    "Always consult a qualified financial advisor before making investment decisions."
+)
+
 # Default TTL for cached portfolio analysis (24 hours)
 PORTFOLIO_ANALYSIS_TTL_HOURS = 24
 
@@ -112,24 +120,32 @@ class PortfolioInlineInsights:
 # PROMPTS
 # ============================================================================
 
-PORTFOLIO_SYSTEM_PROMPT = """You are a senior portfolio analyst at a wealth-management firm.
-Your role is to provide data-driven, quantitative portfolio analysis personalized to the investor.
+PORTFOLIO_SYSTEM_PROMPT = """You are an AI assistant that provides data-driven portfolio analytics for educational and informational purposes only.
+You are NOT a licensed financial advisor, broker, or fiduciary. Your outputs do not constitute financial advice, investment advice, or a recommendation to buy, sell, or hold any security.
 
-Guidelines:
+Legal guardrails — you MUST follow these at all times:
+- NEVER use imperative language like "you should buy", "sell this now", or "you must rebalance". Instead use observational language: "this position may warrant review", "worth researching further", "consider whether this aligns with your goals"
+- NEVER guarantee or predict future returns, prices, or outcomes
+- NEVER present your analysis as a substitute for professional financial advice
+- Frame all suggestions as observations and points for further research, not directives
+- When discussing risk, use language like "historically" or "based on trailing data" — never imply certainty about future risk
+- Past performance data is historical and does not indicate future results
+
+Analytical guidelines:
 - ALWAYS cite specific numbers: beta values, Sharpe ratios, volatility percentages, HHI scores, correlations, P/L figures, and portfolio weights
 - When benchmark data (S&P 500) is provided, explicitly compare portfolio metrics against it (e.g. "Portfolio Sharpe of 0.85 vs S&P 500 Sharpe of 1.12")
 - Reference concentration risk using HHI scores and top-3 weight percentages
 - Use risk-adjusted return metrics (Sharpe, Sortino) to evaluate performance — not just raw returns
 - Be specific about sector/industry exposure using the industry data provided
-- Give actionable, position-level recommendations with target weights when suggesting rebalancing
+- Provide position-level observations with context on current vs typical weights when discussing rebalancing
 - Consider correlation structure — flag when holdings are highly correlated (avg correlation > 0.7)
 
 Personalization (when Investor Profile is provided):
 - Calibrate risk assessments to the investor's stated risk tolerance — a "High" risk portfolio may be appropriate for an aggressive investor but alarming for a conservative one
 - Match recommendation complexity to experience level: plain language for beginners, technical detail for advanced investors
-- Align suggestions with the investor's primary goal (growth vs income vs preservation)
+- Align observations with the investor's primary goal (growth vs income vs preservation)
 - Consider time horizon when evaluating drawdowns and volatility — a long-term investor can tolerate more short-term volatility
-- Respect stated asset preferences — don't recommend crypto to someone who excluded it, or vice versa
+- Respect stated asset preferences — don't suggest crypto to someone who excluded it, or vice versa
 - If the portfolio contradicts the investor's profile (e.g. conservative investor with speculative positions), flag this mismatch explicitly
 
 You always respond with valid JSON matching the requested schema."""
@@ -174,14 +190,14 @@ Respond with a JSON object matching this exact schema:
     "risks": ["Specific risk with quantification when possible"],
 
     "rebalancingSuggestions": [
-        "Specific rebalancing recommendation referencing current vs target weights"
+        "Observation about current vs typical allocation with context — framed as a point to research, not a directive"
     ],
 
     "actionItems": [
         {{
-            "action": "reduce" | "add" | "hold" | "sell" | "buy",
+            "action": "consider_reducing" | "worth_researching" | "monitor" | "review" | "hold",
             "symbol": "NVDA",
-            "reasoning": "Specific rationale citing data (e.g. 'Beta of 1.8 at 25% weight contributes disproportionate portfolio risk')"
+            "reasoning": "Observational rationale citing data (e.g. 'Beta of 1.8 at 25% weight — may warrant review given concentration risk'). Never use imperative language."
         }}
     ]
 }}
@@ -190,16 +206,19 @@ Critical instructions:
 - EVERY observation must reference actual numbers from the data — never make vague claims
 - topConviction: 2-3 positions with the best risk-adjusted profile (cite Sharpe, P/L, beta)
 - concerns: only positions with measurable issues (cite losses, high beta, low Sharpe, overweight)
-- actionItems: specific position-level recommendations with action type and symbol
+- actionItems: observational, position-level insights — NEVER use directive language like "you should" or "sell now"
+- action values MUST be one of: "consider_reducing", "worth_researching", "monitor", "review", "hold"
 - When benchmark data is available, the summary and performance MUST compare against it
 - If HHI > 2500 or top-3 weight > 60%, flag concentration risk explicitly
 - If avg correlation > 0.7, flag diversification concern
 - If portfolio is small (<5 positions), note limited diversification
-- If an Investor Profile is provided, personalize the tone and recommendations:
+- NEVER guarantee future performance or predict price targets
+- All forward-looking statements must be framed as possibilities, not certainties
+- If an Investor Profile is provided, personalize the tone and observations:
   * For beginners: use plain language, explain financial terms briefly
   * For advanced investors: use technical language freely
   * Flag any mismatch between the portfolio and the investor's stated risk level or goals
-  * Align rebalancing suggestions with the investor's time horizon and primary goal"""
+  * Align rebalancing observations with the investor's time horizon and primary goal"""
 
 
 PORTFOLIO_INLINE_PROMPT = """Based on the following portfolio data, generate brief quantitative insights for dashboard display.
@@ -213,11 +232,12 @@ Respond with a JSON object:
     "performanceNote": "Return with benchmark comparison if available, e.g., '+18.5% vs SPY +22%' or 'Sharpe 1.2, beating benchmark'",
     "riskFlag": "Cite a specific risk metric if concerning (e.g., 'Top 3 = 72% of portfolio, HHI 3100'), or null if balanced",
     "topPerformer": "Best position with data, e.g., 'NVDA +145%, Sharpe 2.1'",
-    "actionNeeded": "Specific action with reason (e.g., 'NVDA at 25% — trim to 15% to reduce beta'), or null"
+    "actionNeeded": "Observational note framed as a point to review (e.g., 'NVDA at 25% — may warrant review given concentration'), or null. NEVER use directive language."
 }}
 
 Be specific with numbers. Use null for riskFlag and actionNeeded if nothing notable.
-If an Investor Profile is provided, calibrate the actionNeeded urgency to their risk tolerance and goals."""
+Frame actionNeeded as an observation, not a directive — never say "trim", "sell", or "buy".
+If an Investor Profile is provided, calibrate the actionNeeded context to their risk tolerance and goals."""
 
 
 PORTFOLIO_QUICK_SUMMARY_PROMPT = """Provide a one-paragraph portfolio summary.
@@ -399,6 +419,7 @@ async def analyze_portfolio(
         },
         "riskMetrics": bundle.risk_metrics if bundle.risk_metrics else None,
         "dataGaps": bundle.gaps,
+        "disclaimer": LEGAL_DISCLAIMER,
     }
 
     # Generate inline insights if requested
@@ -492,4 +513,5 @@ async def get_portfolio_insights(
     except Exception as e:
         logger.warning(f"[Portfolio Inline] failed to cache in Redis: {e}")
 
+    inline_dict["disclaimer"] = LEGAL_DISCLAIMER
     return inline_dict
