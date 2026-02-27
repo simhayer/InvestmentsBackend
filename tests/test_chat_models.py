@@ -12,7 +12,7 @@ class TestChatModels(unittest.TestCase):
 
     def test_chat_message_rejects_empty_content(self):
         with self.assertRaises(ValidationError):
-            ChatMessage(role="user", content="   ")
+            ChatMessage(role="user", content="  ")
 
     def test_format_sse_shape(self):
         out = format_sse("token", {"text": "hi"})
