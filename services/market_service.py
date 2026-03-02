@@ -28,12 +28,16 @@ Json = Dict[str, Any]
 # ---------------------------
 # Config
 # ---------------------------
-# US-focused top bar
+# Top bar: US indices, crypto, volatility, commodities
 INDEX_META: Dict[str, Tuple[str, str, str | None]] = {
     "^GSPC": ("SPX", "S&P 500", "USD"),
     "^DJI": ("DJI", "Dow Jones", "USD"),
     "^IXIC": ("IXIC", "Nasdaq", "USD"),
+    "^RUT": ("RUT", "Russell 2000", "USD"),
+    "^VIX": ("VIX", "VIX", "USD"),
     "BTC-USD": ("BTC", "BTC/USD", "USD"),
+    "ETH-USD": ("ETH", "ETH/USD", "USD"),
+    "GLD": ("GLD", "Gold", "USD"),
 }
 SYMBOLS: List[str] = list(INDEX_META.keys())
 
@@ -79,10 +83,10 @@ def sanitize_json(obj: Any) -> Any:
 
 def _sparkline_params(symbol: str) -> tuple[str, str]:
     s = symbol.upper()
-    if s == "BTC-USD":
+    if s in ("BTC-USD", "ETH-USD"):
         # Crypto is 24/7; hourly keeps it lively but still light
         return ("3d", "1h")
-    # Indices: daily is tiny payload
+    # Indices / ETFs: daily is tiny payload
     return ("5d", "1d")
 
 

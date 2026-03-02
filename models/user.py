@@ -38,3 +38,4 @@ class User(Base):
     )
 
     subscription = relationship("UserSubscription", back_populates="user", uselist=False)
+    watchlists = relationship("Watchlist", back_populates="owner", cascade="all, delete-orphan")

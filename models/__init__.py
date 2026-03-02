@@ -7,6 +7,7 @@ from .user_onboarding_profile import UserOnboardingProfile
 from .portfolio_analysis import PortfolioAnalysis
 from .user_subscription import UserSubscription
 from .crypto_asset import CryptoAsset
+from .watchlist import Watchlist, WatchlistItem
 from .vectors.sec_filing_chunk import SecFilingChunk
 from .vectors.company_insights import CompanyInsight
 from .conversation import Conversation, ConversationMessage

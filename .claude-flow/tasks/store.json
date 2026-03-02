@@ -1,0 +1,22 @@
+{
+  "tasks": {
+    "task-1772418410148-nh41xl": {
+      "taskId": "task-1772418410148-nh41xl",
+      "type": "feature",
+      "description": "Implement personalized market monitor endpoint using authenticated holdings with optional symbol override and tests",
+      "priority": "high",
+      "status": "completed",
+      "progress": 100,
+      "assignedTo": [],
+      "tags": [
+        "market",
+        "personalization",
+        "ai"
+      ],
+      "createdAt": "2026-03-02T02:26:50.148Z",
+      "startedAt": null,
+      "completedAt": null
+    }
+  },
+  "version": "3.0.0"
+}
